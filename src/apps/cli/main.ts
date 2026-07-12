@@ -70,6 +70,7 @@ async function main(argv: string[]): Promise<number> {
       const deps = bindFsDeps(base);
       const r = await uc.initSession(deps, { task, agents, driver });
       const view = uc.view(r.session);
+      if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(base, '.pair')}`);
       out(`  Task:      ${task}`);
       out(`  Agents:    ${r.session.agents.join(', ')}`);
@@ -245,6 +246,32 @@ async function main(argv: string[]): Promise<number> {
       out(`Grant ${id} cancelled; ${g?.assignee} notified.`);
       return 0;
     }
+    case 'watch': {
+      const root = findRoot(rootFlag);
+      const deps = bindFsDeps(root);
+      const tail = num(flags, 'tail', 10);
+      const refreshSec = Math.max(1, num(flags, 'refreshsec', 2));
+      const { renderWatchFrame } = await import('@adapters/tui/watch.ts');
+      let lastFrame = '';
+      for (;;) {
+        const state = await deps.store.load();
+        if (state) {
+          const entries: { message: Awaited<ReturnType<typeof deps.mailbox.archived>>[number]; pending: boolean }[] = [];
+          for (const m of await deps.mailbox.archived()) entries.push({ message: m, pending: false });
+          for (const agent of state.agents) {
+            for (const m of await deps.mailbox.pending(agent)) entries.push({ message: m, pending: true });
+          }
+          entries.sort((a, b) => a.message.name.localeCompare(b.message.name));
+          const width = Math.max(60, (process.stdout.columns ?? 100) - 1);
+          const frame = renderWatchFrame({ view: uc.view(state), entries, width, tail, refreshSec });
+          if (frame !== lastFrame) {
+            process.stdout.write(`\x1b[2J\x1b[H${frame}`);
+            lastFrame = frame;
+          }
+        }
+        await deps.clock.sleep(refreshSec * 1000);
+      }
+    }
     default: {
       out(HELP);
       return 0;
@@ -267,10 +294,32 @@ Usage:
   pair init   -Task '<goal>' [-Agents 'claude,codex[,agy,...]'] [-Driver <agent>] [-Root <repo>]
   pair send   -From <me> [-To <agent>] [-Type ask|answer|handoff|review|info]
               (-Message '<text>' | -File <path>) [-Turn pass|keep]
+              # -To required when more than one possible recipient
   pair wait   -As <me> [-TimeoutSec 300] [-PollSec 2]      # 0 = check once
   pair ask    -From <me> (-Message '<text>' | -File <path>) # send ask + wait
-  pair status | log [-Tail 10] | end -As <me> [-Message '<summary>']
-  pair grant / grants / grant-accept / grant-done / grant-cancel   # see PROTOCOL.md
+  pair status
+  pair log    [-Tail 10]
+  pair watch  [-Tail 10] [-RefreshSec 2]   # live dashboard (for the human's pane)
+  pair end    -As <me> [-Message '<summary>']   # notifies every other agent
+
+Work grants (grants-lite — parallel editing; driver-only issuance):
+  pair grant        -From <driver> -To <agent> -TaskDesc '<task>'
+                    (-Worktree <path> | -Files a,b,c -AcceptSharedWorktreeRisk)
+                    [-AgreedIn <message-id>]
+  pair grants       [-Json]                      # list all grants
+  pair grant-accept -As <me> -Id <grant-id>      # offered -> active, then edit within scope
+  pair grant-done   -As <me> -Id <grant-id> -Message '<result>'
+  pair grant-cancel -As <driver> -Id <grant-id> [-Message '<reason>']
+  Grant traffic never moves the conversation turn. -Files scopes share the
+  worktree and are advisory only (NOT M4-safe); -Worktree scopes are isolated.
+
+Message types:
+  ask      question or request needing a reply
+  answer   reply to an ask
+  review   review verdict on the driver's work
+  handoff  the RECIPIENT becomes driver; everyone else navigates
+  info     FYI, usually with -Turn keep
+  done     session complete (sent by 'pair end')
 
 Exit codes: 0 ok, 2 wait timed out (re-run wait), 1 error.
 State lives in .pair/ at the repo root; protocol spec in the claudex repo.`;

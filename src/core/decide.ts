@@ -23,7 +23,7 @@ export function decide(
     case 'end-session':
       return withActive(state, (s) => decideEnd(s, command, envelope));
     case 'issue-grant':
-      return withActive(state, (s) => decideIssueGrant(s, command, envelope));
+      return withActive(state, (s) => decideIssueGrant(s, command, envelope), GRANT_INACTIVE);
     case 'accept-grant':
       return withActive(state, (s) => {
         const bad = assertParticipant(s, meta.principal, '-As');
@@ -31,7 +31,7 @@ export function decide(
         return withGrant(s, command.grantId, ['offered'], meta.principal, () =>
           ok([{ kind: 'grant-accepted', grantId: command.grantId, at: meta.at }]),
         );
-      });
+      }, GRANT_INACTIVE);
     case 'complete-grant':
       return withActive(state, (s) => {
         const bad = assertParticipant(s, meta.principal, '-As');
@@ -42,24 +42,26 @@ export function decide(
             messageEvent(envelope, g.assignee, g.issuer, 'grant-done', `GRANT ${g.id} COMPLETE\n${command.result}`),
           ]),
         );
-      });
+      }, GRANT_INACTIVE);
     case 'cancel-grant':
-      return withActive(state, (s) => decideCancelGrant(s, command, envelope));
+      return withActive(state, (s) => decideCancelGrant(s, command, envelope), GRANT_INACTIVE);
   }
 }
+
+/** pair.ps1 parity: grant verbs report inactivity differently than send. */
+const GRANT_INACTIVE = (status: string) =>
+  `Session status is '${status}' — grant operations require an active session.`;
+const SEND_INACTIVE = (status: string) =>
+  `Session status is '${status}' — no messages can be sent. Start a new session with: pair init`;
 
 function withActive(
   state: SessionState | undefined,
   fn: (s: SessionState) => Result<Event[], ProtocolError>,
+  message: (status: string) => string = SEND_INACTIVE,
 ): Result<Event[], ProtocolError> {
   if (!state || state.status !== 'active') {
     const status = state ? state.status : 'missing';
-    return err(
-      new ProtocolError(
-        'session-not-active',
-        `Session status is '${status}' — no messages can be sent. Start a new session with: pair init`,
-      ),
-    );
+    return err(new ProtocolError('session-not-active', message(status)));
   }
   return fn(state);
 }

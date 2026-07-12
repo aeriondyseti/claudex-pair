@@ -37,7 +37,7 @@ export interface ProtocolStore {
   /** Apply decided events durably. Must be atomic per ENHANCEMENTS.md limits. */
   commit(envelope: CommandEnvelope, events: readonly Event[]): Promise<CommitReceipt>;
   /** Initialize storage for a brand-new session (dirs, memory template, gitignore). */
-  initialize(envelope: CommandEnvelope, events: readonly Event[]): Promise<void>;
+  initialize(envelope: CommandEnvelope, events: readonly Event[]): Promise<{ gitignoreUpdated: boolean }>;
 }
 
 export interface Mailbox {

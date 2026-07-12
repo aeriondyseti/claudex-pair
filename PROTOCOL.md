@@ -5,7 +5,7 @@ Turn-based pair programming between interactive AI CLI sessions — Claude Code
 its own terminal pane. Sessions have n ≥ 2 agents; two is simply the common
 case. There is no daemon and no pane automation: agents communicate
 exclusively through files in a `.pair/` directory at the target repo's root,
-using the `pair` command (`D:\Development\claudex\bin\pair.ps1`).
+using the `pair` command (the TypeScript CLI port, with `bin/pair.ps1` acting as a thin verb-for-verb compatible shim).
 
 ## Model
 

@@ -44,11 +44,16 @@ async function executeWithState(deps: Deps, state: SessionState | undefined, pri
   const decided = decide(state, envelope);
   if (!decided.ok) throw decided.error;
   if (command.kind === 'init-session') {
-    await deps.store.initialize(envelope, decided.value);
-    return { events: decided.value, receipt: { messageFiles: [] as readonly string[] }, session: (await deps.store.load())! };
+    const init = await deps.store.initialize(envelope, decided.value);
+    return {
+      events: decided.value,
+      receipt: { messageFiles: [] as readonly string[] },
+      session: (await deps.store.load())!,
+      gitignoreUpdated: init.gitignoreUpdated,
+    };
   }
   const receipt = await deps.store.commit(envelope, decided.value);
-  return { events: decided.value, receipt, session: (await deps.store.load())! };
+  return { events: decided.value, receipt, session: (await deps.store.load())!, gitignoreUpdated: false };
 }
 
 export async function sendMessage(

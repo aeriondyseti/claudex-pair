@@ -107,7 +107,7 @@ export function bindFsDeps(root: string): Deps {
         status: 'active',
         started: init.at,
       };
-      await sessions.initialize(disk);
+      return sessions.initialize(disk);
     },
     async commit(envelope, events) {
       const disk = await sessions.load();
