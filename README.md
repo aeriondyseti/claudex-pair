@@ -26,7 +26,9 @@ and `handoff` only from the driver — the CLI enforces both. Full spec:
 
 | path | what |
 |---|---|
-| `bin/pair.ps1` | the CLI: `init` `send` `wait` `ask` `status` `log` `watch` `end` |
+| `bin/pair.ps1` | the CLI shim (delegates to the TypeScript port) |
+| `src/` | TypeScript protocol core and CLI app (layout per `docs/ARCHITECTURE.md`) |
+| `dist/pair` | compiled binary via `bun build --compile` |
 | `bin/pair.cmd`, `bin/pair` | cmd / Git Bash shims |
 | `PROTOCOL.md` | canonical protocol spec (both agents read this) |
 | `instructions/claude-pairing.md` | operating instructions for Claude Code |
@@ -71,6 +73,13 @@ relies on its skill description for the same effect.
 
 If a wait ever times out (exit code 2), it's not an error — the partner is
 still working; the agent just re-arms the wait.
+
+## Development
+
+The CLI is written in TypeScript and is verb-for-verb compatible with the original PowerShell design.
+- `bun install` — install dependencies
+- `bun run check` — typecheck and lint
+- `bun test` — run tests
 
 ## Notes
 
