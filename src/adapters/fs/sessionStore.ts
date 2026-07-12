@@ -36,6 +36,14 @@ export class FsSessionStore {
     await this.save(session);
     try { await readFile(join(this.pairDir, 'memory.md')); }
     catch { await writeFile(join(this.pairDir, 'memory.md'), MEMORY_TEMPLATE(session.task), 'utf8'); }
+    // Legacy Cmd-Init parity: keep session state out of version control.
+    const gitignore = join(this.root, '.gitignore');
+    try {
+      const current = await readFile(gitignore, 'utf8');
+      if (!/^\.pair\//m.test(current)) await writeFile(gitignore, `${current}\n.pair/\n`, 'utf8');
+    } catch {
+      /* no .gitignore — same as pair.ps1, do not create one */
+    }
   }
 
   async load(): Promise<DiskSession> {

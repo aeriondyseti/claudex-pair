@@ -37,6 +37,27 @@ export class FsMailbox {
     return name;
   }
 
+  async pending(agent: string): Promise<Array<{ name: string; message: PairMessage }>> {
+    const inbox = join(this.pairDir, 'inbox', agent);
+    let names: string[];
+    try { names = (await readdir(inbox)).filter((n) => n.endsWith('.md')).sort(); }
+    catch { return []; }
+    const out = [];
+    for (const name of names) out.push({ name, message: parseMessage(await readFile(join(inbox, name), 'utf8')) });
+    return out;
+  }
+
+  async archived(last?: number): Promise<Array<{ name: string; message: PairMessage }>> {
+    const archive = join(this.pairDir, 'archive');
+    let names: string[];
+    try { names = (await readdir(archive)).filter((n) => n.endsWith('.md')).sort(); }
+    catch { return []; }
+    if (last !== undefined) names = names.slice(-last);
+    const out = [];
+    for (const name of names) out.push({ name, message: parseMessage(await readFile(join(archive, name), 'utf8')) });
+    return out;
+  }
+
   async claimAll(agent: string): Promise<Array<{ name: string; message: PairMessage }>> {
     const inbox = join(this.pairDir, 'inbox', agent);
     const archive = join(this.pairDir, 'archive');

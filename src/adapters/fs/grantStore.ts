@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { DiskGrant } from './types.ts';
 
@@ -17,6 +17,15 @@ export class FsGrantStore {
 
   async read(id: string): Promise<DiskGrant> {
     return JSON.parse(await readFile(this.path(id), 'utf8')) as DiskGrant;
+  }
+
+  async list(): Promise<DiskGrant[]> {
+    let names: string[];
+    try { names = (await readdir(this.grantsDir)).filter((n) => n.endsWith('.json')).sort(); }
+    catch { return []; }
+    const out: DiskGrant[] = [];
+    for (const name of names) out.push(await this.read(name.replace(/\.json$/, '')));
+    return out;
   }
 
   async transition(id: string, expected: readonly DiskGrant['state'][], update: (grant: DiskGrant) => DiskGrant, now: string): Promise<DiskGrant> {

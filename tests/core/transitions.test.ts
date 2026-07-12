@@ -70,7 +70,7 @@ function buildCommand(raw: Row['command']): { command: Record<string, unknown>; 
       break;
     case 'issue-grant':
       command['grantId'] ??= 'gX';
-      command['task'] ??= command['task'] === '' ? '' : (command['task'] ?? 'work');
+      command['task'] ??= 'work'; // ??= keeps an explicit "" (DEC-17)
       command['scope'] ??= { mode: 'worktree', worktree: 'wt' };
       command['agreedIn'] ??= '';
       break;
