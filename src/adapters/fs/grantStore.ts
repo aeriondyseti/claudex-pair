@@ -28,7 +28,12 @@ export class FsGrantStore {
     return out;
   }
 
-  async transition(id: string, expected: readonly DiskGrant['state'][], update: (grant: DiskGrant) => DiskGrant, now: string): Promise<DiskGrant> {
+  /**
+   * `guard` runs immediately after lock acquisition (grants-lite invariant:
+   * the session-active recheck must happen UNDER the per-grant lock — an end
+   * can commit between the caller's precondition check and this lock).
+   */
+  async transition(id: string, expected: readonly DiskGrant['state'][], update: (grant: DiskGrant) => DiskGrant, now: string, guard?: () => Promise<void>): Promise<DiskGrant> {
     const path = this.path(id); const lockPath = `${path}.lock`;
     let lock: Awaited<ReturnType<typeof open>> | undefined;
     for (let attempt = 0; attempt < 40 && !lock; attempt++) {
@@ -39,6 +44,7 @@ export class FsGrantStore {
     }
     if (!lock) throw new Error(`Could not lock grant '${id}' after 10s; if no other transition is running, delete ${lockPath}`);
     try {
+      if (guard) await guard();
       const current = await this.read(id);
       if (!expected.includes(current.state)) throw new Error(`Grant '${id}' is '${current.state}' (expected: ${expected.join('|')}) — stale transition rejected`);
       const next = { ...update(current), revision: current.revision + 1, updated: now };

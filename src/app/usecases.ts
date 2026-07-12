@@ -2,7 +2,7 @@ import type { Command, CommandEnvelope } from '@core/commands.ts';
 import { decide } from '@core/decide.ts';
 import { ProtocolError } from '@core/errors.ts';
 import { openGrants, navigators, resolveRecipient } from '@core/queries.ts';
-import type { AgentId, Grant, SessionState } from '@core/types.ts';
+import type { AgentId, Grant, MessageType, SessionState } from '@core/types.ts';
 import type { Deps, StoredMessage } from './ports/index.ts';
 
 /**
@@ -58,7 +58,7 @@ async function executeWithState(deps: Deps, state: SessionState | undefined, pri
 
 export async function sendMessage(
   deps: Deps,
-  args: { from: AgentId; to?: AgentId; type: string; turn: 'pass' | 'keep'; body: string },
+  args: { from: AgentId; to?: AgentId; type: MessageType; turn: 'pass' | 'keep'; body: string },
 ) {
   const state = await deps.store.load();
   let to = args.to;
@@ -72,7 +72,7 @@ export async function sendMessage(
   return executeWithState(deps, state, args.from, {
     kind: 'send-message',
     to: to ?? '',
-    type: args.type as never,
+    type: args.type,
     turn: args.turn,
     body: args.body,
   });

@@ -38,6 +38,15 @@ export function bindFsDeps(root: string): Deps {
     };
   };
 
+  // Grants-lite invariant: re-verify the session is still active while
+  // holding the per-grant lock (an end can commit in between).
+  const activeGuard = async (): Promise<void> => {
+    const s = await sessions.load();
+    if (s.status !== 'active') {
+      throw new Error(`Session status is '${s.status}' — grant operations require an active session.`);
+    }
+  };
+
   const applyEvents = async (
     envelope: CommandEnvelope,
     events: readonly Event[],
@@ -77,13 +86,13 @@ export function bindFsDeps(root: string): Deps {
           }));
           break;
         case 'grant-accepted':
-          await grants.transition(event.grantId, ['offered'], (g) => ({ ...g, state: 'active' }), event.at);
+          await grants.transition(event.grantId, ['offered'], (g) => ({ ...g, state: 'active' }), event.at, activeGuard);
           break;
         case 'grant-completed':
-          await grants.transition(event.grantId, ['active'], (g) => ({ ...g, state: 'done', result: event.result }), event.at);
+          await grants.transition(event.grantId, ['active'], (g) => ({ ...g, state: 'done', result: event.result }), event.at, activeGuard);
           break;
         case 'grant-cancelled':
-          await grants.transition(event.grantId, ['offered', 'active'], (g) => ({ ...g, state: 'cancelled', result: event.reason || g.result }), event.at);
+          await grants.transition(event.grantId, ['offered', 'active'], (g) => ({ ...g, state: 'cancelled', result: event.reason || g.result }), event.at, activeGuard);
           break;
         case 'session-initialized':
           break; // handled by initialize()

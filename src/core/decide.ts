@@ -153,6 +153,9 @@ function decideSend(
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });
+  // pair.ps1 parity: a raw `send -Type done` completes the session (pair end
+  // is the richer verb — memory summary + fan-out — but done-send is legal).
+  if (command.type === 'done') events.push({ kind: 'session-ended', by: from, summary: command.body, at: envelope.meta.at });
   return ok(events);
 }
 

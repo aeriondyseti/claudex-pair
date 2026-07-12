@@ -83,8 +83,16 @@ async function main(argv: string[]): Promise<number> {
       const deps = bindFsDeps(findRoot(rootFlag));
       const from = requireStr(flags, 'from', 'send requires -From <you> — never impersonate a partner').toLowerCase();
       const to = str(flags, 'to')?.toLowerCase();
-      const type = (str(flags, 'type') ?? 'info').toLowerCase();
-      const turn = (str(flags, 'turn') ?? 'pass').toLowerCase() as 'pass' | 'keep';
+      const type = (str(flags, 'type') ?? 'info').toLowerCase() as import('@core/types.ts').MessageType;
+      const VALID_TYPES = ['ask', 'answer', 'handoff', 'review', 'info', 'done'];
+      if (!VALID_TYPES.includes(type)) {
+        throw new ProtocolError('session-not-active', `-Type '${type}' is not valid. Valid values: ${VALID_TYPES.join(', ')}`);
+      }
+      const turnRaw = (str(flags, 'turn') ?? 'pass').toLowerCase();
+      if (turnRaw !== 'pass' && turnRaw !== 'keep') {
+        throw new ProtocolError('session-not-active', `-Turn '${turnRaw}' is not valid. Valid values: pass, keep`);
+      }
+      const turn = turnRaw as 'pass' | 'keep';
       const body = await bodyFrom(flags);
       const r = await uc.sendMessage(deps, { from, ...(to ? { to } : {}), type, turn, body });
       const s = r.session;

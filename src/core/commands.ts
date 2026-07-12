@@ -12,7 +12,7 @@ export type CommandMeta = {
 
 export type Command =
   | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId }
-  | { kind: 'send-message'; to: AgentId; type: Exclude<MessageType, 'done'>; turn: TurnMode; body: string }
+  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string }
   | { kind: 'end-session'; summary: string }
   | { kind: 'issue-grant'; grantId: GrantId; to: AgentId; task: string; scope: GrantScopeInput; agreedIn: MessageId | '' }
   | { kind: 'accept-grant'; grantId: GrantId }
