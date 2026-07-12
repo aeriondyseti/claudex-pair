@@ -3,7 +3,22 @@ import type { AgentId, GrantId, GrantScope, MessageId, MessageType, Timestamp, T
 /**
  * Events are the WAL vocabulary (ENHANCEMENTS.md rev 7): the future broker's
  * journal is a log of these; state is replay-derived via evolve().
+ *
+ * Provenance lives on the WRAPPER, not the event: transition events
+ * (turn-passed, driver-changed, grant-*) deliberately carry no actor/id —
+ * the journal stores every event as a JournalRecord, whose metadata is the
+ * uniform source of idempotency (envelope id), provenance (principal), and
+ * ordering (seq). Events stay minimal so replay stays minimal.
  */
+export type JournalRecord = {
+  /** Monotonic position in the journal; assigned by the Journal port on append. */
+  readonly seq: number;
+  /** The CommandEnvelope id that produced this event (idempotency key). */
+  readonly envelopeId: MessageId;
+  readonly principal: AgentId;
+  readonly at: Timestamp;
+  readonly event: Event;
+};
 export type Event =
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp }
   | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp }

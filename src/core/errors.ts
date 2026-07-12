@@ -16,6 +16,8 @@ export type ProtocolErrorCode =
   | 'grant-to-self'
   | 'grant-scope-invalid'
   | 'grant-risk-unacknowledged'
+  | 'grant-task-missing'
+  | 'grant-id-collision'
   | 'grant-not-found'
   | 'grant-wrong-assignee'
   | 'grant-stale-transition';

@@ -25,20 +25,24 @@ export function decide(
     case 'issue-grant':
       return withActive(state, (s) => decideIssueGrant(s, command, envelope));
     case 'accept-grant':
-      return withActive(state, (s) =>
-        withGrant(s, command.grantId, ['offered'], envelope.meta.principal, () =>
+      return withActive(state, (s) => {
+        const bad = assertParticipant(s, meta.principal, '-As');
+        if (bad) return err(bad);
+        return withGrant(s, command.grantId, ['offered'], meta.principal, () =>
           ok([{ kind: 'grant-accepted', grantId: command.grantId, at: meta.at }]),
-        ),
-      );
+        );
+      });
     case 'complete-grant':
-      return withActive(state, (s) =>
-        withGrant(s, command.grantId, ['active'], envelope.meta.principal, (g) =>
+      return withActive(state, (s) => {
+        const bad = assertParticipant(s, meta.principal, '-As');
+        if (bad) return err(bad);
+        return withGrant(s, command.grantId, ['active'], meta.principal, (g) =>
           ok([
             { kind: 'grant-completed', grantId: command.grantId, result: command.result, at: meta.at },
             messageEvent(envelope, g.assignee, g.issuer, 'grant-done', `GRANT ${g.id} COMPLETE\n${command.result}`),
           ]),
-        ),
-      );
+        );
+      });
     case 'cancel-grant':
       return withActive(state, (s) => decideCancelGrant(s, command, envelope));
   }
@@ -198,6 +202,12 @@ function decideIssueGrant(
   }
   if (from === command.to) {
     return err(new ProtocolError('grant-to-self', 'Cannot grant work to yourself; the driver already edits under the turn.'));
+  }
+  if (!command.task) {
+    return err(new ProtocolError('grant-task-missing', "grant requires -TaskDesc '<what the assignee should do>'"));
+  }
+  if (s.grants[command.grantId]) {
+    return err(new ProtocolError('grant-id-collision', `Grant id collision for '${command.grantId}' — re-run the grant command.`));
   }
   const scope = validateScope(command.scope);
   if (!scope.ok) return scope;

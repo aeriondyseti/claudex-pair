@@ -7,7 +7,7 @@
   "scripts": {
     "check": "bun run lint && bun run depcruise && bun run typecheck && bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src tests",
+    "lint": "eslint src tests --no-error-on-unmatched-pattern",
     "depcruise": "depcruise src --config .dependency-cruiser.cjs",
     "test": "bun test",
     "build": "bun build --compile --outfile dist/pair src/apps/cli/main.ts"
