@@ -122,7 +122,7 @@ function messageEvent(
   type: Extract<Event, { kind: 'message-sent' }>['type'],
   body: string,
   turn: 'pass' | 'keep' = 'keep',
-): Event {
+): Extract<Event, { kind: 'message-sent' }> {
   return { kind: 'message-sent', id: envelope.meta.id, from, to, type, turn, body, at: envelope.meta.at };
 }
 
@@ -168,9 +168,14 @@ function decideEnd(
   const bad = assertParticipant(s, by, '-As');
   if (bad) return err(bad);
   const events: Event[] = [{ kind: 'session-ended', by, summary: command.summary, at: envelope.meta.at }];
-  for (const other of s.agents.filter((a) => a !== by)) {
-    events.push(messageEvent(envelope, by, other, 'done', command.summary));
-  }
+  // Fan-out messages need DISTINCT ids: the mailbox file name is derived from
+  // the id, and same-named files for different recipients later collide in
+  // the shared archive (found live: both done files overwrote each other).
+  const others = s.agents.filter((a) => a !== by);
+  others.forEach((other, i) => {
+    const msg = messageEvent(envelope, by, other, 'done', command.summary);
+    events.push(i === 0 ? msg : { ...msg, id: `${envelope.meta.id}-${i}` });
+  });
   return ok(events);
 }
 
