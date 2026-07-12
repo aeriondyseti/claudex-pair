@@ -17,10 +17,10 @@ module.exports = {
     },
     {
       name: 'app-only-core',
-      comment: 'ARCHITECTURE.md: app → core only',
+      comment: 'ARCHITECTURE.md: app → core only (src/app, NOT src/apps — composition roots import anything)',
       severity: 'error',
-      from: { path: '^src/app' },
-      to: { pathNot: '^src/(app|core)' },
+      from: { path: '^src/app/' },
+      to: { pathNot: '^src/(app|core)/' },
     },
     {
       name: 'adapters-no-apps',
