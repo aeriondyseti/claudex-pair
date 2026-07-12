@@ -1,0 +1,4 @@
+.pair/
+node_modules/
+dist/
+*.log

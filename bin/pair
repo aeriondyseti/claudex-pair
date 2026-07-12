@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Git Bash shim for claudex pair.
+exec pwsh -NoProfile -ExecutionPolicy Bypass -File "$(dirname "$0")/pair.ps1" "$@"
