@@ -30,7 +30,7 @@ export class FsSessionStore {
   readonly pairDir: string;
   constructor(readonly root: string) { this.pairDir = join(root, '.pair'); }
 
-  async initialize(session: DiskSession): Promise<void> {
+  async initialize(session: DiskSession): Promise<{ gitignoreUpdated: boolean }> {
     await mkdir(join(this.pairDir, 'archive'), { recursive: true });
     await Promise.all(session.agents.map((agent) => mkdir(join(this.pairDir, 'inbox', agent), { recursive: true })));
     await this.save(session);
@@ -40,10 +40,14 @@ export class FsSessionStore {
     const gitignore = join(this.root, '.gitignore');
     try {
       const current = await readFile(gitignore, 'utf8');
-      if (!/^\.pair\//m.test(current)) await writeFile(gitignore, `${current}\n.pair/\n`, 'utf8');
+      if (!/^\.pair\//m.test(current)) {
+        await writeFile(gitignore, `${current}\n.pair/\n`, 'utf8');
+        return { gitignoreUpdated: true };
+      }
     } catch {
       /* no .gitignore — same as pair.ps1, do not create one */
     }
+    return { gitignoreUpdated: false };
   }
 
   async load(): Promise<DiskSession> {
