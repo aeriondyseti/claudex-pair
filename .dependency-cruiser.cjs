@@ -23,6 +23,13 @@ module.exports = {
       to: { pathNot: '^src/(app|core)/' },
     },
     {
+      name: 'broker-no-apps-no-adapters',
+      comment: 'BROKER-SPEC: src/broker hosts app use-cases; transport is injected by apps/broker (composition), never imported directly',
+      severity: 'error',
+      from: { path: '^src/broker/' },
+      to: { path: '^src/(apps|adapters)/' },
+    },
+    {
       name: 'adapters-no-apps',
       comment: 'ARCHITECTURE.md: adapters may not import composition roots',
       severity: 'error',
