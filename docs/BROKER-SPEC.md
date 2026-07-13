@@ -46,7 +46,7 @@
     `expired-request` rather than silently re-executing.
 - **Delivery ledger (journaled, not in-memory)**: every message fan-out creates
   deliveries with stable identity `deliveryId = <messageId>:<recipient>`. Two event
-  kinds in the same journal: `delivery-enqueued {deliveryId, seq}` (part of the commit
+  kinds in the same journal: `delivery-enqueued {deliveryId, deliverySeq}` (part of the commit
   txn) and `delivery-acked {deliveryId, by-clientId}` (its own txn). **Leases are
   ephemeral projections** — only enqueue/ack are durable; on restart every enqueued,
   un-acked delivery is redelivered (F4/F11). Subscription resume uses a **delivery
@@ -71,12 +71,16 @@
 ## Wire protocol (newline-delimited JSON over the pipe)
 - Request: {reqId, token, epoch, clientId, as, kind:'execute', envelope} →
   {reqId, ok, seq, events | error{code,message}}.
-- Retry contract: same (clientId, reqId) always returns the original outcome (from the
-  durable dedup index), never a second execution.
-- Subscribe: {kind:'subscribe', as, afterDelivery} → pushes
-  {kind:'delivery', deliveryId, message}; client acks {kind:'ack', deliveryId} within
-  the lease (default 90s, extensible via {kind:'extend', deliveryId}) or the broker
-  redelivers (at-least-once; consumers dedup by deliveryId).
+- Retry contract: a retried **committed** request replays its recorded outcome (never
+  a second execution); a retried **rejected** request is re-evaluated against current
+  state (safe: rejections made no state change).
+- Subscribe: {kind:'subscribe', as, afterDeliverySeq} → pushes
+  {kind:'delivery', deliverySeq, deliveryId, message}. `deliverySeq` is a monotonic
+  ledger offset assigned at enqueue — the ordered cursor; `deliveryId`
+  (messageId:recipient) is identity for ack/dedup, not ordering. Client acks
+  {kind:'ack', deliveryId} within the lease (default 90s, extensible via
+  {kind:'extend', deliveryId}) or the broker redelivers (at-least-once; consumers
+  dedup by deliveryId).
 - Queries: {kind:'query', what:'status'|'log'|...} → DTO (includes liveness: per-agent
   connectedSince, lastActivity, broker pid/epoch/heartbeatAt).
 - **Client ack contract (implementer trap)**: `pair wait` must write the delivered
@@ -122,8 +126,11 @@ F12 crash at snapshot/segment-rotation boundaries → recovery from either the o
     new artifact, never a mixed state
 F13 stale Unix socket after kill -9 → bind gets EADDRINUSE → probe: connection
     refused ⇒ unlink dead socket and bind; connection accepted ⇒ live broker, back off
-F14 wait crashes after ack-received but before print → framework-level ordering test:
-    delivery is only acked after stdout write+flush completes
+F14 client ack-ordering, both boundaries: (a) wait crashes after receiving a delivery
+    but before printing → no ack was sent → redelivery, nothing lost; (b) wait crashes
+    after stdout flush but before ack → redelivery produces a duplicate print →
+    consumer dedups by deliveryId; the invariant under test: ack is sent only after
+    stdout write+flush returns
 
 ## Non-goals now
 - No topology changes (still pair semantics), no user channel (U1), no multi-repo broker.
