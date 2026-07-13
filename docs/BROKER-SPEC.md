@@ -50,7 +50,7 @@
   txn) and `delivery-acked {deliveryId, by-clientId}` (its own txn). **Leases are
   ephemeral projections** — only enqueue/ack are durable; on restart every enqueued,
   un-acked delivery is redelivered (F4/F11). Subscription resume uses a **delivery
-  cursor** (`afterDelivery`), not commit seq — one commit can fan out many deliveries.
+  cursor** (`afterDeliverySeq`), not commit seq — one commit can fan out many deliveries.
 - `.pair/journal/snapshot.json` — atomic-replace compaction: {state, lastSeq,
   dedupWindow, openDeliveries}. Segment rotation and snapshot writes must be
   crash-safe at every boundary (F12): write-new → fsync → rename → only then trim.
