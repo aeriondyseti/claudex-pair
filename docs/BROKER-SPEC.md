@@ -10,26 +10,40 @@
   **OS-exclusive lock held for its entire lifetime** — the open handle, not the file's
   existence, is the lease (survives PID reuse; releases automatically on process death).
   The record holds {processStartTime, pid, nonce, epoch, endpoint, heartbeatAt}.
-  - Heartbeat: broker rewrites heartbeatAt every 10s. A candidate that cannot acquire
-    the lock but observes heartbeat older than 60s treats the incumbent as **hung**
-    (alive-but-stuck brokers must not be immortal): it requests OS lock steal by
-    breaking the handle via lease-file replace — atomic rename of a new lease written
-    with epoch+1 — then verifies it now holds the exclusive lock on the new file.
+  - Heartbeat: broker rewrites heartbeatAt every 10s.
+  - **A held lock is never stolen.** (Renaming a file out from under an exclusive
+    holder is not sound: Windows rejects it, and on POSIX the deposed broker keeps
+    writing under the old inode — two writers.) A candidate that cannot acquire the
+    lock but observes heartbeat older than 60s reports the incumbent as **hung** and
+    performs **fencing by verified termination**: kill exactly the recorded
+    {pid, processStartTime, nonce} identity (refusing if the identity no longer
+    matches — PID reuse), then acquire the lock normally with epoch+1. If termination
+    is not permitted, surface "broker hung" to the human instead of proceeding.
   - Every wire message carries the sender's expected epoch; requests bearing an old
-    epoch are rejected with `stale-epoch` (client re-discovers and retries).
-- `.pair/broker.token` — 32-byte random capability, user-only perms; clients read and
+    epoch are rejected with `stale-epoch` (client re-discovers and retries). Epochs
+    protect clients from stale endpoints; the single-writer guarantee comes from the
+    lifetime lock + fencing, never from epochs alone.
+- `.pair/broker.token` — 32-byte random capability, user-only perms; **generated and
+  written only by the process that holds the lease lock, immediately after
+  acquisition** (racing spawns must never overwrite a live token). Clients read and
   present it. (U1 later: separate user-channel token outside repo.)
 
 ## Storage (journal is authoritative; legacy files are materialized views)
 - `.pair/journal/segment-NNNNNN.jsonl` — one **transaction record** per line:
   `{seq, txn: {clientId, reqId}, envelopeId, principal, at, events: Event[],
-  deliveries: DeliveryId[], crc32}` — fsync before ack.
-  - **Durable idempotency**: the (clientId, reqId) pair and the committed seq live in
-    the record itself, so recovery reconstructs the dedup index from the journal; a
-    retry after crash-before-ack replays the recorded outcome instead of re-appending
-    (F2). Dedup eviction is snapshot-defined: the snapshot stores the retained dedup
-    window (last N txns per client + horizon seq); anything older is answered
-    `expired-request` rather than silently re-executed.
+  deliveries: DeliveryId[], outcome, crc32}` — fsync before ack. `outcome` is the
+  serialized wire response (ok, seq, event summaries) so a replayed retry returns
+  byte-equivalent results.
+  - **Durable idempotency — committed successes only.** The (clientId, reqId) pair,
+    committed seq, and outcome live in the record; recovery reconstructs the dedup
+    index from the journal, so a retry after crash-before-ack replays the recorded
+    outcome instead of re-appending (F2). **Rejections are not journaled**: a rejected
+    command made no state change (decide is pure), so re-evaluating a retried
+    rejection is safe by construction — and may legitimately return a different
+    answer if state moved. The retry guarantee is therefore scoped: *effectful
+    commits are exactly-once; rejections are re-evaluated.* Dedup eviction is
+    snapshot-defined (last N txns per client + horizon seq); older reqIds answer
+    `expired-request` rather than silently re-executing.
 - **Delivery ledger (journaled, not in-memory)**: every message fan-out creates
   deliveries with stable identity `deliveryId = <messageId>:<recipient>`. Two event
   kinds in the same journal: `delivery-enqueued {deliveryId, seq}` (part of the commit
@@ -41,12 +55,18 @@
   dedupWindow, openDeliveries}. Segment rotation and snapshot writes must be
   crash-safe at every boundary (F12): write-new → fsync → rename → only then trim.
 - **Mirrors** (session.json, inbox/*.md, archive/, grants/*.json) are broker-written
-  views updated AFTER ack. `.pair/journal/mirror-manifest.json` records
-  {mirroredSeq, per-file content hashes}. On recovery:
-  - mirroredSeq < lastSeq with hashes matching the manifest → **expected lag**
-    (normal crash ordering; silently rebuild mirrors forward);
-  - hash mismatch at the same mirrored head → **content divergence = tamper** →
-    read-only conflict state + doctor (rev-7 rule). Never conflate the two (F8).
+  views updated AFTER ack. A journaled `delivery-acked` is what moves a message's
+  mirror from `inbox/` to `archive/` — the ack IS the consume event, so `watch`
+  and `status` mirrors never show already-claimed messages as pending.
+  `.pair/journal/mirror-manifest.json` records {mirroredSeq, per-file content hashes}.
+  Recovery rule (ordered — a crashed broker's own partial mirror update is LAG,
+  never tamper):
+  - **manifest.mirroredSeq < journal head → full mirror rebuild, unconditionally.**
+    Hashes are not consulted: a crash between mirror writes and the manifest replace
+    legitimately leaves mismatched hashes behind. (Implementation may instead use
+    generation directories + an atomic pointer swap.)
+  - **Tamper is only judged at parity**: manifest head == journal head AND hashes
+    mismatch → content divergence → read-only conflict state + doctor (rev-7 rule).
 
 ## Wire protocol (newline-delimited JSON over the pipe)
 - Request: {reqId, token, epoch, clientId, as, kind:'execute', envelope} →
@@ -59,6 +79,9 @@
   redelivers (at-least-once; consumers dedup by deliveryId).
 - Queries: {kind:'query', what:'status'|'log'|...} → DTO (includes liveness: per-agent
   connectedSince, lastActivity, broker pid/epoch/heartbeatAt).
+- **Client ack contract (implementer trap)**: `pair wait` must write the delivered
+  message to stdout AND flush before sending `ack` — ack-then-crash-before-print
+  would lose the message to the agent forever, defeating at-least-once end to end.
 
 ## Lifecycle
 - CLI: connect → on ECONNREFUSED/absent, spawn detached broker, await readiness
@@ -84,16 +107,23 @@ F3  double spawn race → OS lock yields exactly one holder; loser connects
 F4  client dies with unacked delivery → lease expiry → redelivery to next wait
 F5  duplicate wait (same identity, two connections) → each delivery acked exactly once
 F6  journal crc corruption mid-history → refuse start with doctor guidance
-F7  hung broker (lock held, heartbeat stale) → steal via lease replace, epoch bump,
-    old-epoch requests rejected; PID reuse cannot fake liveness (processStartTime+nonce)
-F8  mirror states: journal-ahead lag → silent rebuild; content divergence at same
-    mirrored head → read-only conflict state
+F7  hung broker (lock held, heartbeat stale) → fencing by verified termination of the
+    exact {pid, startTime, nonce} identity, then normal acquisition with epoch bump;
+    identity mismatch (PID reuse) → refuse and report; termination unavailable →
+    "broker hung" surfaced, no takeover
+F8  mirror states: manifest behind journal head (incl. mismatched hashes from the
+    broker's own partial update) → unconditional rebuild; divergence AT parity →
+    read-only conflict state
 F9  idle shutdown vs racing new connection → connection wins or clean respawn
 F10 end-vs-grant-accept race → broker-serialized, grant mutation rejected post-end
 F11 broker crash/restart with outstanding unacked deliveries → all redelivered from
     the durable ledger, none lost, none duplicated post-ack
 F12 crash at snapshot/segment-rotation boundaries → recovery from either the old or
     new artifact, never a mixed state
+F13 stale Unix socket after kill -9 → bind gets EADDRINUSE → probe: connection
+    refused ⇒ unlink dead socket and bind; connection accepted ⇒ live broker, back off
+F14 wait crashes after ack-received but before print → framework-level ordering test:
+    delivery is only acked after stdout write+flush completes
 
 ## Non-goals now
 - No topology changes (still pair semantics), no user channel (U1), no multi-repo broker.
