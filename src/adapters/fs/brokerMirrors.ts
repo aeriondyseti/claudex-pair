@@ -80,6 +80,10 @@ export class FsMirrors implements MirrorStore {
         case 'turn-passed':
         case 'driver-changed':
         case 'session-ended':
+        case 'turn-revoked':
+        case 'agent-left':
+        case 'agent-joined':
+        case 'agent-kicked':
           break; // session.json is saved once below from post-commit state
       }
     }

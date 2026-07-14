@@ -35,6 +35,7 @@ export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 
 const COMMAND_KINDS = new Set([
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
+  'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
 ]);
 
 export type BrokerResponse =
@@ -69,6 +70,10 @@ export class BrokerCore {
   #host: BrokerHost;
 
   #serial: Promise<unknown> = Promise.resolve();
+  /** Mirror writes apply strictly in commit order — post-ack, but never
+   * interleaved: a later txn's void must not run before an earlier txn's
+   * inbox write (found live: kick-void racing the kicked mail's write). */
+  #mirrorSerial: Promise<unknown> = Promise.resolve();
   #subscriptions = new Map<string, Subscription>(); // sink id → sub
   #leases = new Map<string, Lease>(); // deliveryId → lease
   #connections = new Set<string>();
@@ -171,6 +176,21 @@ export class BrokerCore {
       meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as },
     };
     const state = this.#journal.sessionState;
+    // 8a liveness pre-check — the fact pure decide cannot know: an active
+    // delivery lease means the turn holder is mid-work; reject rather than
+    // rob them. A missing listener or expired lease admits the revocation.
+    if (command.kind === 'revoke-turn' && state && state.turn !== as) {
+      const holder = state.turn;
+      const now = Date.now();
+      const live = [...this.#leases.values()].some((lease) => {
+        if (lease.expiresAt <= now) return false;
+        const sub = this.#subscriptions.get(lease.holder);
+        return sub?.as === holder;
+      });
+      if (live) {
+        return err(reqId, 'partner-active', `${holder} holds a live delivery lease (still working) — revocation rejected. Retry after the lease expires or the reply lands.`);
+      }
+    }
     const decided = decide(state, envelope);
     if (!decided.ok) {
       // Rejections are not journaled (pure decide; retries re-evaluate).
@@ -178,6 +198,12 @@ export class BrokerCore {
       return err(reqId, code, decided.error.message);
     }
     const events = decided.value;
+    // F18/F21: roster removals void the agent's undelivered mail in the same
+    // txn — capture the open set now (pre-commit) for the mirror moves.
+    const removedAgents = events.flatMap((e) => (e.kind === 'agent-left' || e.kind === 'agent-kicked' ? [e.agent] : []));
+    const voidedPreexisting = removedAgents.length
+      ? this.#journal.openDeliveries().filter((d) => removedAgents.includes(d.message.to))
+      : [];
     let gitignoreUpdated: boolean | undefined;
     if (command.kind === 'init-session') {
       // Init writes its mirror inline so gitignoreUpdated is truthful in the
@@ -197,22 +223,36 @@ export class BrokerCore {
       events: [...events],
       data: { session: undefined as unknown, receipt, ...(gitignoreUpdated === undefined ? {} : { gitignoreUpdated }) },
     };
-    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId });
+    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
     const post = this.#journal.sessionState!;
     (response as { data: { session: unknown } }).data.session = post;
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
+      // Voided-in-same-txn deliveries are already closed — never pushed.
       const match = open.find((o) => o.deliveryId === d.deliveryId);
       return match ? [match] : [];
     });
-    // Ack the requester first (the return), then mirrors + delivery push.
-    void this.#afterCommit(post, record.events, record.seq, fresh);
+    // Voided notices enqueued by THIS txn still need their mirror moved
+    // inbox → archive (they were never open post-commit).
+    const voidedNew = removedAgents.length
+      ? record.events.flatMap((e) =>
+          e.kind === 'message-sent' && removedAgents.includes(e.to)
+            ? [{ deliveryId: `${e.id}:${e.to}`, deliverySeq: 0, message: e }]
+            : [],
+        )
+      : [];
+    // Ack the requester first (the return), then mirrors + delivery push,
+    // with mirror application serialized in commit order.
+    const voided = [...voidedPreexisting, ...voidedNew];
+    this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh, voided));
     return response;
   }
 
-  async #afterCommit(state: SessionState, events: readonly Event[], seq: number, deliveries: OpenDelivery[]): Promise<void> {
+  async #afterCommit(state: SessionState, events: readonly Event[], seq: number, deliveries: OpenDelivery[], voided: OpenDelivery[] = []): Promise<void> {
     try {
       await this.#mirrors.applyEvents(state, events, seq);
+      // Voided mail lands in the archive, never a removed agent's inbox (F18).
+      for (const delivery of voided) await this.#mirrors.applyAck(delivery, seq);
     } catch {
       /* mirror lag is recoverable by rebuild on next recovery */
     }
@@ -281,11 +321,10 @@ export class BrokerCore {
       if (!open) return { reqId, ok: true }; // idempotent (F5/F11)
       await this.#journal.ackDelivery(deliveryId, clientId, this.#clock.now());
       this.#leases.delete(deliveryId);
-      try {
-        await this.#mirrors.applyAck(open, this.#journal.headSeq);
-      } catch {
-        /* mirror lag recoverable */
-      }
+      const seq = this.#journal.headSeq;
+      this.#mirrorSerial = this.#mirrorSerial.then(() =>
+        this.#mirrors.applyAck(open, seq).catch(() => undefined /* mirror lag recoverable */),
+      );
       return { reqId, ok: true };
     });
   }

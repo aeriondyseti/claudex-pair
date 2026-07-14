@@ -56,6 +56,15 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         state: 'cancelled',
         result: event.reason || g.result,
       }));
+    case 'turn-revoked':
+      // The turn mutation itself travels as the paired turn-passed event;
+      // the revocation event is the journaled provenance record.
+      return state;
+    case 'agent-left':
+    case 'agent-kicked':
+      return state && { ...state, agents: state.agents.filter((a) => a !== event.agent) };
+    case 'agent-joined':
+      return state && { ...state, agents: [...state.agents, event.agent] };
     case 'message-sent':
       return state; // delivery is the Mailbox port's concern, not session state
   }

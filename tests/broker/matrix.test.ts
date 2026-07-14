@@ -1,5 +1,3 @@
-import { describe, test } from 'bun:test';
-
 /**
  * BROKER-SPEC failure-matrix COVERAGE MAP. The W1 skeleton's F1–F14 todos
  * are all implemented as concrete tests; this file records where, so the
@@ -33,39 +31,18 @@ import { describe, test } from 'bun:test';
  * - F14 print+flush-before-ack, both crash boundaries + open-beats-cursor resume
  *                                    → tests/integration/broker-client.test.ts (loopback), unit in brokerWait
  *
- * F15–F22 (turn revocation 8a + roster/close authority 11) are W2c scope —
- * real todos below, quoting the spec so implementers convert without
- * re-reading it.
+ * F15–F22 (W2c: turn revocation 8a + roster/close authority 11):
+ *
+ * - F15 revoke-vs-reply race        → tests/broker/matrix-server.test.ts (both orders)
+ * - F16 partner-active lease guard  → tests/broker/matrix-server.test.ts
+ * - F17 leave returns turn same txn → tests/core/roster-revoke.test.ts
+ * - F18 removal voids deliveries    → tests/broker/matrix-server.test.ts (server slice);
+ *                                     client-driven rejoin flow lands with the W2c CLI lane
+ * - F19 end-not-driver (end + raw done-send) → tests/core/transitions.jsonl DEC-29/30/31
+ * - F20 leave-with-grant            → tests/core/transitions.jsonl DEC-36/37
+ * - F21 kick cancels grants same txn → tests/core/roster-revoke.test.ts
+ * - F22 init-not-driver             → tests/core/transitions.jsonl DEC-28 (+ DEC-04 ordering)
+ *
+ * This file is intentionally test-free: it is the index of the matrix.
  */
-
-describe('F15', () => {
-  test.todo('revoke-vs-reply race → broker-serialized: whichever envelope commits first wins; the late reply is archived advisory (stale-turn), never a turn mutation — at no point do two agents hold the turn', () => {});
-});
-
-describe('F16', () => {
-  test.todo('revoke attempt while the navigator holds a live delivery lease (heartbeating) → rejected partner-active; after lease expiry with no ack, the same revoke commits', () => {});
-});
-
-describe('F17', () => {
-  test.todo('navigator leaves while holding the turn → turn returns to the driver in the same committed txn; a post-rejoin reply bearing the old turn is stale (per F15)', () => {});
-});
-
-describe('F18', () => {
-  test.todo('leave/kick with enqueued undelivered deliveries → voided to the archive in the same committed txn; nothing is ever delivered to a removed agent; a later rejoin starts from a fresh delivery cursor (no stale redelivery)', () => {});
-});
-
-describe('F19', () => {
-  test.todo('navigator end-session or done-send → rejected end-not-driver; the rejection makes no state change and is not journaled (retried rejections re-evaluate per the retry contract)', () => {});
-});
-
-describe('F20', () => {
-  test.todo('voluntary leave while holding an offered/active grant → rejected leave-with-grant; after grant-done or a driver cancel, the same leave commits', () => {});
-});
-
-describe('F21', () => {
-  test.todo('kick of a grant-holding navigator → open grants cancelled in the same committed txn (the stop-notice to the kicked agent is voided with its other deliveries); grant scope/worktree ownership released; driver reissues to reassign', () => {});
-});
-
-describe('F22', () => {
-  test.todo('init issued by a principal other than the declared driver → rejected init-not-driver (roster authority is uniform from session creation onward)', () => {});
-});
+export {};

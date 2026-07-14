@@ -20,7 +20,19 @@ export type ProtocolErrorCode =
   | 'grant-id-collision'
   | 'grant-not-found'
   | 'grant-wrong-assignee'
-  | 'grant-stale-transition';
+  | 'grant-stale-transition'
+  // ENHANCEMENTS 8a/11 (W2c)
+  | 'revoke-not-driver'
+  | 'revoke-own-turn'
+  | 'partner-active'
+  | 'end-not-driver'
+  | 'init-not-driver'
+  | 'driver-cannot-leave'
+  | 'leave-with-grant'
+  | 'join-not-driver'
+  | 'already-participant'
+  | 'kick-not-driver'
+  | 'kick-driver';
 
 export class ProtocolError extends Error {
   constructor(

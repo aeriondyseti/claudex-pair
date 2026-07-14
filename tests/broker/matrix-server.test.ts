@@ -229,3 +229,108 @@ describe('F10', () => {
     }
   }, 20_000);
 });
+
+function makeSink(as: string, got: unknown[]): import('@broker/ports.ts').DeliverySink {
+  return {
+    id: `sink-${as}`,
+    sendDelivery: async (push) => {
+      got.push(push);
+    },
+    sendError: async () => undefined,
+  };
+}
+
+describe('F15', () => {
+  test('revoke-vs-reply race → broker-serialized: whichever envelope commits first wins; the late reply is a rejected turn mutation — at no point do two agents hold the turn', async () => {
+    // Order A: revoke enters the single-writer chain first.
+    const rootA = await tempRoot();
+    const coreA = makeCore(rootA);
+    await coreA.recover();
+    await seedSession(coreA, 'f15a');
+    await coreA.execute('f15a-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    const [revokeA, replyA] = await Promise.all([
+      coreA.execute('f15a-revoke', 'client-a', 'claude', { command: { kind: 'revoke-turn', reason: 'stalled' } }),
+      coreA.execute('f15a-reply', 'client-b', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'answer', turn: 'pass', body: 'late' } }),
+    ]);
+    expect(revokeA.ok).toBeTrue();
+    expect(replyA.ok).toBeFalse();
+    if (!replyA.ok) expect(replyA.error.code).toBe('not-your-turn');
+    const grantsA = await coreA.query('f15a-status', 'status');
+    if (grantsA.ok) expect((grantsA.data as { session: { turn: string } }).session.turn).toBe('claude');
+
+    // Order B: the reply lands first; the revoke is decided post-commit.
+    const rootB = await tempRoot();
+    const coreB = makeCore(rootB);
+    await coreB.recover();
+    await seedSession(coreB, 'f15b');
+    await coreB.execute('f15b-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    const [replyB, revokeB] = await Promise.all([
+      coreB.execute('f15b-reply', 'client-b', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'answer', turn: 'pass', body: 'in time' } }),
+      coreB.execute('f15b-revoke', 'client-a', 'claude', { command: { kind: 'revoke-turn', reason: 'stalled' } }),
+    ]);
+    expect(replyB.ok).toBeTrue();
+    expect(revokeB.ok).toBeFalse();
+    if (!revokeB.ok) expect(revokeB.error.code).toBe('revoke-own-turn');
+  }, 20_000);
+});
+
+describe('F16', () => {
+  test('revoke attempt while the navigator holds a live delivery lease → rejected partner-active; after lease expiry with no ack, the same revoke commits', async () => {
+    const root = await tempRoot();
+    const core = new BrokerCore(
+      join(root, '.pair'),
+      { clock: systemClock, ids: systemIds, mirrors: new FsMirrors(root), codec: fsMessageCodec },
+      { ...DEFAULT_CONFIG, idleGraceMs: 60_000, deliveryLeaseMs: 1_200 },
+      { onStopped: () => undefined, pid: process.pid, epoch: 1, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
+    );
+    await core.recover();
+    await seedSession(core, 'f16');
+    await core.execute('f16-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    // A live subscriber takes the delivery lease (still working).
+    const got: unknown[] = [];
+    await core.subscribe('f16-sub', makeSink('codex', got), 'codex', 0);
+    await Bun.sleep(100);
+    expect(got.length).toBe(1);
+
+    const early = await core.execute('f16-revoke-early', 'client-a', 'claude', { command: { kind: 'revoke-turn', reason: 'impatient' } });
+    expect(early.ok).toBeFalse();
+    if (!early.ok) expect(early.error.code).toBe('partner-active');
+
+    await Bun.sleep(1_500); // lease expires, no ack
+    const late = await core.execute('f16-revoke-late', 'client-a', 'claude', { command: { kind: 'revoke-turn', reason: 'now stale' } });
+    expect(late.ok).toBeTrue();
+  }, 20_000);
+});
+
+describe('F18 (server slice)', () => {
+  test('kick with enqueued undelivered deliveries → voided to the archive in the same committed txn; nothing delivered to the removed agent; rejoin starts fresh', async () => {
+    const root = await tempRoot();
+    const core = makeCore(root);
+    await core.recover();
+    await seedSession(core, 'f18');
+    await core.execute('f18-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'pending one' } });
+    const kick = await core.execute('f18-kick', 'client-a', 'claude', { command: { kind: 'kick-agent', agent: 'codex', reason: 'gone' } });
+    expect(kick.ok).toBeTrue();
+    // Same txn: no open deliveries remain for codex (incl. the kick notice).
+    expect(core.journal.openDeliveriesFor('codex')).toHaveLength(0);
+    await Bun.sleep(300); // post-ack mirror moves
+    const inbox = await import('node:fs/promises').then((fs) => fs.readdir(join(root, '.pair', 'inbox', 'codex')).catch(() => []));
+    expect(inbox).toHaveLength(0);
+    const archive = await import('node:fs/promises').then((fs) => fs.readdir(join(root, '.pair', 'archive')).catch(() => []));
+    expect(archive.length).toBeGreaterThanOrEqual(2); // pending ask + kick notice
+
+    // A subscriber for the removed agent gets nothing redelivered.
+    const got: unknown[] = [];
+    await core.subscribe('f18-sub', makeSink('codex', got), 'codex', 0);
+    await Bun.sleep(100);
+    expect(got).toHaveLength(0);
+
+    // Rejoin (driver-admitted) is a fresh roster entry — only the join
+    // notice is open for it; nothing stale from before the kick.
+    const rejoin = await core.execute('f18-join', 'client-a', 'claude', { command: { kind: 'join-session', agent: 'codex' } });
+    expect(rejoin.ok).toBeTrue();
+    const openNow = core.journal.openDeliveriesFor('codex');
+    expect(openNow).toHaveLength(1);
+    expect(openNow[0]!.message.type).toBe('join');
+  }, 20_000);
+});

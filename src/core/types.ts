@@ -17,7 +17,12 @@ export type MessageType =
   | 'done'
   | 'grant'
   | 'grant-done'
-  | 'grant-cancel';
+  | 'grant-cancel'
+  | 'propose-end'
+  | 'turn-revoked'
+  | 'leave'
+  | 'join'
+  | 'kick';
 
 export type TurnMode = 'pass' | 'keep';
 

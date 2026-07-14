@@ -17,7 +17,7 @@ export function decide(
   const { command, meta } = envelope;
   switch (command.kind) {
     case 'init-session':
-      return decideInit(state, command, meta.at);
+      return decideInit(state, command, meta.principal, meta.at);
     case 'send-message':
       return withActive(state, (s) => decideSend(s, command, envelope));
     case 'end-session':
@@ -45,7 +45,140 @@ export function decide(
       }, GRANT_INACTIVE);
     case 'cancel-grant':
       return withActive(state, (s) => decideCancelGrant(s, command, envelope), GRANT_INACTIVE);
+    case 'revoke-turn':
+      return withActive(state, (s) => decideRevokeTurn(s, command, envelope));
+    case 'leave-session':
+      return withActive(state, (s) => decideLeave(s, envelope));
+    case 'join-session':
+      return withActive(state, (s) => decideJoin(s, command, envelope));
+    case 'kick-agent':
+      return withActive(state, (s) => decideKick(s, command, envelope));
   }
+}
+
+/**
+ * ENHANCEMENTS 8a: the driver reclaims the turn from an unresponsive holder.
+ * Hard authorization here (driver-only, active, partner holds the turn);
+ * liveness (live delivery lease → partner-active) is the broker's pre-check —
+ * a fact this pure core cannot know. The notice to the revoked navigator and
+ * the turn return are ONE decided event list, so they commit in one txn.
+ */
+function decideRevokeTurn(
+  s: SessionState,
+  command: Extract<Command, { kind: 'revoke-turn' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const by = envelope.meta.principal;
+  const bad = assertParticipant(s, by, '-From');
+  if (bad) return err(bad);
+  if (by !== s.driver) {
+    return err(new ProtocolError('revoke-not-driver', `Only the driver (${s.driver}) may revoke the turn (you are '${by}').`));
+  }
+  if (s.turn === by) {
+    return err(new ProtocolError('revoke-own-turn', 'You already hold the turn; there is nothing to revoke.'));
+  }
+  const holder = s.turn;
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  return ok([
+    { kind: 'turn-revoked', from: holder, reason: command.reason, at: envelope.meta.at },
+    messageEvent(envelope, by, holder, 'turn-revoked', `TURN REVOKED by ${by} while you held it.${reasonSuffix} The driver has resumed; a reply you were composing is now advisory — send it with -Turn keep.`),
+    { kind: 'turn-passed', to: by },
+  ]);
+}
+
+/**
+ * ENHANCEMENTS 11: voluntary leave. Blocked while holding an offered/active
+ * grant; leaving while holding the turn returns it to the driver in the same
+ * txn; the driver cannot leave (handoff first).
+ */
+function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[], ProtocolError> {
+  const agent = envelope.meta.principal;
+  const bad = assertParticipant(s, agent, '-As');
+  if (bad) return err(bad);
+  if (agent === s.driver) {
+    return err(new ProtocolError('driver-cannot-leave', 'The driver cannot leave the session — hand off first (pair send -Type handoff), or end it.'));
+  }
+  const held = Object.values(s.grants).find((g) => g.assignee === agent && (g.state === 'offered' || g.state === 'active'));
+  if (held) {
+    return err(
+      new ProtocolError(
+        'leave-with-grant',
+        `Cannot leave while grant '${held.id}' is ${held.state} — finish it (pair grant-done) or have the driver cancel it first.`,
+      ),
+    );
+  }
+  const events: Event[] = [
+    { kind: 'agent-left', agent, at: envelope.meta.at },
+    messageEvent(envelope, agent, s.driver, 'leave', `${agent} left the session.`),
+  ];
+  if (s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
+  return ok(events);
+}
+
+/**
+ * ENHANCEMENTS 11: joins are driver-admitted — the DRIVER issues the join
+ * for the arriving agent (roster authority is the driver's, uniformly).
+ */
+function decideJoin(
+  s: SessionState,
+  command: Extract<Command, { kind: 'join-session' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const by = envelope.meta.principal;
+  const bad = assertParticipant(s, by, '-From');
+  if (bad) return err(bad);
+  if (by !== s.driver) {
+    return err(new ProtocolError('join-not-driver', `Only the driver (${s.driver}) admits agents to the roster (you are '${by}').`));
+  }
+  if (s.agents.includes(command.agent)) {
+    return err(new ProtocolError('already-participant', `'${command.agent}' is already a participant.`));
+  }
+  if (!AGENT_NAME_PATTERN.test(command.agent)) {
+    return err(new ProtocolError('invalid-agents', `invalid agent name '${command.agent}' (lowercase letter first, then letters/digits/dash/underscore, max 16 chars)`));
+  }
+  return ok([
+    { kind: 'agent-joined', agent: command.agent, at: envelope.meta.at },
+    messageEvent(
+      envelope,
+      by,
+      command.agent,
+      'join',
+      `${command.agent} joined the session (admitted by ${by}). Catch up via .pair/memory.md and a rehydrate ask — earlier messages are not redelivered.`,
+    ),
+  ]);
+}
+
+/**
+ * ENHANCEMENTS 11: driver-only forced removal. Open grants of the kicked
+ * agent are cancelled in the SAME decided event list (one txn, F21); the
+ * ledger layer voids the agent's undelivered deliveries (F18).
+ */
+function decideKick(
+  s: SessionState,
+  command: Extract<Command, { kind: 'kick-agent' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const by = envelope.meta.principal;
+  const bad = assertParticipant(s, by, '-From') ?? assertParticipant(s, command.agent, '-Agent');
+  if (bad) return err(bad);
+  if (by !== s.driver) {
+    return err(new ProtocolError('kick-not-driver', `Only the driver (${s.driver}) may kick (you are '${by}').`));
+  }
+  if (command.agent === s.driver) {
+    return err(new ProtocolError('kick-driver', 'The driver cannot be kicked — hand off first.'));
+  }
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  const events: Event[] = [{ kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at }];
+  for (const g of Object.values(s.grants)) {
+    if (g.assignee === command.agent && (g.state === 'offered' || g.state === 'active')) {
+      events.push({ kind: 'grant-cancelled', grantId: g.id, reason: `assignee kicked${reasonSuffix}`, at: envelope.meta.at });
+    }
+  }
+  // The stop-notice is emitted normally; the ledger voids it with the rest
+  // of the kicked agent's deliveries (F21) — journaled, never delivered.
+  events.push(messageEvent(envelope, by, command.agent, 'kick', `You were removed from the session by ${by}.${reasonSuffix} Stop all work immediately.`));
+  if (s.turn === command.agent) events.push({ kind: 'turn-passed', to: by });
+  return ok(events);
 }
 
 /** pair.ps1 parity: grant verbs report inactivity differently than send. */
@@ -82,6 +215,7 @@ function assertParticipant(s: SessionState, name: string, param: string): Protoc
 function decideInit(
   state: SessionState | undefined,
   command: Extract<Command, { kind: 'init-session' }>,
+  principal: string,
   at: string,
 ): Result<Event[], ProtocolError> {
   if (state && state.status === 'active') {
@@ -111,6 +245,18 @@ function decideInit(
   }
   if (!agents.includes(command.driver)) {
     return err(new ProtocolError('driver-not-agent', `driver '${command.driver}' must be one of the agents: ${agents.join(', ')}`));
+  }
+  // ENHANCEMENTS 11 (F22): roster authority is the driver's from session
+  // creation onward — init must be issued AS the agent that becomes driver.
+  // Checked after roster-shape validation so a malformed roster reports the
+  // more diagnostic error first (DEC-04).
+  if (principal !== command.driver) {
+    return err(
+      new ProtocolError(
+        'init-not-driver',
+        `init must be issued as the agent that becomes driver ('${command.driver}'), not '${principal}' — the initial roster is driver-declared.`,
+      ),
+    );
   }
   return ok([{ kind: 'session-initialized', task: command.task, agents, driver: command.driver, at }]);
 }
@@ -148,6 +294,17 @@ function decideSend(
   if (command.type === 'handoff' && s.driver !== from) {
     return err(new ProtocolError('handoff-not-driver', `Only the driver (${s.driver}) may send handoff (you are '${from}').`));
   }
+  // ENHANCEMENTS 11 (F19): ending is driver authority — the raw done-send
+  // completion path is not a loophole. Navigators propose via
+  // `send -Type propose-end`; the driver decides and executes the end.
+  if (command.type === 'done' && s.driver !== from) {
+    return err(
+      new ProtocolError(
+        'end-not-driver',
+        `Only the driver (${s.driver}) may end the session (you are '${from}'). Propose it instead: pair send -Type propose-end -Turn keep -Message '<why>'`,
+      ),
+    );
+  }
   const events: Event[] = [
     { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at },
   ];
@@ -167,6 +324,15 @@ function decideEnd(
   const by = envelope.meta.principal;
   const bad = assertParticipant(s, by, '-As');
   if (bad) return err(bad);
+  // ENHANCEMENTS 11 (F19): end is driver authority — ending kicks everyone.
+  if (by !== s.driver) {
+    return err(
+      new ProtocolError(
+        'end-not-driver',
+        `Only the driver (${s.driver}) may end the session (you are '${by}'). Propose it instead: pair send -Type propose-end -Turn keep -Message '<why>'`,
+      ),
+    );
+  }
   const events: Event[] = [{ kind: 'session-ended', by, summary: command.summary, at: envelope.meta.at }];
   // Fan-out messages need DISTINCT ids: the mailbox file name is derived from
   // the id, and same-named files for different recipients later collide in

@@ -17,7 +17,15 @@ export type Command =
   | { kind: 'issue-grant'; grantId: GrantId; to: AgentId; task: string; scope: GrantScopeInput; agreedIn: MessageId | '' }
   | { kind: 'accept-grant'; grantId: GrantId }
   | { kind: 'complete-grant'; grantId: GrantId; result: string }
-  | { kind: 'cancel-grant'; grantId: GrantId; reason: string };
+  | { kind: 'cancel-grant'; grantId: GrantId; reason: string }
+  // ENHANCEMENTS 8a: driver reclaims the turn from an unresponsive holder.
+  // Elapsed-time policy is CLI-side attestation (-ConfirmUnresponsive); the
+  // broker contributes the liveness fact (live lease → partner-active).
+  | { kind: 'revoke-turn'; reason: string }
+  // ENHANCEMENTS 11: roster mutations — driver authority, uniformly.
+  | { kind: 'leave-session' }
+  | { kind: 'join-session'; agent: AgentId }
+  | { kind: 'kick-agent'; agent: AgentId; reason: string };
 
 export type GrantScopeInput =
   | { mode: 'worktree'; worktree: string }

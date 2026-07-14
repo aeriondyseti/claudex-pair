@@ -28,4 +28,12 @@ export type Event =
   | { kind: 'grant-issued'; grantId: GrantId; issuer: AgentId; assignee: AgentId; task: string; scope: GrantScope; agreedIn: MessageId | ''; at: Timestamp }
   | { kind: 'grant-accepted'; grantId: GrantId; at: Timestamp }
   | { kind: 'grant-completed'; grantId: GrantId; result: string; at: Timestamp }
-  | { kind: 'grant-cancelled'; grantId: GrantId; reason: string; at: Timestamp };
+  | { kind: 'grant-cancelled'; grantId: GrantId; reason: string; at: Timestamp }
+  // ENHANCEMENTS 8a/11 — turn revocation + roster lifecycle. The revocation
+  // notice and turn return travel in the SAME decided event list (one txn);
+  // roster removals additionally void the agent's open deliveries at the
+  // ledger layer (broker), never here.
+  | { kind: 'turn-revoked'; from: AgentId; reason: string; at: Timestamp }
+  | { kind: 'agent-left'; agent: AgentId; at: Timestamp }
+  | { kind: 'agent-joined'; agent: AgentId; at: Timestamp }
+  | { kind: 'agent-kicked'; agent: AgentId; reason: string; at: Timestamp };

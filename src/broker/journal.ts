@@ -21,6 +21,13 @@ export type TxnRecord = {
   at: string;
   events: Event[];
   deliveries: DeliveryRef[];
+  /**
+   * Deliveries CLOSED by this txn without consumption (F18/F21): a removed
+   * agent's undelivered mail — including notices enqueued by this very txn —
+   * voided to the archive in the same committed record. Optional for
+   * backward compatibility with pre-W2c journals.
+   */
+  voided?: DeliveryRef[];
   outcome: unknown;
   crc32: number;
 };
@@ -182,6 +189,9 @@ export class Journal {
     if (record.events.length === 0) {
       for (const d of record.deliveries) this.open_.delete(d.deliveryId);
     }
+    // Voided deliveries close in the SAME txn (F18/F21) — after enqueues, so
+    // a notice enqueued and voided by one record nets out closed on replay.
+    for (const d of record.voided ?? []) this.open_.delete(d.deliveryId);
     this.lastSeq = record.seq;
     for (const d of record.deliveries) {
       if (d.deliverySeq > this.lastDeliverySeq) this.lastDeliverySeq = d.deliverySeq;
@@ -203,17 +213,35 @@ export class Journal {
     }
   }
 
-  /** Commit an effectful transaction: fsync before returning (spec: before ack). */
+  /**
+   * Commit an effectful transaction: fsync before returning (spec: before
+   * ack). `voidRecipients` closes every open delivery addressed to those
+   * agents — pre-existing AND enqueued by this very txn — in the same record
+   * (F18/F21: removal voids undelivered mail, including the stop-notice).
+   */
   async commit(
     envelope: CommandEnvelope,
     events: readonly Event[],
     outcome: unknown,
     reqIdentity: { clientId: string; reqId: string },
+    voidRecipients: readonly string[] = [],
   ): Promise<TxnRecord> {
     const deliveries: DeliveryRef[] = [];
     for (const event of events) {
       if (event.kind === 'message-sent') {
         deliveries.push({ deliveryId: `${event.id}:${event.to}`, deliverySeq: ++this.lastDeliverySeq });
+      }
+    }
+    const voided: DeliveryRef[] = [];
+    if (voidRecipients.length) {
+      for (const open of this.open_.values()) {
+        if (voidRecipients.includes(open.message.to)) voided.push({ deliveryId: open.deliveryId, deliverySeq: open.deliverySeq });
+      }
+      for (const event of events) {
+        if (event.kind === 'message-sent' && voidRecipients.includes(event.to)) {
+          const ref = deliveries.find((d) => d.deliveryId === `${event.id}:${event.to}`);
+          if (ref) voided.push(ref);
+        }
       }
     }
     const record: Omit<TxnRecord, 'crc32'> = {
@@ -224,6 +252,7 @@ export class Journal {
       at: envelope.meta.at,
       events: [...events],
       deliveries,
+      ...(voided.length ? { voided } : {}),
       outcome,
     };
     await this.appendLine(encodeRecord(record));
