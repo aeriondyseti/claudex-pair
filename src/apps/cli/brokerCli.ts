@@ -23,6 +23,12 @@ export async function runBrokerCli(command: string, flags: Flags, positionals: s
       throw new Error("pair broker requires 'status' or 'stop'");
     }
     if (command === 'ask') { flags.set('type', 'ask'); flags.set('from', str(flags, 'from') ?? str(flags, 'as') ?? ''); return runBrokerCli('send', flags, positionals, root); }
+    if (command === 'propose-end') {
+      required(flags, 'from', 'propose-end requires -From <you>');
+      const status = await gateway.status();
+      flags.set('to', status.session.driver); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
+      return runBrokerCli('send', flags, positionals, root);
+    }
     if (command === 'init') {
       const task = required(flags, 'task', "init requires -Task '<what the agents are building>'");
       const agents = (str(flags, 'agents') ?? 'claude,codex').split(',').map((a) => a.trim().toLowerCase()).filter(Boolean);
@@ -53,6 +59,16 @@ export async function runBrokerCli(command: string, flags: Flags, positionals: s
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') { const messages = await gateway.log(num(flags, 'tail', 10)); if (!messages.length) out('No archived messages yet.'); for (const m of messages) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`); return 0; }
     if (command === 'grants') { const grants = [...await gateway.grants()].sort((a, b) => a.id.localeCompare(b.id)); if (has(flags, 'json')) out(JSON.stringify(grants, null, 2)); else if (!grants.length) out('No grants in this session.'); else for (const g of grants) { out(`${g.id}  [${g.state}]  ${g.issuer} -> ${g.assignee}  ${g.scope.mode === 'worktree' ? `worktree ${g.scope.worktree}` : `files: ${g.scope.files.join(', ')}`}`); out(`    task: ${g.task}${g.result ? `\n    result: ${g.result}` : ''}`); } return 0; }
+    if (command === 'revoke-turn') {
+      const from = required(flags, 'from', 'revoke-turn requires -From <driver>').toLowerCase();
+      if (!has(flags, 'confirmunresponsive')) throw new Error('revoke-turn requires -ConfirmUnresponsive: explicitly attest that the turn holder is unresponsive.');
+      const r = await execute(gateway, from, { kind: 'revoke-turn', reason: str(flags, 'reason') ?? '' });
+      const revoked = r.events.find((e) => e.kind === 'turn-revoked');
+      out(`Turn revoked from ${revoked?.kind === 'turn-revoked' ? revoked.from : 'partner'}; ${from} now holds the turn. Broker liveness guard verified there was no live delivery lease.`); return 0;
+    }
+    if (command === 'leave') { const as = required(flags, 'as', 'leave requires -As <you>').toLowerCase(); await execute(gateway, as, { kind: 'leave-session' }); out(`${as} left the session.`); return 0; }
+    if (command === 'join') { const from = required(flags, 'from', 'join requires -From <driver>').toLowerCase(); const agent = required(flags, 'agent', 'join requires -Agent <name>').toLowerCase(); await execute(gateway, from, { kind: 'join-session', agent }); out(`${agent} joined the session. Earlier deliveries are not replayed; the rejoined agent starts with a fresh cursor.`); return 0; }
+    if (command === 'kick') { const from = required(flags, 'from', 'kick requires -From <driver>').toLowerCase(); const agent = required(flags, 'agent', 'kick requires -Agent <name>').toLowerCase(); await execute(gateway, from, { kind: 'kick-agent', agent, reason: str(flags, 'reason') ?? '' }); out(`${agent} was removed from the session; its pending deliveries were voided.`); return 0; }
     if (command === 'end') {
       const as = required(flags, 'as', 'end requires -As <your own agent name>').toLowerCase();
       const summary = str(flags, 'file') || str(flags, 'message') ? await bodyFrom(flags) : 'Session ended.';

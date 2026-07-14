@@ -65,10 +65,18 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File D:\Development\claudex\bin\pair.ps
 
 ## Ending
 
-When the user confirms the task is done while the session is active:
-`pair end -As codex -Message '<what was accomplished>'` — then give the user
-a normal wrap-up. If a `done` message arrives, the session is already complete:
-never wait or send again; just wrap up for the user.
+Only the driver may end. If you navigate and believe work is complete, run
+`pair propose-end -From codex -Message '<why>'`; it keeps the turn and asks the
+driver to decide. When the user confirms and you are driver, run `pair end -As
+codex -Message '<what was accomplished>'`. After `done`, never wait or send.
+
+## Turn recovery and roster
+
+The driver may use `pair revoke-turn -From codex -ConfirmUnresponsive
+[-Reason '<why>']`; broker mode refuses while the holder has a live delivery
+lease, while fs mode has no liveness guard beyond this explicit attestation.
+Use `leave -As codex`, or as driver `join -From codex -Agent <name>` and `kick
+-From codex -Agent <name> [-Reason ...]`. Rejoin never replays old mail.
 
 ## Work grants (parallel editing)
 

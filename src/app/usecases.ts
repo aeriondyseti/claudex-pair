@@ -113,6 +113,22 @@ export async function cancelGrant(deps: Deps, args: { as: AgentId; grantId: stri
   return execute(deps, args.as, { kind: 'cancel-grant', grantId: args.grantId, reason: args.reason });
 }
 
+export async function revokeTurn(deps: Deps, args: { from: AgentId; reason: string }) {
+  return execute(deps, args.from, { kind: 'revoke-turn', reason: args.reason });
+}
+
+export async function leaveSession(deps: Deps, args: { as: AgentId }) {
+  return execute(deps, args.as, { kind: 'leave-session' });
+}
+
+export async function joinSession(deps: Deps, args: { from: AgentId; agent: AgentId }) {
+  return execute(deps, args.from, { kind: 'join-session', agent: args.agent });
+}
+
+export async function kickAgent(deps: Deps, args: { from: AgentId; agent: AgentId; reason: string }) {
+  return execute(deps, args.from, { kind: 'kick-agent', agent: args.agent, reason: args.reason });
+}
+
 export type WaitOutcome =
   | { kind: 'delivered'; messages: readonly StoredMessage[]; session: SessionState }
   | { kind: 'timeout' };
