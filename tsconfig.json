@@ -16,7 +16,8 @@
     "paths": {
       "@core/*": ["src/core/*"],
       "@app/*": ["src/app/*"],
-      "@adapters/*": ["src/adapters/*"]
+      "@adapters/*": ["src/adapters/*"],
+      "@broker/*": ["src/broker/*"]
     }
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"]
