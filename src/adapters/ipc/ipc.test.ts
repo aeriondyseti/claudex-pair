@@ -11,7 +11,7 @@ async function pair() {
   const root = await mkdtemp(join(tmpdir(), 'claudex-ipc-')); const endpoint = endpointFor(root, 7);
   const server = new IpcServer({ endpoint, token: 'secret', epoch: 7, handler: async (frame, connection) => {
     if (frame.kind === 'execute') return { reqId: frame.reqId, ok: true, seq: 9, events: [frame.envelope] };
-    if (frame.kind === 'subscribe') await connection.send({ kind: 'delivery', deliverySeq: 3, deliveryId: 'm:codex', message: 'hello' });
+    if (frame.kind === 'subscribe') { await connection.send({ kind: 'delivery', deliverySeq: 3, deliveryId: 'm:codex', message: 'hello' }); return { reqId: frame.reqId, ok: true }; }
   }});
   await server.listen(); cleanups.push(() => server.close(), () => rm(root, { recursive: true, force: true }));
   return { endpoint, server };

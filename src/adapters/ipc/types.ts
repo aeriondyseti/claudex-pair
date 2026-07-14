@@ -1,9 +1,9 @@
 export type WireBase = { token: string; epoch: number; clientId: string };
 export type ExecuteFrame = WireBase & { kind: 'execute'; reqId: string; as: string; envelope: unknown };
-export type QueryFrame = WireBase & { kind: 'query'; reqId: string; what: string };
-export type SubscribeFrame = WireBase & { kind: 'subscribe'; as: string; afterDeliverySeq: number };
-export type AckFrame = WireBase & { kind: 'ack'; deliveryId: string };
-export type ExtendFrame = WireBase & { kind: 'extend'; deliveryId: string };
+export type QueryFrame = WireBase & { kind: 'query'; reqId: string; what: string; args?: unknown };
+export type SubscribeFrame = WireBase & { kind: 'subscribe'; reqId: string; as: string; afterDeliverySeq: number };
+export type AckFrame = WireBase & { kind: 'ack'; reqId: string; deliveryId: string };
+export type ExtendFrame = WireBase & { kind: 'extend'; reqId: string; deliveryId: string };
 export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame;
 
 export type ErrorFrame = { reqId?: string; ok: false; error: { code: string; message: string } };

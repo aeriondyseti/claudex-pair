@@ -97,7 +97,7 @@ async function main(): Promise<number> {
     join(root, '.pair'),
     { clock, ids: systemIds, mirrors: new FsMirrors(root), codec: fsMessageCodec },
     config,
-    { onStopped: () => void stop(0), pid: process.pid, epoch, heartbeatAt: () => heartbeatAt },
+    { onStopped: () => void stop(0), pid: process.pid, epoch, endpoint, heartbeatAt: () => heartbeatAt },
   );
 
   const mode = await core.recover();
@@ -110,7 +110,7 @@ async function main(): Promise<number> {
       case 'execute':
         return (await core.execute(frame.reqId, frame.clientId, frame.as, frame.envelope)) as ServerFrame;
       case 'query': {
-        const response = (await core.query(frame.reqId, frame.what)) as ServerFrame;
+        const response = (await core.query(frame.reqId, frame.what, frame.args)) as ServerFrame;
         if (frame.what === 'broker-stop') {
           // Respond-then-close (drain contract): the response frame goes out
           // on the returned promise; teardown follows once it has flushed.
@@ -119,14 +119,11 @@ async function main(): Promise<number> {
         return response;
       }
       case 'subscribe':
-        await core.subscribe(asSink(connection), frame.as, frame.afterDeliverySeq);
-        return;
+        return (await core.subscribe(frame.reqId, asSink(connection), frame.as, frame.afterDeliverySeq)) as ServerFrame;
       case 'ack':
-        await core.ack(frame.deliveryId, frame.clientId);
-        return;
+        return (await core.ack(frame.reqId, frame.deliveryId, frame.clientId)) as ServerFrame;
       case 'extend':
-        core.extend(frame.deliveryId);
-        return;
+        return core.extend(frame.reqId, frame.deliveryId) as ServerFrame;
     }
   };
 
