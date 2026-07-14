@@ -36,15 +36,20 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File D:\Development\claudex\bin\pair.ps
    files as navigator.
 2. Work in small increments. At each checkpoint, record durable decisions in
    `.pair/memory.md` (append-only), then pass the turn:
-   `pair send -From codex -To <agent> -Type ask|answer|review|handoff -Message '<short, concrete>'`
+   `pair send -From codex -To <agent> -Type ask|answer|review|handoff -TimeoutSec 240 -PollSec 5 -Message '<short, concrete>'`
    (`-To` may be omitted only when exactly one other agent is present.)
-   For long bodies or tricky quoting, write the body to a temp file and use
-   `-File <path>` instead of `-Message`.
-3. Then block for the reply:
+   A turn-passing send FUSES the wait: the command blocks and returns when
+   the reply arrives. Exit 0 = message delivered — read the output; it states
+   whose turn it is. Exit 2 = timeout and the send COMMITTED — NEVER re-send;
+   re-arm with standalone wait (step 3). For long bodies or tricky quoting,
+   write the body to a temp file and use `-File <path>` instead of `-Message`.
+3. To wait without sending (joining, re-arming after an FYI wake or exit 2):
    `pair wait -As codex -TimeoutSec 240 -PollSec 5`
-   Exit 0 = message delivered, act on it. Exit 2 = timeout, partner still
-   working — immediately run the same wait command again (keep re-running on
-   exit 2; this is the designed idle loop, not an error).
+   Exit 0 = message delivered — read the output: act only if it says the
+   turn is now yours; an FYI wake means note the content and re-arm the same
+   wait. Exit 2 = timeout, partner still working — immediately run the same
+   wait command again (keep re-running on exit 2; this is the designed idle
+   loop, not an error).
 
 ## Etiquette (deltas from normal work)
 

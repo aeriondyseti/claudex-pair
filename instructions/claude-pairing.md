@@ -36,14 +36,20 @@ Always run it from the target repo (state lives in `<repo>/.pair/`).
    as **navigator** you review code in the repo and direct — you NEVER edit
    files as navigator.
 2. Work in small increments. At each checkpoint, record durable decisions in
-   `.pair/memory.md` (append-only), then pass the turn:
+   `.pair/memory.md` (append-only), then pass the turn — run the send with
+   the Bash tool and `run_in_background: true`:
    `$PAIR send -From claude -Type ask|answer|review|handoff -Message '<short, concrete>'`
-   For long bodies or tricky quoting, write the body to a temp file and use
-   `-File <path>` instead of `-Message`.
-3. Then block for the reply — use the Bash tool with `run_in_background: true`:
-   `$PAIR wait -As claude -TimeoutSec 900 -PollSec 3`
-   You'll be notified when it exits. Exit 0 = message delivered, act on it.
-   Exit 2 = timeout, partner still working — start the same wait again.
+   A turn-passing send FUSES the wait: the process blocks and exits when the
+   reply arrives, and the harness notifies you. Exit 0 = message delivered —
+   read the output; it states whose turn it is. Exit 2 (only if you bounded
+   it with -TimeoutSec) = the send COMMITTED — never re-send; re-arm with a
+   background `$PAIR wait -As claude`. For long bodies or tricky quoting,
+   write the body to a temp file and use `-File <path>` instead of `-Message`.
+3. To wait without sending (joining, re-arming after an FYI wake or timeout):
+   `$PAIR wait -As claude -TimeoutSec 900 -PollSec 3` with
+   `run_in_background: true`; on exit 2, start the same wait again. On exit
+   0, read the output: act only if it says the turn is now yours; an FYI
+   wake means note the content and re-arm the wait.
    While a background wait runs, you may do read-only work (read code, think);
    do not edit files unless you are the driver AND hold the turn.
 

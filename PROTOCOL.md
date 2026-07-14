@@ -23,9 +23,15 @@ using the `pair` command (the TypeScript CLI port, with `bin/pair.ps1` acting as
   express all change requests as messages to the driver, not as edits.
 - **Addressing**: `-To` is required whenever more than one possible recipient
   exists; in a two-agent session it defaults to the only partner.
-- **Receiving = blocking on `pair wait`.** The wait command prints incoming
-  messages, archives them, and tells the agent whether the turn is now theirs.
-  Exit code `2` means timeout — re-run wait; the partner is still working.
+- **Receiving = the fused wait.** A turn-passing `pair send` does not return:
+  the same process blocks as the sender's listener and exits when a delivery
+  arrives, printing it and stating whose turn it is (sending and waiting are
+  one command — nothing to forget; `-NoWait` opts out, `-Turn keep` never
+  blocks). Standalone `pair wait` remains for joining, draining
+  (`-TimeoutSec 0`), and re-arming. Exit code `2` means timeout: after a
+  fused send it means the send already COMMITTED — re-arm with standalone
+  `wait`, never by re-sending; after a standalone `wait` it simply means
+  re-run the wait.
 
 ## Filesystem layout (in the target repo, not in claudex)
 
@@ -111,8 +117,9 @@ not the concepts.
 2. **Join** — each other agent reads `session.json` + `memory.md`, announces
    itself (`pair send -From <self> -To <driver> -Type info -Turn keep
    -Message 'joined, ready'`), then blocks on `pair wait -As <self>`.
-3. **Loop** — the turn-holder works, then sends (usually `ask` or `review`)
-   and waits. Typical rhythm: driver implements a small increment → sends
+3. **Loop** — the turn-holder works, then sends (usually `ask` or `review`);
+   the send fuses into the wait and exits when the reply lands. Typical
+   rhythm: driver implements a small increment → sends
    `ask` ("review this: <files/summary>") → navigator reviews the actual code
    in the repo → sends `review` → driver addresses findings → repeat.
 4. **Handoff** — to swap roles, the current driver sends `-Type handoff`;
@@ -149,18 +156,28 @@ not the concepts.
 
 ## Waiting mechanics per CLI
 
-- **Claude Code** — run wait as a background task (harness notifies on exit):
-  `pwsh -NoProfile -ExecutionPolicy Bypass -File D:/Development/claudex/bin/pair.ps1 wait -As claude -TimeoutSec 900 -PollSec 3`
-  with `run_in_background: true`. On exit 2, start it again.
-- **Codex CLI** — run wait as a normal foreground command with a timeout the
-  harness tolerates: `... wait -As codex -TimeoutSec 240 -PollSec 5`, and
-  re-run it whenever it exits with code 2.
-- **Antigravity CLI (`agy`)** — same pattern as Codex: foreground
-  `... wait -As agy -TimeoutSec 240 -PollSec 5`, re-run on exit 2. (agy 1.1.1
-  exposes no background-task facility; if a future version does, prefer the
-  Claude Code pattern.)
-- `-TimeoutSec 0` = non-blocking single check; useful to drain the inbox
-  before sending.
+The portable wake-up primitive is **tool-call completion**: the fused send
+(or a standalone wait) terminates when a message arrives, and the harness
+announces the completion — a backgrounded process exiting where the harness
+tracks background tasks, a foreground command returning otherwise
+(ENHANCEMENTS.md U3).
+
+- **Claude Code** — background the fused send (`run_in_background: true`;
+  the harness re-invokes the agent on exit), unbounded:
+  `pwsh -NoProfile -ExecutionPolicy Bypass -File D:/Development/claudex/bin/pair.ps1 send -From claude -Type ask -Message '...'`
+  Re-arm (FYI wake, or after a bounded timeout) with a background standalone
+  `... wait -As claude -TimeoutSec 900 -PollSec 3`; on exit 2, start it again.
+- **Codex CLI** — run the fused send foreground with a timeout the harness
+  tolerates: `... send -From codex -Type ask -TimeoutSec 240 -PollSec 5 -Message '...'`.
+  The command's return is the wake-up. On exit 2 (send COMMITTED — never
+  re-send) re-arm with `... wait -As codex -TimeoutSec 240 -PollSec 5`,
+  re-running it on every exit 2.
+- **Antigravity CLI (`agy`)** — same pattern as Codex: foreground, bounded,
+  re-arm standalone wait on exit 2. (agy 1.1.1 exposes no background-task
+  facility; if a future version verifiably announces background exits, prefer
+  the Claude Code pattern.)
+- `-TimeoutSec 0` on standalone wait = non-blocking single check; useful to
+  drain the inbox before sending.
 
 ## Human's view
 

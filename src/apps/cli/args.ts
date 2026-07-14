@@ -8,7 +8,7 @@ export type ParsedArgs = {
   flags: Map<string, string | true>;
 };
 
-const KNOWN_SWITCHES = new Set(['acceptsharedworktreerisk', 'json']);
+const KNOWN_SWITCHES = new Set(['acceptsharedworktreerisk', 'json', 'nowait']);
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags = new Map<string, string | true>();

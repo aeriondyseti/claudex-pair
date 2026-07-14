@@ -57,6 +57,35 @@ function printMessages(messages: readonly { name: string; raw: string }[]) {
   }
 }
 
+/**
+ * Shared wait orchestration for `wait` and the fused turn-passing `send`
+ * (ENHANCEMENTS.md U3). The caller supplies the timeout wording because the
+ * two paths differ there: a fused send has ALREADY committed, so its timeout
+ * text must forbid re-sending.
+ */
+async function runWait(
+  deps: ReturnType<typeof bindFsDeps>,
+  args: { as: string; timeoutSec: number; pollSec: number; timeoutLines: readonly string[] },
+): Promise<number> {
+  const outcome = await uc.waitForMessages(deps, { as: args.as, timeoutSec: args.timeoutSec, pollSec: args.pollSec });
+  if (outcome.kind === 'timeout') {
+    for (const line of args.timeoutLines) out(line);
+    return 2;
+  }
+  printMessages(outcome.messages);
+  const s = outcome.session;
+  out('='.repeat(66));
+  if (s.status !== 'active') {
+    out(`SESSION ${s.status.toUpperCase()} — your partner ended the session. Wrap up and report to the user; do not wait again.`);
+  } else if (s.turn === args.as) {
+    const role = s.driver === args.as ? 'DRIVER' : 'NAVIGATOR';
+    out(`It is now YOUR turn, ${args.as}. Your role: ${role}. Act on the message, then send a reply (turn: pass) and wait again.`);
+  } else {
+    out(`FYI only — the turn stays with ${s.turn}. Note the content and continue; if you are idle, re-arm: pair wait -As ${args.as}`);
+  }
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   const { command, flags } = parseArgs(argv);
   const rootFlag = str(flags, 'root');
@@ -99,40 +128,50 @@ async function main(argv: string[]): Promise<number> {
       const name = r.receipt.messageFiles[0] ?? '';
       const sentTo = to ?? r.events.find((e) => e.kind === 'message-sent')?.to;
       out(`Sent ${type} -> ${sentTo} (${name}). Turn: ${s.turn}. Driver: ${s.driver}. Status: ${s.status}.`);
-      if (turn === 'pass') out(`You handed over the turn. Now block on: pair wait -As ${from}`);
-      return 0;
+      // U3 fused send+wait: a send that actually moved the turn rolls straight
+      // into the wait loop — subscribing is control flow, not a step the agent
+      // can forget. Terminal `done` and -NoWait return immediately.
+      const fuse = turn === 'pass' && type !== 'done' && !has(flags, 'nowait') && s.status === 'active';
+      if (!fuse) {
+        // No wait hint on a session-ending send: `done` commits session-ended,
+        // so telling the agent to block on a completed session is a trap.
+        if (turn === 'pass' && s.status === 'active') out(`You handed over the turn. Now block on: pair wait -As ${from}`);
+        return 0;
+      }
+      out('You handed over the turn. Waiting for the reply (-NoWait skips the fused wait).');
+      const timeoutSec = num(flags, 'timeoutsec', Infinity);
+      return runWait(deps, {
+        as: from,
+        timeoutSec,
+        pollSec: Math.max(1, num(flags, 'pollsec', 2)),
+        timeoutLines: [
+          'SEND ALREADY COMMITTED — do NOT re-send.',
+          `No reply after ${timeoutSec}s; your partner is likely still working.`,
+          `NEXT: pair wait -As ${from} -TimeoutSec ${timeoutSec}`,
+        ],
+      });
     }
     case 'wait': {
       const deps = bindFsDeps(findRoot(rootFlag));
       const as = requireStr(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase();
       const timeoutSec = num(flags, 'timeoutsec', 300);
-      const pollSec = Math.max(1, num(flags, 'pollsec', 2));
-      const outcome = await uc.waitForMessages(deps, { as, timeoutSec, pollSec });
-      if (outcome.kind === 'timeout') {
-        out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: pair wait -As ${as} -TimeoutSec ${timeoutSec}`);
-        return 2;
-      }
-      printMessages(outcome.messages);
-      const s = outcome.session;
-      out('='.repeat(66));
-      if (s.status !== 'active') {
-        out(`SESSION ${s.status.toUpperCase()} — your partner ended the session. Wrap up and report to the user; do not wait again.`);
-      } else if (s.turn === as) {
-        const role = s.driver === as ? 'DRIVER' : 'NAVIGATOR';
-        out(`It is now YOUR turn, ${as}. Your role: ${role}. Act on the message, then send a reply (turn: pass) and wait again.`);
-      } else {
-        out(`FYI only — the turn stays with ${s.turn}. Note the content and continue what you were doing.`);
-      }
-      return 0;
+      return runWait(deps, {
+        as,
+        timeoutSec,
+        pollSec: Math.max(1, num(flags, 'pollsec', 2)),
+        timeoutLines: [
+          `No message after ${timeoutSec}s; your partner is likely still working. Re-run: pair wait -As ${as} -TimeoutSec ${timeoutSec}`,
+        ],
+      });
     }
     case 'ask': {
       const from = (str(flags, 'from') ?? str(flags, 'as'))?.toLowerCase();
       if (!from) throw new ProtocolError('session-not-active', 'ask requires -From <your own agent name>');
       flags.set('from', from);
       if (!flags.has('type')) flags.set('type', 'ask');
-      const sendCode = await main(['send', ...flattenFlags(flags)]);
-      if (sendCode !== 0) return sendCode;
-      return main(['wait', '-As', from, ...(rootFlag ? ['-Root', rootFlag] : [])]);
+      // Pure alias: send now fuses the wait itself — delegating exactly once
+      // is what prevents the historical double-wait.
+      return main(['send', ...flattenFlags(flags)]);
     }
     case 'status': {
       const deps = bindFsDeps(findRoot(rootFlag));
@@ -302,9 +341,14 @@ Usage:
   pair init   -Task '<goal>' [-Agents 'claude,codex[,agy,...]'] [-Driver <agent>] [-Root <repo>]
   pair send   -From <me> [-To <agent>] [-Type ask|answer|handoff|review|info]
               (-Message '<text>' | -File <path>) [-Turn pass|keep]
+              [-NoWait] [-TimeoutSec N] [-PollSec 2]
               # -To required when more than one possible recipient
+              # A send that passes the turn WAITS for the reply in the same
+              # process (unbounded unless -TimeoutSec; -NoWait opts out).
+              # Timeout exit 2 means the send COMMITTED — re-arm with 'pair
+              # wait', never re-send. -Turn keep returns immediately.
   pair wait   -As <me> [-TimeoutSec 300] [-PollSec 2]      # 0 = check once
-  pair ask    -From <me> (-Message '<text>' | -File <path>) # send ask + wait
+  pair ask    -From <me> (-Message '<text>' | -File <path>) # = send -Type ask
   pair status
   pair log    [-Tail 10]
   pair watch  [-Tail 10] [-RefreshSec 2]   # live dashboard (for the human's pane)
@@ -329,7 +373,8 @@ Message types:
   info     FYI, usually with -Turn keep
   done     session complete (sent by 'pair end')
 
-Exit codes: 0 ok, 2 wait timed out (re-run wait), 1 error.
+Exit codes: 0 ok, 2 wait timed out (re-run wait; after a fused send timeout
+the message IS committed — never re-send), 1 error.
 State lives in .pair/ at the repo root; protocol spec in the claudex repo.`;
 
 const code = await main(process.argv.slice(2)).catch((e: unknown) => {
