@@ -2,7 +2,7 @@ import { ProtocolError } from '@core/errors.ts';
 import * as uc from '@app/usecases.ts';
 import { bindFsDeps } from './bind.ts';
 import { parseArgs, str, num, has } from './args.ts';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { runBrokerCli } from './brokerCli.ts';
 
@@ -31,6 +31,18 @@ function findRoot(explicit?: string): string {
 }
 
 const out = (s: string) => process.stdout.write(`${s}\n`);
+
+/** True when `.pair/` holds an active pre-broker session (no journal dir). */
+function isActiveLegacyFsSession(root: string): boolean {
+  const pairDir = join(root, '.pair');
+  if (existsSync(join(pairDir, 'journal'))) return false;
+  try {
+    const session = JSON.parse(readFileSync(join(pairDir, 'session.json'), 'utf8')) as { status?: string };
+    return session.status === 'active';
+  } catch {
+    return false;
+  }
+}
 
 function requireStr(flags: Map<string, string | true>, name: string, message: string): string {
   const v = str(flags, name);
@@ -95,8 +107,14 @@ async function main(argv: string[]): Promise<number> {
   // for read-only diagnostics and the legacy compatibility test suite.
   if (process.env.CLAUDEX_PROTOCOL_MODE !== 'fs' && command !== 'watch' && command !== 'help') {
     const root = command === 'init' || command === 'broker' ? resolve(rootFlag ?? process.cwd()) : findRoot(rootFlag);
-    const result = await runBrokerCli(command, flags, positionals, root);
-    if (result !== undefined) return result;
+    // Legacy-session guard: an ACTIVE session with no journal predates the
+    // broker — it must complete in fs mode (an empty journal would report it
+    // session-not-active and strand the participants). Broker mode owns
+    // sessions it created; `pair broker` itself needs no session.
+    if (command === 'broker' || !isActiveLegacyFsSession(root)) {
+      const result = await runBrokerCli(command, flags, positionals, root);
+      if (result !== undefined) return result;
+    }
   }
 
   switch (command) {
