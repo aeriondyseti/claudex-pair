@@ -177,15 +177,24 @@ function run(cmd: string, args: string[]): Promise<string | undefined> {
 
 type BindResult = { kind: 'bound'; server: Server } | { kind: 'in-use' };
 
-function tryBind(endpoint: string): Promise<BindResult> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.once('error', (error) => {
-      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') resolve({ kind: 'in-use' });
-      else reject(error);
+async function tryBind(endpoint: string): Promise<BindResult> {
+  try {
+    return await new Promise<BindResult>((resolve, reject) => {
+      const server = createServer();
+      server.once('error', (error) => {
+        if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') resolve({ kind: 'in-use' });
+        else reject(error);
+      });
+      server.listen(endpoint, () => resolve({ kind: 'bound', server }));
     });
-    server.listen(endpoint, () => resolve({ kind: 'bound', server }));
-  });
+  } catch (error) {
+    // Bun (≤1.3) throws SYNCHRONOUSLY (ERR_INVALID_ARG_TYPE) when another
+    // PROCESS holds a Windows named pipe, instead of emitting EADDRINUSE.
+    // Only classify as in-use when a live listener actually answers.
+    if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') return { kind: 'in-use' };
+    if (endpoint.startsWith('\\\\.\\pipe\\') && (await endpointIsLive(endpoint))) return { kind: 'in-use' };
+    throw error;
+  }
 }
 
 function endpointIsLive(endpoint: string): Promise<boolean> {
