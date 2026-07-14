@@ -91,7 +91,9 @@ review, user-approved):
    Today either agent may send a turn-passing message regardless of `session.turn`,
    a navigator can send `handoff`, and `-From x -To x` is accepted. Validate:
    turn-passing sends require sender == turn holder; `handoff` requires sender == driver;
-   recipient must be `Other(sender)`.
+   recipient must be `Other(sender)`; session-ending commands — `pair end` and the
+   raw `send -Type done` parity path — require sender == driver (item 11's
+   close-authority rule).
 
 3. **Re-init isolation / session rotation** *(code review; claude-squad; cx994 CCB)*
    A new `pair init` over a completed session silently inherits the old `memory.md`,
@@ -152,6 +154,32 @@ ack loss, lease expiry/redelivery, broker-crash recovery, end races).
    *(cx994 CCB)* is a liveness probe answered by the partner on its next wait —
    useful, but only a true round trip when the partner actively replies.
 
+8a. **Driver-side turn revocation on navigator timeout** *(user request,
+    2026-07-12 — pulled into current scope; the action on item 8's signals)*
+    When the driver has passed the turn (asked a question, requested a review) and
+    the navigator produces no reply within a configurable timeout, the driver may
+    revoke the turn and continue instead of blocking indefinitely on a dead or
+    wedged partner. Design constraints:
+    - **Revocation is a broker-executed privileged action**, not an ordinary send —
+      a deliberate, journaled exception to item 2's "turn-passing requires sender ==
+      turn holder" invariant, available only to the driver (in M3 terms: the
+      control-authority holder revoking a grant it issued). Like every mutation it
+      is a `decide`-authorized envelope through the single-writer commit path; the
+      broker contributes the liveness facts the pure core cannot know.
+    - **Timeout must distinguish "gone" from "still working."** It keys off item 8's
+      liveness signals: an active lease heartbeat (item 5) defers revocation, so a
+      navigator mid-way through a long review is not robbed of the turn; only a
+      missing listener or stalled progress starts the clock.
+    - **No silent turn theft.** `pair status`/`watch` surface the pending timeout
+      before it fires; the revocation lands as an explicit `turn_revoked` record in
+      the navigator's inbox and the archive. A late reply from the revoked navigator
+      is recognized as stale (message ids / `reply_to` from item 7, grant epoch) and
+      is archived as advisory rather than mutating turn state.
+    - Configurable per-session timeout with a conservative default; disabled means
+      today's behavior (wait forever).
+    See BROKER-SPEC.md "Turn revocation" for the wire/serialization contract and
+    failure cases (F15/F16).
+
 9. **`pair doctor`** *(code review)*
    Detect and repair orphaned turn-passing messages, stale turns, claimed-but-orphaned
    messages, leftover temp files, malformed session.json.
@@ -167,11 +195,53 @@ ack loss, lease expiry/redelivery, broker-crash recovery, end races).
     Cheapest fix for the biggest failure mode of two long-running interactive
     sessions.
 
-11. **Cooperative close handshake — distinct from user-ordered end** *(Agent Teams)*
-    Two different verbs. An *agent-proposed* close ("I think we're done") is a request
-    the partner may reject with a reason. A *user-authorized* `pair end` stays
-    immediate and non-vetoable — the user outranks both agents, per protocol. The CLI
-    should distinguish them (e.g. `pair propose-end` vs `pair end`).
+11. **Close authority: driver-only end, cooperative close, navigator leave/rejoin**
+    *(Agent Teams; driver-only end and leave/rejoin are user rules, 2026-07-12 —
+    pulled into current scope)*
+    Three related verbs with distinct authority:
+    - **`pair end` is driver-only.** Ending the session kicks every participant,
+      so only the driver may do it. The same restriction covers the raw
+      `send -Type done` parity path — today *any* participant's done-send
+      completes the session (`src/core/decide.ts`); under this rule a navigator
+      done-send is rejected (`end-not-driver`), not silently demoted to a plain
+      message. A *user-authorized* end stays immediate and non-vetoable — the
+      user outranks both agents — executed as a privileged user-channel action
+      per U1.
+    - **Agent-proposed close** ("I think we're done") remains a request any
+      participant may make (`pair propose-end`, rejectable with a reason); the
+      driver decides and executes the actual end.
+    - **Navigator leave / join / kick — roster mutations** *(user rule: join/leave
+      changes the roster, not a presence flag)*. `pair leave` removes the
+      navigator from the roster; `pair join` re-admits it. **Roster authority is
+      the driver's, uniformly — one rule, no initial-vs-later special case**
+      *(user rule)*: `pair init` must be issued as the agent that becomes driver
+      (it declares the initial roster — today `decide` doesn't check this;
+      `init-not-driver` guard added), and every later join is driver-admitted.
+      Rules:
+      - **Voluntary leave is blocked while the agent holds an offered/active
+        grant** (`leave-with-grant`): finish it (`grant-done`) or have the driver
+        cancel it first. Leaving while holding the turn returns the turn to the
+        driver in the same transaction.
+      - **Kick (`pair kick`, driver-only) is the forced removal.** The kicked
+        agent's open grants are cancelled in the same transaction and reassigned
+        by the driver — reissue to a new assignee; a `grant-reassign`
+        convenience may wrap cancel+issue.
+      - **Undelivered deliveries for a removed agent are voided to the archive**,
+        never queued for a possible return — a rejoining agent is a fresh roster
+        entry that catches up via item 10's rehydrate, not via stale redelivery.
+      - The driver can neither leave nor be kicked; handoff first.
+      - The roster may shrink to the driver alone — valid protocol state, because
+        leave-to-reset-and-rejoin is a supported recovery flow for a
+        malfunctioning agent. But **kicking the last navigator prompts the driver
+        to end the session** (CLI-level advice, not a `decide` invariant) unless
+        the driver is waiting for a return; init's ≥2-agent rule applies only at
+        creation.
+      This pulls the pair-scope slice of M1's add/remove rules forward; M1 keeps
+      the N-agent generalization (registry versioning, `registry_updated`,
+      bounded roster).
+    See BROKER-SPEC.md "Session end & roster lifecycle" (F17–F22). PROTOCOL.md's
+    End step ("one agent runs `pair end`") gets the driver-only wording when the
+    guard lands in `decide`.
 
 ## P2 — workflow features (better pairing, not just safer)
 
@@ -236,7 +306,9 @@ M1. **Agent registry with lifecycle** *(SeemSeam ccb's per-agent config)*
     from its display name), CLI type (claude, codex, gemini, …), role, status
     (active / joined / left), and inbox. `-From`/`-To`/`-As` validate against the
     registry instead of a hardcoded enum. Define add/remove rules and what happens
-    to an agent's pending grants and undelivered messages when it leaves. Registry
+    to an agent's pending grants and undelivered messages when it leaves — item 11
+    now defines the pair-scope answers (grant-guarded voluntary leave, driver kick
+    with grant reassignment, voided deliveries); M1 generalizes them. Registry
     changes carry a monotonically increasing registry version and emit a
     `registry_updated` event to subscribed clients. v1 sets a bounded practical
     limit (registry-defined N, not implied unbounded scaling). Two-agent sessions
@@ -345,6 +417,90 @@ U2. **Antigravity CLI (`agy`) as a supported adapter** *(user request)*
     the first heterogeneous CLI exercising the registry, roles, and three-agent
     topologies for real.
 
+U3. **Fused send+wait — push delivery via process exit** *(user request,
+    2026-07-14; supersedes the hook-centric sketch discussed the same day)*
+    The observed #1 operational failure: an agent sends a turn-passing message
+    and forgets to run `pair wait`, so replies rot in the inbox and the session
+    stalls. No broker-side push can fix this — an idle CLI agent's loop only
+    runs when a tool result returns or the harness injects input — so the push
+    must terminate in a harness facility. The portable primitive every
+    harness has is **tool-call completion**: a backgrounded process exiting
+    where the harness tracks background tasks (Claude Code), a foreground
+    command returning everywhere else (Codex, agy). Therefore the process IS
+    the subscription:
+    - **Mechanism.** A turn-passing `pair send` (`ask`/`answer`/`review`/
+      `handoff`) does not return after commit; the same process rolls straight
+      into the wait loop as the sender's listener and **exits when a delivery
+      arrives**. The reply's arrival is what terminates the process; the
+      harness announces the completion. Send + block + deliver = one process.
+    - **Exit contract** (same as today's `wait`): exit 0 = delivery received
+      and printed (act on it), exit 2 = timeout, other nonzero = error.
+      **Timeout ≠ send failure**: a timed-out fused send has already
+      committed, so exit-2 output must lead with `SEND ALREADY COMMITTED — do
+      NOT re-send` and direct the agent to re-arm with **standalone
+      `pair wait`**, never by re-running the send (a naive retry would
+      duplicate the message — file mode mints a fresh messageId on every
+      send). The fused wait is **unbounded by default**; `-TimeoutSec` exists
+      for harnesses that need bounded foreground calls. A CLI test pins this
+      boundary. Output always states whose turn it is: an FYI (`turn: keep`)
+      wakes the process without granting the turn — the wake event and the
+      right-to-act are deliberately decoupled, and the output is where that
+      distinction lives.
+    - **Blocking follows the turn token.** Auto-wait only when the send passes
+      the turn — passing the turn means "I am now blocked on you," so blocking
+      is the honest default. `-Turn keep` sends return immediately (the sender
+      intends to keep working); `-NoWait` opts out explicitly. `done`/end
+      sends return immediately. Standalone `pair wait` remains for
+      join/recovery and re-arming.
+    - **What fusing actually buys.** Correctness is NOT the claim: the durable
+      inbox (file mode) and the delivery ledger (broker mode) mean a fast
+      reply landing between send and wait was never lost — it sat in the
+      inbox; the failure was that nobody came back for it. Fusing closes the
+      *agent liveness* gap: a successful send proceeds directly into the
+      subscription by control flow — the agent cannot forget the subscribe
+      step, because it is not a step. (A brief transport interval between
+      commit response and subscription registration remains and is safe —
+      delivery is durable; an atomic broker execute+subscribe operation may
+      additionally eliminate it, but zero-window registration is NOT part of
+      the contract unless that atomicity is specced.) In broker mode the
+      fused command holds one IPC connection and resumes its subscription
+      from the client's last acked `deliverySeq` — commit seq is NOT a
+      delivery cursor; BROKER-SPEC separates the two deliberately. The F14
+      print+flush-before-ack client contract applies unchanged.
+    - **Per-harness waiting mechanics** (PROTOCOL.md section gets rewritten
+      when this lands): Claude Code backgrounds the fused command
+      (`run_in_background`; harness re-invokes the agent on exit) — unbounded.
+      Codex CLI runs it foreground with its tolerated timeout (~240s) — the
+      command's *return* is the wake-up, and sending/waiting being
+      inseparable leaves nothing to forget. agy: verify per U2's rule
+      (foreground like Codex until its harness demonstrably announces
+      background exits).
+    - **Implementation shape.** The fuse is **CLI orchestration, not a merged
+      use case**: `sendMessage` and `waitForMessages`
+      (`src/app/usecases.ts`) stay independently testable; the CLI command
+      layer (`src/apps/cli/main.ts`) calls send then rolls into the shared
+      wait-rendering helper. The existing `ask` convenience (main.ts) already
+      chains send+wait and must become a pure alias (set type, delegate once)
+      or it would double-wait. Changing send's default to block is a breaking
+      change for existing scripts/e2e expectations — the slice ships with a
+      migration note and tests covering `-NoWait`, `-Turn keep`, and the
+      timeout boundary.
+    - **Residual gap: re-arming.** After exit 2 (timeout) or exit 0 on an FYI
+      when the agent still lacks the turn, the agent must re-run **standalone
+      wait** — still a remembering problem, now much smaller. Mitigations, in
+      order: the output's final line is an explicit next-action
+      (`NEXT: pair wait -As codex ...` — trailing instructions are what LLM
+      agents most reliably follow); optional harness-level hardening where
+      available — a Claude Code `Stop` hook (`pair hook stop`) that blocks
+      going idle while the session is active with unread mail or no live
+      listener (rides item 8's listener-liveness signal), and a Codex
+      `notify`-hook adapter that alerts the *user* (toast + `watch`/`status`
+      STALLED flag) since Codex hooks are one-way. Hooks are hardening, not
+      the mechanism — the fused command must be sufficient on a bare harness.
+    - Cross-refs: rides item 5's lease/ack/redelivery semantics and item 23's
+      broker subscription channel; feeds item 8's listener liveness (a fused
+      waiter is a live IPC connection the broker can observe).
+
 ## P3 — DX and extensibility
 
 21. **JSON output and stable error codes** *(code review)*
@@ -374,13 +530,22 @@ U2. **Antigravity CLI (`agy`) as a supported adapter** *(user request)*
 P0 lands as ordered slices, each test-first:
 
 1. **Spec first**: write down the session state machine (states, transitions, who may
-   trigger each), the broker IPC/journal contract, and the recovery scheme; encode
-   them in failure/concurrency Pester tests before touching `pair.ps1`.
+   trigger each) — including 8a's driver `revoke-turn` transition — the broker
+   IPC/journal contract, and the recovery scheme; encode them in
+   failure/concurrency Pester tests before touching `pair.ps1`.
 2. **Broker + commit journal** (item 1 and Coordination architecture) with items 4
    and 6 riding along (same code path); election lock, readiness handshake, idle
    shutdown, crash recovery.
-3. **Invariant enforcement** (item 2) and **session rotation** (item 3).
-4. **Delivery semantics: lease/ack/redelivery** (item 5).
-5. Then P1 visibility (items 8, 9) — small, immediately useful.
+3. **Invariant enforcement** (item 2, now including driver-only end/done-send) and
+   **session rotation** (item 3).
+4. **Delivery semantics: lease/ack/redelivery** (item 5), with U3's fused
+   send+wait riding the same slice — it is the subscribe channel's first
+   consumer, and its file-mode fallback (send rolls into today's poll loop)
+   can land even before the broker wiring.
+5. Then P1 visibility (items 8, 9) — small, immediately useful — with 8a (turn
+   revocation) riding item 8: the liveness signals and slice-4 lease semantics it
+   depends on are already in place, so it lands as a `decide` transition plus a
+   broker liveness guard, not new machinery. Item 11's roster verbs
+   (leave/join/kick) land here too — they share the liveness/status surface.
 6. Workflow features by demand, starting with 12 (structured handoff) and 13 (review
    gate), which encode what the instruction files already ask agents to do by convention.

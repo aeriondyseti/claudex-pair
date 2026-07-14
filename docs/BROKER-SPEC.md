@@ -103,6 +103,54 @@ receive → authenticate token+epoch → dedup check → decide(state, envelope)
 append txn record (events + delivery enqueues) + fsync → evolve in-memory →
 ack requester → update mirrors + manifest → push deliveries to subscribers.
 
+## Turn revocation (ENHANCEMENTS 8a — in scope)
+- `revoke-turn` is an ordinary execute envelope through the single-writer commit
+  path; `decide` authorizes it (principal == driver, partner holds the turn, session
+  active). The broker contributes the liveness fact the pure core cannot know:
+  revocation is admitted only when the navigator has **no live delivery lease** —
+  an active lease/heartbeat means "still working" and rejects with `partner-active`;
+  a missing listener or expired lease admits it. The elapsed-since-turn-pass timeout
+  is CLI-side policy (when the driver *offers* to revoke); the broker/core check is
+  the authorization.
+- Serialization answers the race for free: a navigator reply and a driver
+  `revoke-turn` are two envelopes through the same commit path — first commit wins,
+  the loser is decided against post-commit state. A reply bearing a revoked turn is
+  rejected as a turn mutation and archived as advisory (`stale-turn`), so there is
+  never a double turn holder.
+- The `turn_revoked` event fans out as a normal delivery to the navigator (same
+  ledger, same at-least-once semantics) and lands in the archive mirror — no silent
+  turn theft.
+
+## Session end & roster lifecycle (ENHANCEMENTS 11 — in scope)
+- **End is driver authority**: `decide` authorizes `end-session` — and the raw
+  `send -Type done` completion path — as principal == driver, rejecting otherwise
+  with `end-not-driver`. This supersedes the pair.ps1 parity behavior (any
+  participant could complete the session); a navigator signals completion via
+  propose-end, never done-send. End fan-out and the F10 end-vs-grant race are
+  unchanged.
+- **Leave / join / kick are journaled roster mutations** (user rule — the roster
+  itself changes; there is no presence flag): `agent-left` / `agent-joined` /
+  `agent-kicked` events. Voluntary leave is rejected while the agent holds an
+  offered/active grant (`leave-with-grant`); leaving while holding the turn
+  returns the turn to the driver **in the same committed txn**. Kick is
+  driver-only forced removal: the same txn cancels the kicked agent's open
+  grants, and the driver reassigns by reissue. **Roster authority is the
+  driver's uniformly**: `pair init` must be issued as the agent that becomes
+  driver (`init-not-driver` otherwise — new guard; decideInit currently checks
+  no principal), and every later join is driver-admitted — membership is
+  driver-chosen at every point in the session's life. The driver can neither
+  leave nor be kicked; handoff first. A kick that empties the navigator roster
+  leaves a valid solo session (leave-to-reset-and-rejoin is a supported
+  recovery flow); the CLI prompts the driver to end unless a rejoin is
+  expected.
+- **Removal voids undelivered deliveries**: enqueued deliveries for a removed
+  agent are closed to the archive in the same txn — never delivered to a
+  non-participant, never held for a possible return. A rejoined agent is a fresh
+  roster entry with a fresh delivery cursor; context catch-up is rehydrate
+  (ENHANCEMENTS item 10), not redelivery.
+- Pair-scope roster lives in the session.json `agents[]` mirror; M1's registry
+  versioning / `registry_updated` generalization stays deferred.
+
 ## Failure test matrix (write these FIRST)
 F1  kill -9 mid-append → restart truncates torn tail, state consistent
 F2  crash after fsync before ack → retry with same (clientId, reqId) replays recorded
@@ -131,6 +179,26 @@ F14 client ack-ordering, both boundaries: (a) wait crashes after receiving a del
     after stdout flush but before ack → redelivery produces a duplicate print →
     consumer dedups by deliveryId; the invariant under test: ack is sent only after
     stdout write+flush returns
+F15 revoke-vs-reply race → broker-serialized: whichever envelope commits first wins;
+    the late reply is archived advisory (`stale-turn`), never a turn mutation — at no
+    point do two agents hold the turn
+F16 revoke attempt while the navigator holds a live delivery lease (heartbeating) →
+    rejected `partner-active`; after lease expiry with no ack, the same revoke commits
+F17 navigator leaves while holding the turn → turn returns to the driver in the same
+    committed txn; a post-rejoin reply bearing the old turn is stale (per F15)
+F18 leave/kick with enqueued undelivered deliveries → voided to the archive in the
+    same committed txn; nothing is ever delivered to a removed agent; a later
+    rejoin starts from a fresh delivery cursor (no stale redelivery)
+F19 navigator end-session or done-send → rejected `end-not-driver`; the rejection
+    makes no state change and is not journaled (retried rejections re-evaluate per
+    the retry contract)
+F20 voluntary leave while holding an offered/active grant → rejected
+    `leave-with-grant`; after grant-done or a driver cancel, the same leave commits
+F21 kick of a grant-holding navigator → open grants cancelled in the same committed
+    txn (the stop-notice to the kicked agent is voided with its other deliveries);
+    grant scope/worktree ownership released; driver reissues to reassign
+F22 init issued by a principal other than the declared driver → rejected
+    `init-not-driver` (roster authority is uniform from session creation onward)
 
 ## Non-goals now
 - No topology changes (still pair semantics), no user channel (U1), no multi-repo broker.
