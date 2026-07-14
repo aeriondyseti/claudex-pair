@@ -4,7 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { encodeFrame, NdjsonDecoder } from './framing.ts';
 import type { ClientFrame, ErrorFrame, FrameHandler, ServerConnection, ServerFrame } from './types.ts';
 
-export type IpcServerOptions = { endpoint: string; token: string; epoch: number; handler: FrameHandler };
+export type IpcServerOptions = {
+  endpoint: string;
+  token: string;
+  epoch: number;
+  handler: FrameHandler;
+  /** Broker-side connection lifecycle (idle tracking, subscription cleanup). */
+  onConnection?: (id: string, event: 'open' | 'close') => void;
+};
 
 export class IpcServer {
   #server?: Server;
@@ -32,7 +39,8 @@ export class IpcServer {
   #accept(socket: Socket) {
     this.#connections.add(socket); const decoder = new NdjsonDecoder();
     const connection: ServerConnection = { id: randomUUID(), send: (frame) => write(socket, frame) };
-    socket.on('close', () => this.#connections.delete(socket));
+    this.options.onConnection?.(connection.id, 'open');
+    socket.on('close', () => { this.#connections.delete(socket); this.options.onConnection?.(connection.id, 'close'); });
     socket.on('data', (chunk) => {
       let frames: unknown[];
       try { frames = decoder.push(chunk); } catch (error) { void write(socket, wireError('bad-frame', String(error))); socket.destroy(); return; }
