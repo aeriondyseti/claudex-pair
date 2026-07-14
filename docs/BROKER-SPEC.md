@@ -6,18 +6,26 @@
   endpoint handshake part of election: clients discover the current endpoint (and epoch)
   from the lease record, so a deposed broker's stale pipe can never be confused with the
   incumbent's.
-- **Election** (`.pair/broker.lease`): the broker opens the lease file with an
-  **OS-exclusive lock held for its entire lifetime** — the open handle, not the file's
-  existence, is the lease (survives PID reuse; releases automatically on process death).
-  The record holds {processStartTime, pid, nonce, epoch, endpoint, heartbeatAt}.
+- **Election (endpoint-as-lock)**: the broker's lifetime lock is **binding the
+  fixed election endpoint** `claudex-<hash>-lock` (named pipe on Windows, unix
+  socket elsewhere) — libuv binds are first-instance-exclusive (losers get
+  EADDRINUSE) and the bound handle dies with the process: held for the
+  broker's entire lifetime, never stealable, released automatically on
+  process death. (Node/Bun cannot hold a true OS-exclusive FILE lock —
+  fs.open cannot reach Windows share modes — so the endpoint is the lock; see
+  the W2 gateway contract section for the decision record.) Unix stale
+  election sockets use the F13 probe/unlink flow; Windows pipe names are not
+  filesystem entries and cannot go stale.
+  `.pair/broker.lease` is **only the discovery/heartbeat record**, written by
+  the lock winner via atomic replace: {processStartTime, pid, nonce, epoch,
+  endpoint, heartbeatAt}.
   - Heartbeat: broker rewrites heartbeatAt every 10s.
-  - **A held lock is never stolen.** (Renaming a file out from under an exclusive
-    holder is not sound: Windows rejects it, and on POSIX the deposed broker keeps
-    writing under the old inode — two writers.) A candidate that cannot acquire the
-    lock but observes heartbeat older than 60s reports the incumbent as **hung** and
-    performs **fencing by verified termination**: kill exactly the recorded
+  - **A held bind is never stolen.** A candidate that cannot bind but observes
+    heartbeat older than 60s reports the incumbent as **hung** and performs
+    **fencing by verified termination**: kill exactly the recorded
     {pid, processStartTime, nonce} identity (refusing if the identity no longer
-    matches — PID reuse), then acquire the lock normally with epoch+1. If termination
+    matches — PID reuse); the dead process's election binding vanishes with it,
+    and the candidate acquires normally with epoch+1. If termination
     is not permitted, surface "broker hung" to the human instead of proceeding.
   - Every wire message carries the sender's expected epoch; requests bearing an old
     epoch are rejected with `stale-epoch` (client re-discovers and retries). Epochs
@@ -77,7 +85,14 @@
 - Subscribe: {kind:'subscribe', as, afterDeliverySeq} → pushes
   {kind:'delivery', deliverySeq, deliveryId, message}. `deliverySeq` is a monotonic
   ledger offset assigned at enqueue — the ordered cursor; `deliveryId`
-  (messageId:recipient) is identity for ack/dedup, not ordering. Client acks
+  (messageId:recipient) is identity for ack/dedup, not ordering.
+  `afterDeliverySeq` is the client's last ACKED cursor (never merely
+  observed — print-then-crash must redeliver, F14). **Open/unacked beats
+  cursor**: on subscribe the broker ALWAYS first redelivers every open
+  delivery for the agent regardless of cursor (out-of-order acks can leave
+  seq 9 open while seq 10 is acked — a cursor of 10 must not suppress 9),
+  then streams new deliveries after the cursor; the cursor suppresses only
+  already-closed history. A fresh client passes 0. Client acks
   {kind:'ack', deliveryId} within the lease (default 90s, extensible via
   {kind:'extend', deliveryId}) or the broker redelivers (at-least-once; consumers
   dedup by deliveryId).
@@ -157,7 +172,9 @@ F2  crash after fsync before ack → retry with same (clientId, reqId) replays r
     outcome from the journal-rebuilt dedup index; no double event
 F3  double spawn race → OS lock yields exactly one holder; loser connects
 F4  client dies with unacked delivery → lease expiry → redelivery to next wait
-F5  duplicate wait (same identity, two connections) → each delivery acked exactly once
+F5  duplicate wait (same identity, two connections) → each delivery acked exactly
+    once; out-of-order ack (10 acked, 9 open) then resubscribe with cursor 10 →
+    open seq 9 is redelivered (open/unacked beats cursor)
 F6  journal crc corruption mid-history → refuse start with doctor guidance
 F7  hung broker (lock held, heartbeat stale) → fencing by verified termination of the
     exact {pid, startTime, nonce} identity, then normal acquisition with epoch bump;
@@ -178,7 +195,8 @@ F14 client ack-ordering, both boundaries: (a) wait crashes after receiving a del
     but before printing → no ack was sent → redelivery, nothing lost; (b) wait crashes
     after stdout flush but before ack → redelivery produces a duplicate print →
     consumer dedups by deliveryId; the invariant under test: ack is sent only after
-    stdout write+flush returns
+    stdout write+flush returns; (c) resume after either crash serves every still-open
+    delivery regardless of the presented cursor (open/unacked beats cursor)
 F15 revoke-vs-reply race → broker-serialized: whichever envelope commits first wins;
     the late reply is archived advisory (`stale-turn`), never a turn mutation — at no
     point do two agents hold the turn
@@ -199,6 +217,71 @@ F21 kick of a grant-holding navigator → open grants cancelled in the same comm
     grant scope/worktree ownership released; driver reissues to reassign
 F22 init issued by a principal other than the declared driver → rejected
     `init-not-driver` (roster authority is uniform from session creation onward)
+
+## W2 gateway contract (frozen 2026-07-14, claude+codex, pre-branch checkpoint)
+- **The authority boundary is the COMMAND, never client-decided events.**
+  `src/app/ports/gateway.ts` (ProtocolGateway) is the single mutation surface:
+  execute(command + principal + RequestIdentity) → authoritative outcome
+  (post-commit session, events, receipt, seq); query DTOs (StatusDto, log);
+  subscribe(as, afterDeliverySeq)/ack/extend. The broker stamps envelope meta
+  (id, at) and runs decide+commit itself; an IPC ProtocolStore shipping
+  client-decided events would be a stale-state TOCTOU and is forbidden. File
+  mode adapts the same gateway to local use-cases; core untouched.
+- **Response is the read.** Execute/query responses are authoritative; the CLI
+  never reads `.pair/` mirror CONTENT after an ack to produce output. Two
+  defined exceptions: findRoot may probe for `.pair/session.json` EXISTENCE
+  (root discovery, content untrusted), and read-only diagnostics (`status`,
+  `log`, `watch`, `doctor` in fs-diagnostic mode) report the journal
+  head/epoch they saw and may lag.
+- **Discovery/spawn**: client resolves the daemon entry the same way the shim
+  resolves the CLI — `bun run src/apps/broker/main.ts` when bun exists, else
+  `dist/pair-broker.exe` — spawns detached with stdio ignored, then awaits
+  readiness (lease record present + endpoint ping ok) with bounded backoff
+  (100ms doubling, 5s deadline), retries the connect once. Double-spawn: the
+  OS lease lock picks the winner; the loser's spawn idles out or exits on
+  lock-acquire failure, and the client connects to the recorded endpoint.
+- **Client identity**: clientId = crypto.randomUUID() once per CLI process;
+  reqId unique per logical request and reused verbatim across reconnect
+  retries. Dedup scope is the journal's per-client window; expired reqIds
+  answer `expired-request`.
+- **Broker stop semantics**: `pair broker stop` is a clean shutdown at any
+  time, as a DRAIN transition: stop accepting new execute/subscribe → finish
+  the in-flight txn (fsync) → respond to the stop requester → close
+  connections → release the lease → exit. Unacked deliveries are NOT a
+  blocker: the ledger is durable and redelivers on next start (F11).
+  `pair broker status` reports lease/epoch/pid/heartbeat + connection count
+  without mutating anything. Control surface is `BrokerControl`
+  (gateway.ts) — separate from ProtocolGateway because it exists
+  pre-session.
+- **Election primitive (approved revision of Identity & discovery's
+  file-lock wording)**: Node/Bun expose no true lifetime OS file lock
+  (fs.open cannot reach Windows share modes), so **the endpoint IS the
+  lock**: election = binding the fixed election name
+  `claudex-<hash>-lock` (named pipe on Windows, unix socket elsewhere).
+  libuv pipe binds are first-instance-exclusive (EADDRINUSE for losers) and
+  the handle dies with the process — exactly the "held handle, never stolen,
+  released on death" semantics the spec requires, with zero new
+  dependencies. Unix stale-socket staleness uses the existing F13
+  probe/unlink flow; Windows pipes are not filesystem entries and cannot go
+  stale. The lease RECORD (.pair/broker.lease: {pid, processStartTime,
+  nonce, epoch, endpoint, heartbeatAt}) remains a plain JSON file written by
+  the lock winner via atomic replace; the serving endpoint keeps its
+  epoch-suffixed name. Fencing is unchanged: a candidate that cannot bind
+  but observes a stale heartbeat performs verified termination of the exact
+  recorded identity, after which the dead process's election binding has
+  vanished and normal acquisition proceeds with epoch+1.
+- **Config injection**: the composition root takes a BrokerConfig
+  {idleGraceMs=60000, heartbeatMs=10000, deliveryLeaseMs=90000}. Env override
+  CLAUDEX_BROKER_IDLE_GRACE_MS is accepted only if it parses to an integer in
+  [1000, 60000] — tests may only SHORTEN idle grace, never extend it. Tests
+  must stop/await the daemon in finally; leaked daemons are test bugs.
+- **F9 joint spec (decisive race is server-side)**: idle-exit must stop
+  accepting atomically BEFORE the final no-connections/no-unacked check; a
+  connection landing after the check finds the endpoint closed and triggers
+  the client's normal spawn-on-demand retry (connection wins or clean
+  respawn — never a hung client, never two brokers). Codex owns the
+  client-driven storm test; the server-side ordering is claude's to
+  implement per this clause.
 
 ## Non-goals now
 - No topology changes (still pair semantics), no user channel (U1), no multi-repo broker.

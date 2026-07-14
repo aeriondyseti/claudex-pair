@@ -1,0 +1,152 @@
+import type { AgentId, Grant, SessionState } from '@core/types.ts';
+import type { Command } from '@core/commands.ts';
+import type { Event } from '@core/events.ts';
+import type { StoredMessage, CommitReceipt } from './index.ts';
+
+/**
+ * ProtocolGateway — the single authority boundary for protocol mutations
+ * (BROKER-SPEC "W2 gateway contract"; frozen with codex 2026-07-14 before
+ * the W2a parallel branches).
+ *
+ * The caller submits a COMMAND with its authenticated principal. The
+ * authority behind the gateway (broker daemon in broker mode; the local
+ * file-mode adapter otherwise) stamps id/timestamp, runs `decide` against
+ * CURRENT state, persists, and returns the authoritative outcome.
+ *
+ * Deliberately NOT part of this surface: client-side `decide` results.
+ * Shipping client-decided events across a process boundary is a stale-state
+ * TOCTOU and lets a client bypass authorization — the broker re-decides
+ * everything. `ProtocolStore` (index.ts) remains the file-mode-internal
+ * persistence port; it is never remoted.
+ *
+ * Import rule (frozen): this module imports from ./index.ts and is imported
+ * DIRECTLY as `@app/ports/gateway.ts`. It is deliberately never re-exported
+ * from ./index.ts — re-exporting would create a barrel cycle.
+ */
+
+/** Identity a client presents for durable idempotency (BROKER-SPEC dedup). */
+export type RequestIdentity = {
+  /** Stable for the lifetime of one CLI process (crypto.randomUUID at start). */
+  readonly clientId: string;
+  /** Unique per logical request; reused VERBATIM across reconnect retries. */
+  readonly reqId: string;
+};
+
+export type ExecuteRequest = {
+  /** The authenticated principal — the agent this client acts as. */
+  readonly as: AgentId;
+  readonly command: Command;
+  readonly identity: RequestIdentity;
+};
+
+/**
+ * Authoritative result of a committed execute. `session` is the post-commit
+ * state — the CLI renders from THIS, never from `.pair/` mirrors, which are
+ * views updated after ack and may lag (BROKER-SPEC "Mirrors").
+ */
+export type ExecuteOutcome = {
+  /**
+   * Committed journal seq — broker mode only. Absent in file mode, which has
+   * no durable sequence; a fabricated counter would imply false monotonicity.
+   */
+  readonly seq?: number;
+  readonly events: readonly Event[];
+  readonly receipt: CommitReceipt;
+  readonly session: SessionState;
+  /** init-session only. */
+  readonly gitignoreUpdated?: boolean;
+};
+
+/** Liveness facts only the broker can observe (ENHANCEMENTS item 8). */
+export type LivenessDto = {
+  readonly broker?: { readonly pid: number; readonly epoch: number; readonly heartbeatAt: string };
+  readonly agents: Readonly<Record<AgentId, { readonly connectedSince?: string; readonly lastActivity?: string }>>;
+};
+
+/** Wire-safe status projection (no Maps — Records only). */
+export type StatusDto = {
+  readonly session: SessionState;
+  readonly navigators: readonly AgentId[];
+  readonly openGrants: readonly Grant[];
+  readonly pending: Readonly<Record<AgentId, readonly StoredMessage[]>>;
+  readonly recent: readonly StoredMessage[];
+  /** Absent in file mode — file mode has no listener signal to report. */
+  readonly liveness?: LivenessDto;
+};
+
+export type Delivery = {
+  /** Monotonic ledger cursor assigned at enqueue — ordering + resume. */
+  readonly deliverySeq: number;
+  /** `<messageId>:<recipient>` — identity for ack/dedup, not ordering. */
+  readonly deliveryId: string;
+  readonly message: StoredMessage;
+};
+
+/**
+ * An open subscription for one agent. At-least-once: consumers dedup by
+ * deliveryId; ack ONLY after the delivered message has been written to
+ * stdout and flushed (BROKER-SPEC F14).
+ */
+export interface DeliverySubscription {
+  readonly deliveries: AsyncIterable<Delivery>;
+  ack(deliveryId: string): Promise<void>;
+  /** Extend the delivery lease during long processing (default 90s). */
+  extend(deliveryId: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ProtocolGateway {
+  /**
+   * Commit a command. Throws ProtocolError (stable `code`) on rejection —
+   * rejections make no state change and re-evaluate on retry; committed
+   * successes replay their recorded outcome under the same RequestIdentity.
+   */
+  execute(request: ExecuteRequest): Promise<ExecuteOutcome>;
+  status(): Promise<StatusDto>;
+  log(tail?: number): Promise<readonly StoredMessage[]>;
+  /** All grants regardless of state (the CLI `grants` listing). */
+  grants(): Promise<readonly Grant[]>;
+  /**
+   * Resume delivery from the client's last ACKED cursor — never an observed
+   * or printed-but-unacked one: a crash between print and ack must lead to
+   * REDELIVERY (F14). **Open/unacked beats cursor**: the broker ALWAYS first
+   * redelivers every open delivery for this agent regardless of the cursor
+   * (out-of-order acks can leave seq 9 open while 10 is acked; a cursor of
+   * 10 must not suppress 9), then streams new deliveries after the cursor —
+   * the cursor suppresses only already-closed history. A fresh process with
+   * no durable cursor passes 0. Commit seq is NOT a delivery cursor.
+   */
+  subscribe(as: AgentId, afterDeliverySeq: number): Promise<DeliverySubscription>;
+  /**
+   * Release the underlying connection/resources deterministically. One-shot
+   * CLI commands and tests call this in finally; without it, idle shutdown
+   * (F9) cannot be exercised deterministically. File mode: no-op.
+   */
+  close(): Promise<void>;
+}
+
+/** Broker daemon status — meaningful before/without any session. */
+export type BrokerStatusDto = {
+  readonly running: boolean;
+  readonly pid?: number;
+  readonly epoch?: number;
+  readonly endpoint?: string;
+  readonly heartbeatAt?: string;
+  readonly connections?: number;
+  readonly journalHeadSeq?: number;
+  readonly openDeliveries?: number;
+};
+
+/**
+ * Daemon lifecycle control (`pair broker status|stop`) — a separate surface
+ * from ProtocolGateway because it exists pre-session and must not be
+ * conflated with protocol queries. stop() drains: refuse new execute/
+ * subscribe, finish the in-flight txn, respond to the stop requester, close
+ * connections, release the lease, exit. Open unacked deliveries are durable
+ * and redeliver on next start (F11) — never a stop blocker.
+ */
+export interface BrokerControl {
+  brokerStatus(): Promise<BrokerStatusDto>;
+  stop(): Promise<void>;
+  close(): Promise<void>;
+}
