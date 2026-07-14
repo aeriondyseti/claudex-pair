@@ -55,6 +55,7 @@ export type BrokerHost = {
   onStopped: (reason: 'stop-requested' | 'idle') => void;
   pid: number;
   epoch: number;
+  endpoint: string;
   heartbeatAt: () => string;
 };
 
@@ -253,7 +254,7 @@ export class BrokerCore {
     this.#sweepTimer.unref();
   }
 
-  subscribe(sink: DeliverySink, as: string, afterDeliverySeq: number): Promise<void> {
+  subscribe(reqId: string, sink: DeliverySink, as: string, afterDeliverySeq: number): Promise<BrokerResponse> {
     // The cursor exists for closed-history suppression; the ledger holds no
     // closed history to replay, so open/unacked-beats-cursor consumes it
     // entirely (frozen contract) — accepted for wire compatibility.
@@ -261,8 +262,7 @@ export class BrokerCore {
     this.#lastBusyAt = Date.now();
     return this.#chain(async () => {
       if (this.#stopping) {
-        await sink.sendError('broker-stopping', 'Broker is draining; retry to respawn.');
-        return;
+        return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
       }
       this.#subscriptions.set(sink.id, { sink, as, connectedSince: this.#clock.now(), lastActivity: this.#clock.now() });
       // Open/unacked beats cursor (frozen rule): every open delivery for
@@ -270,14 +270,15 @@ export class BrokerCore {
       // ledger holds no closed history to replay, so the cursor's job ends
       // here by construction.
       for (const delivery of this.#journal.openDeliveriesFor(as)) this.#push(delivery);
+      return { reqId, ok: true };
     });
   }
 
-  ack(deliveryId: string, clientId: string): Promise<void> {
+  ack(reqId: string, deliveryId: string, clientId: string): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
     return this.#chain(async () => {
       const open = this.#journal.openDeliveries().find((d) => d.deliveryId === deliveryId);
-      if (!open) return; // idempotent (F5/F11)
+      if (!open) return { reqId, ok: true }; // idempotent (F5/F11)
       await this.#journal.ackDelivery(deliveryId, clientId, this.#clock.now());
       this.#leases.delete(deliveryId);
       try {
@@ -285,15 +286,17 @@ export class BrokerCore {
       } catch {
         /* mirror lag recoverable */
       }
+      return { reqId, ok: true };
     });
   }
 
-  extend(deliveryId: string): void {
+  extend(reqId: string, deliveryId: string): BrokerResponse {
     const lease = this.#leases.get(deliveryId);
     if (lease) lease.expiresAt = Date.now() + this.#config.deliveryLeaseMs;
+    return { reqId, ok: true };
   }
 
-  async query(reqId: string, what: string): Promise<BrokerResponse> {
+  async query(reqId: string, what: string, args?: unknown): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
     if (what === 'broker-status') return { reqId, ok: true, data: this.#brokerStatus() };
     if (what === 'broker-stop') {
@@ -314,7 +317,8 @@ export class BrokerCore {
       return { reqId, ok: true, data: state ? Object.values(state.grants) : [] };
     }
     if (what === 'log' || what.startsWith('log:')) {
-      const tail = what.startsWith('log:') ? Number(what.slice(4)) || 10 : 10;
+      const requested = args && typeof args === 'object' ? Number((args as { tail?: unknown }).tail) : NaN;
+      const tail = what.startsWith('log:') ? Number(what.slice(4)) || 10 : Number.isFinite(requested) ? requested : 10;
       return { reqId, ok: true, data: await this.#mirrors.archived(tail) };
     }
     return err(reqId, 'unknown-query', `Unknown query: ${what}`);
@@ -345,6 +349,7 @@ export class BrokerCore {
       running: true,
       pid: this.#host.pid,
       epoch: this.#host.epoch,
+      endpoint: this.#host.endpoint,
       heartbeatAt: this.#host.heartbeatAt(),
       connections: this.#connections.size,
       journalHeadSeq: this.#journal.headSeq,

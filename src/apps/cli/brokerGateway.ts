@@ -26,7 +26,9 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
   }
 
   async execute(request: ExecuteRequest): Promise<ExecuteOutcome> {
-    return this.request((client) => client.execute(request.as, request.command, request.identity.reqId), request.identity.reqId);
+    const response = await this.response((client) => client.execute(request.as, { command: request.command }, request.identity.reqId), true);
+    const data = response.data as Omit<ExecuteOutcome, 'seq' | 'events'>;
+    return { ...data, ...(response.seq === undefined ? {} : { seq: response.seq }), events: (response.events ?? []) as ExecuteOutcome['events'] };
   }
   async status(): Promise<StatusDto> { return this.query<StatusDto>('status'); }
   async log(tail = 10): Promise<readonly StoredMessage[]> { return this.query<readonly StoredMessage[]>('log', { tail }); }
@@ -74,20 +76,26 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
   }
 
   private async request<T>(send: (client: IpcClient) => Promise<ResponseFrame>, _reqId: string, spawn = true): Promise<T> {
+    return (await this.response(send, spawn)).data as T;
+  }
+
+  private async response(send: (client: IpcClient) => Promise<ResponseFrame>, spawn: boolean): Promise<Extract<ResponseFrame, { ok: true }>> {
     let response: ResponseFrame;
     try { response = await send(await this.getClient(spawn)); }
     catch {
+      if (!spawn) throw new Error('Broker is not running.');
       this.client?.close();
       this.client = await this.connector.rediscover();
       response = await send(this.client);
     }
     if (!response.ok && response.error.code === 'stale-epoch') {
+      if (!spawn) throw new BrokerWireError(response.error.code, response.error.message);
       this.client?.close();
       this.client = await this.connector.rediscover();
       response = await send(this.client);
     }
     if (!response.ok) throw new BrokerWireError(response.error.code, response.error.message);
-    return response.data as T;
+    return response;
   }
 
   private async getClient(spawn: boolean): Promise<IpcClient> {

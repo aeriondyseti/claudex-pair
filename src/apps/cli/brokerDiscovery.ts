@@ -82,7 +82,7 @@ async function spawnDetachedBroker(root: string): Promise<void> {
   const source = join(packageRoot, 'src', 'apps', 'broker', 'main.ts');
   const compiled = join(packageRoot, 'dist', 'pair-broker.exe');
   const bun = Bun.which('bun');
-  const argv = bun ? [bun, 'run', source, '-Root', root] : [compiled, '-Root', root];
+  const argv = bun ? [bun, 'run', source, root] : [compiled, root];
   const child = Bun.spawn(argv, { cwd: root, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', env: process.env });
   child.unref();
 }

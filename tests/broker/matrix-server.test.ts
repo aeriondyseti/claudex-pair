@@ -129,7 +129,7 @@ function makeCore(root: string) {
     join(root, '.pair'),
     { clock: systemClock, ids: systemIds, mirrors: new FsMirrors(root), codec: fsMessageCodec },
     { ...DEFAULT_CONFIG, idleGraceMs: 60_000 },
-    { onStopped: () => undefined, pid: process.pid, epoch: 1, heartbeatAt: () => systemClock.now() },
+    { onStopped: () => undefined, pid: process.pid, epoch: 1, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
   );
 }
 
