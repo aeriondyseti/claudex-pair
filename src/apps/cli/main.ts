@@ -4,6 +4,7 @@ import { bindFsDeps } from './bind.ts';
 import { parseArgs, str, num, has } from './args.ts';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
+import { runBrokerCli } from './brokerCli.ts';
 
 /**
  * `pair` CLI — verb-for-verb parity with bin/pair.ps1, including output text
@@ -87,8 +88,16 @@ async function runWait(
 }
 
 async function main(argv: string[]): Promise<number> {
-  const { command, flags } = parseArgs(argv);
+  const { command, flags, positionals } = parseArgs(argv);
   const rootFlag = str(flags, 'root');
+
+  // Broker is the authoritative default. The explicit fs mode is retained
+  // for read-only diagnostics and the legacy compatibility test suite.
+  if (process.env.CLAUDEX_PROTOCOL_MODE !== 'fs' && command !== 'watch' && command !== 'help') {
+    const root = command === 'init' || command === 'broker' ? resolve(rootFlag ?? process.cwd()) : findRoot(rootFlag);
+    const result = await runBrokerCli(command, flags, positionals, root);
+    if (result !== undefined) return result;
+  }
 
   switch (command) {
     case 'init': {
@@ -352,6 +361,7 @@ Usage:
   pair status
   pair log    [-Tail 10]
   pair watch  [-Tail 10] [-RefreshSec 2]   # live dashboard (for the human's pane)
+  pair broker status|stop [-Root <repo>]
   pair end    -As <me> [-Message '<summary>']   # notifies every other agent
 
 Work grants (grants-lite — parallel editing; driver-only issuance):

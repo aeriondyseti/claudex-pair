@@ -6,12 +6,14 @@
 export type ParsedArgs = {
   command: string;
   flags: Map<string, string | true>;
+  positionals: string[];
 };
 
 const KNOWN_SWITCHES = new Set(['acceptsharedworktreerisk', 'json', 'nowait']);
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags = new Map<string, string | true>();
+  const positionals: string[] = [];
   let command = 'help';
   let i = 0;
   if (argv.length > 0 && argv[0] !== undefined && !argv[0].startsWith('-')) {
@@ -21,7 +23,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   for (; i < argv.length; i++) {
     const token = argv[i];
     if (token === undefined) continue;
-    if (!token.startsWith('-')) continue;
+    if (!token.startsWith('-')) { positionals.push(token); continue; }
     const name = token.replace(/^-+/, '').toLowerCase();
     const next = argv[i + 1];
     if (KNOWN_SWITCHES.has(name) || next === undefined || next.startsWith('-')) {
@@ -31,7 +33,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       i++;
     }
   }
-  return { command, flags };
+  return { command, flags, positionals };
 }
 
 export function str(flags: ParsedArgs['flags'], name: string): string | undefined {

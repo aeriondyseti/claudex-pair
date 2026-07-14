@@ -10,6 +10,7 @@ export class IpcClient {
   #socket: Socket | undefined; #decoder = new NdjsonDecoder();
   #pending = new Map<string, { resolve: (frame: ResponseFrame) => void; reject: (error: Error) => void }>();
   #deliveries = new Set<(frame: DeliveryFrame) => void>();
+  #closes = new Set<(error: Error) => void>();
   constructor(readonly options: IpcClientOptions) { this.clientId = options.clientId ?? randomUUID(); }
 
   async connect(): Promise<void> {
@@ -18,32 +19,33 @@ export class IpcClient {
     await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
     this.#socket = socket; this.#decoder = new NdjsonDecoder();
     socket.on('data', (chunk) => { for (const frame of this.#decoder.push(chunk) as ServerFrame[]) this.#receive(frame); });
-    socket.on('close', () => { const error = new Error('IPC connection closed'); for (const pending of this.#pending.values()) pending.reject(error); this.#pending.clear(); });
+    socket.on('close', () => { const error = new Error('IPC connection closed'); for (const pending of this.#pending.values()) pending.reject(error); this.#pending.clear(); for (const listener of this.#closes) listener(error); });
   }
 
   close() { this.#socket?.destroy(); this.#socket = undefined; }
   onDelivery(listener: (frame: DeliveryFrame) => void) { this.#deliveries.add(listener); return () => this.#deliveries.delete(listener); }
+  onClose(listener: (error: Error) => void) { this.#closes.add(listener); return () => this.#closes.delete(listener); }
 
   async execute(as: string, envelope: unknown, reqId: string = randomUUID()): Promise<ResponseFrame> {
     const frame: ExecuteFrame = { ...this.#base(), kind: 'execute', reqId, as, envelope };
     return this.#requestWithRetry(frame, this.options.retryCount ?? 1);
   }
-  async query(what: string, reqId: string = randomUUID()): Promise<ResponseFrame> {
-    const frame: QueryFrame = { ...this.#base(), kind: 'query', reqId, what };
+  async query(what: string, reqId: string = randomUUID(), args?: unknown): Promise<ResponseFrame> {
+    const frame: QueryFrame = { ...this.#base(), kind: 'query', reqId, what, ...(args === undefined ? {} : { args }) };
     return this.#requestWithRetry(frame, this.options.retryCount ?? 1);
   }
-  async subscribe(as: string, afterDeliverySeq = 0) { const frame: SubscribeFrame = { ...this.#base(), kind: 'subscribe', as, afterDeliverySeq }; await this.#send(frame); }
-  async ack(deliveryId: string) { const frame: AckFrame = { ...this.#base(), kind: 'ack', deliveryId }; await this.#send(frame); }
-  async extend(deliveryId: string) { const frame: ExtendFrame = { ...this.#base(), kind: 'extend', deliveryId }; await this.#send(frame); }
+  async subscribe(as: string, afterDeliverySeq = 0, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'subscribe', reqId, as, afterDeliverySeq }, this.options.retryCount ?? 1); }
+  async ack(deliveryId: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'ack', reqId, deliveryId }, this.options.retryCount ?? 1); }
+  async extend(deliveryId: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'extend', reqId, deliveryId }, this.options.retryCount ?? 1); }
 
   #base() { return { token: this.options.token, epoch: this.options.epoch, clientId: this.clientId }; }
-  async #requestWithRetry(frame: ExecuteFrame | QueryFrame, retries: number): Promise<ResponseFrame> {
+  async #requestWithRetry(frame: ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame, retries: number): Promise<ResponseFrame> {
     for (let attempt = 0;; attempt++) {
       try { await this.connect(); return await this.#request(frame); }
       catch (error) { this.close(); if (attempt >= retries) throw error; }
     }
   }
-  async #request(frame: ExecuteFrame | QueryFrame): Promise<ResponseFrame> {
+  async #request(frame: ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame): Promise<ResponseFrame> {
     const response = new Promise<ResponseFrame>((resolve, reject) => this.#pending.set(frame.reqId, { resolve, reject }));
     try { await this.#send(frame); } catch (error) { this.#pending.delete(frame.reqId); throw error; }
     return response;

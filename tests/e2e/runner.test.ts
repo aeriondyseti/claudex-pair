@@ -38,7 +38,7 @@ async function runScenario(root: string, rawSteps: Step[]) {
   for (const raw of rawSteps) {
     const step = interpolate(raw, vars);
     const before = await snapshotUnchanged(root, step.effects ?? []);
-    const proc = Bun.spawn(['bun', 'run', cli, ...step.argv], { cwd: root, stdout: 'pipe', stderr: 'pipe', env: process.env });
+    const proc = Bun.spawn(['bun', 'run', cli, ...step.argv], { cwd: root, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, CLAUDEX_PROTOCOL_MODE: 'fs' } });
     const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     const output = stdout + stderr;
     expect(code, `${step.step}: exit\n${output}`).toBe(step.exit);
