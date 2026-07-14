@@ -1,0 +1,9 @@
+{"scenario":"roster-revoke-cli"}
+{"step":"init","argv":["init","-Task","roster cli","-Agents","claude,codex,agy","-Driver","claude"],"exit":0,"output":["Pairing session initialized"]}
+{"step":"pass-to-codex","argv":["send","-From","claude","-To","codex","-Type","ask","-Message","work","-NoWait"],"exit":0,"output":["Sent ask -> codex","Turn: codex"]}
+{"step":"revoke-needs-attestation","argv":["revoke-turn","-From","claude"],"exit":1,"output":["requires -ConfirmUnresponsive"],"effects":[{"path":".pair/session.json","json":{"turn":"codex"}}]}
+{"step":"revoke-fs-warning","argv":["revoke-turn","-From","claude","-ConfirmUnresponsive","-Reason","stalled"],"exit":0,"output":["Turn revoked from codex","FS MODE LIMITATION","no liveness guard"],"effects":[{"path":".pair/session.json","json":{"turn":"claude"}},{"path":".pair/inbox/codex/*.md","find":{"type":"turn-revoked","from":"claude","to":"codex"}}]}
+{"step":"propose-end-sugar","argv":["propose-end","-From","codex","-Message","looks complete"],"exit":0,"output":["Sent propose-end -> claude","Turn: claude"],"effects":[{"path":".pair/inbox/claude/*.md","find":{"type":"propose-end","turn":"keep"},"text":["looks complete"]}]}
+{"step":"voluntary-leave","argv":["leave","-As","agy"],"exit":0,"output":["agy left the session"],"effects":[{"path":".pair/session.json","json":{"agents":["claude","codex"]}}]}
+{"step":"driver-join","argv":["join","-From","claude","-Agent","agy"],"exit":0,"output":["agy joined the session","starts fresh"],"effects":[{"path":".pair/session.json","json":{"agents":["claude","codex","agy"]}}]}
+{"step":"driver-kick","argv":["kick","-From","claude","-Agent","agy","-Reason","done"],"exit":0,"output":["agy was removed","pending deliveries were voided"],"effects":[{"path":".pair/session.json","json":{"agents":["claude","codex"]}}]}

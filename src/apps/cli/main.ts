@@ -140,7 +140,7 @@ async function main(argv: string[]): Promise<number> {
       const from = requireStr(flags, 'from', 'send requires -From <you> — never impersonate a partner').toLowerCase();
       const to = str(flags, 'to')?.toLowerCase();
       const type = (str(flags, 'type') ?? 'info').toLowerCase() as import('@core/types.ts').MessageType;
-      const VALID_TYPES = ['ask', 'answer', 'handoff', 'review', 'info', 'done'];
+      const VALID_TYPES = ['ask', 'answer', 'handoff', 'review', 'info', 'done', 'propose-end'];
       if (!VALID_TYPES.includes(type)) {
         throw new ProtocolError('session-not-active', `-Type '${type}' is not valid. Valid values: ${VALID_TYPES.join(', ')}`);
       }
@@ -199,6 +199,36 @@ async function main(argv: string[]): Promise<number> {
       // Pure alias: send now fuses the wait itself — delegating exactly once
       // is what prevents the historical double-wait.
       return main(['send', ...flattenFlags(flags)]);
+    }
+    case 'propose-end': {
+      const from = requireStr(flags, 'from', 'propose-end requires -From <you>').toLowerCase();
+      const s = await uc.status(bindFsDeps(findRoot(rootFlag)));
+      flags.set('from', from); flags.set('to', s.session.driver); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
+      return main(['send', ...flattenFlags(flags)]);
+    }
+    case 'revoke-turn': {
+      const deps = bindFsDeps(findRoot(rootFlag));
+      const from = requireStr(flags, 'from', 'revoke-turn requires -From <driver>').toLowerCase();
+      if (!has(flags, 'confirmunresponsive')) throw new ProtocolError('session-not-active', 'revoke-turn requires -ConfirmUnresponsive: explicitly attest that the turn holder is unresponsive.');
+      const r = await uc.revokeTurn(deps, { from, reason: str(flags, 'reason') ?? '' });
+      const revoked = r.events.find((e) => e.kind === 'turn-revoked');
+      out(`Turn revoked from ${revoked?.kind === 'turn-revoked' ? revoked.from : 'partner'}; ${from} now holds the turn.`);
+      out('FS MODE LIMITATION: no liveness guard is available; -ConfirmUnresponsive is the only stale-partner check.');
+      return 0;
+    }
+    case 'leave': {
+      const as = requireStr(flags, 'as', 'leave requires -As <you>').toLowerCase();
+      await uc.leaveSession(bindFsDeps(findRoot(rootFlag)), { as }); out(`${as} left the session.`); return 0;
+    }
+    case 'join': {
+      const from = requireStr(flags, 'from', 'join requires -From <driver>').toLowerCase();
+      const agent = requireStr(flags, 'agent', 'join requires -Agent <name>').toLowerCase();
+      await uc.joinSession(bindFsDeps(findRoot(rootFlag)), { from, agent }); out(`${agent} joined the session. Earlier deliveries are not replayed; the rejoined agent starts fresh.`); return 0;
+    }
+    case 'kick': {
+      const from = requireStr(flags, 'from', 'kick requires -From <driver>').toLowerCase();
+      const agent = requireStr(flags, 'agent', 'kick requires -Agent <name>').toLowerCase();
+      await uc.kickAgent(bindFsDeps(findRoot(rootFlag)), { from, agent, reason: str(flags, 'reason') ?? '' }); out(`${agent} was removed from the session; its pending deliveries were voided.`); return 0;
     }
     case 'status': {
       const deps = bindFsDeps(findRoot(rootFlag));
@@ -366,7 +396,7 @@ const HELP = `claudex pair — turn-based pairing between AI CLI agents (claude,
 
 Usage:
   pair init   -Task '<goal>' [-Agents 'claude,codex[,agy,...]'] [-Driver <agent>] [-Root <repo>]
-  pair send   -From <me> [-To <agent>] [-Type ask|answer|handoff|review|info]
+  pair send   -From <me> [-To <agent>] [-Type ask|answer|handoff|review|info|propose-end]
               (-Message '<text>' | -File <path>) [-Turn pass|keep]
               [-NoWait] [-TimeoutSec N] [-PollSec 2]
               # -To required when more than one possible recipient
@@ -376,11 +406,18 @@ Usage:
               # wait', never re-send. -Turn keep returns immediately.
   pair wait   -As <me> [-TimeoutSec 300] [-PollSec 2]      # 0 = check once
   pair ask    -From <me> (-Message '<text>' | -File <path>) # = send -Type ask
+  pair propose-end -From <me> (-Message '<why>' | -File <path>) # FYI to driver
+  pair revoke-turn -From <driver> -ConfirmUnresponsive [-Reason '<why>']
+              # Broker rejects while a live delivery lease exists. FS mode has
+              # NO liveness guard; the confirmation is its only stale check.
+  pair leave  -As <me>
+  pair join   -From <driver> -Agent <name>
+  pair kick   -From <driver> -Agent <name> [-Reason '<why>']
   pair status
   pair log    [-Tail 10]
   pair watch  [-Tail 10] [-RefreshSec 2]   # live dashboard (for the human's pane)
   pair broker status|stop [-Root <repo>]
-  pair end    -As <me> [-Message '<summary>']   # notifies every other agent
+  pair end    -As <driver> [-Message '<summary>'] # driver-only; notifies all
 
 Work grants (grants-lite — parallel editing; driver-only issuance):
   pair grant        -From <driver> -To <agent> -TaskDesc '<task>'

@@ -114,8 +114,8 @@ not the concepts.
    becomes driver (default agents: `claude,codex`). Exactly one `pair init`
    per session; if `.pair/session.json` already shows `status: active`, join
    instead.
-2. **Join** — each other agent reads `session.json` + `memory.md`, announces
-   itself (`pair send -From <self> -To <driver> -Type info -Turn keep
+2. **Join** — initial participants read `session.json` + `memory.md`, announce
+   themselves (`pair send -From <self> -To <driver> -Type info -Turn keep
    -Message 'joined, ready'`), then blocks on `pair wait -As <self>`.
 3. **Loop** — the turn-holder works, then sends (usually `ask` or `review`);
    the send fuses into the wait and exits when the reply lands. Typical
@@ -125,11 +125,21 @@ not the concepts.
 4. **Handoff** — to swap roles, the current driver sends `-Type handoff`;
    the recipient becomes driver (recorded in `session.json` automatically).
    A navigator who wants to drive asks; the driver replies with a handoff.
-5. **End** — when the user says the task is finished (or the pair agrees and
-   the user confirms), one agent runs `pair end -As <self> -Message
-   '<summary>'`. This appends the summary to `memory.md`, notifies every
-   other agent, and blocks further sends. All agents then report to their
-   users.
+5. **Roster changes** — only the driver may admit an agent (`pair join -From
+   <driver> -Agent <name>`) or forcibly remove one (`pair kick -From <driver>
+   -Agent <name> [-Reason ...]`). A navigator may voluntarily `pair leave -As
+   <self>` when it has no open grant. Rejoining starts with a fresh delivery
+   cursor: messages from before removal are never replayed.
+6. **Unresponsive turn holder** — the driver may run `pair revoke-turn -From
+   <driver> -ConfirmUnresponsive [-Reason ...]`. The confirmation is required
+   caller attestation. Broker mode additionally rejects revocation while the
+   holder has a live delivery lease; fs mode has no liveness guard, so the
+   attestation is its only stale-partner check.
+7. **End** — ending is driver-only. A navigator proposes closure with
+   `pair propose-end -From <self> -Message '<why>'` (a `propose-end`, turn-keep
+   message to the driver). After user confirmation, the driver runs `pair end
+   -As <driver> -Message '<summary>'`. This appends the summary to `memory.md`,
+   notifies every other agent, and blocks further sends.
 
 ## Rules of conduct
 

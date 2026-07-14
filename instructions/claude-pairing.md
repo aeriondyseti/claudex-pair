@@ -66,9 +66,18 @@ Always run it from the target repo (state lives in `<repo>/.pair/`).
 
 ## Ending
 
-When the user confirms the task is done (or codex sends `done`):
-`$PAIR end -As claude -Message '<what was accomplished>'` — then give the
-user a normal wrap-up. After a `done` arrives, never wait or send again.
+Only the driver may end. If you navigate and believe work is complete, run
+`$PAIR propose-end -From claude -Message '<why>'`; it keeps the turn and asks
+the driver to decide. When the user confirms and you are driver, run `$PAIR
+end -As claude -Message '<what was accomplished>'`. After `done`, never wait.
+
+## Turn recovery and roster
+
+The driver may use `$PAIR revoke-turn -From claude -ConfirmUnresponsive
+[-Reason '<why>']`; broker mode refuses while the holder has a live delivery
+lease, while fs mode has no liveness guard beyond this explicit attestation.
+Use `leave -As claude`, or as driver `join -From claude -Agent <name>` and
+`kick -From claude -Agent <name> [-Reason ...]`. Rejoin never replays old mail.
 
 ## Work grants (parallel editing)
 

@@ -53,6 +53,7 @@ export function bindFsDeps(root: string): Deps {
     session: DiskSession,
   ): Promise<CommitReceipt> => {
     const messageFiles: string[] = [];
+    const removed = new Set<string>();
     let sessionDirty = false;
     for (const event of events) {
       switch (event.kind) {
@@ -62,6 +63,9 @@ export function bindFsDeps(root: string): Deps {
             type: event.type, turn: event.turn, sent: event.at, body: event.body,
           });
           messageFiles.push(name);
+          // Removed agents have no live inbox. Keep their notice durable in
+          // the archive, but never let it become stale mail after a rejoin.
+          if (removed.has(event.to)) await mailboxFs.claimAll(event.to);
           break;
         }
         case 'turn-passed':
@@ -75,6 +79,21 @@ export function bindFsDeps(root: string): Deps {
           break;
         case 'session-ended':
           session.status = 'completed';
+          sessionDirty = true;
+          break;
+        case 'turn-revoked':
+          break; // provenance only; paired turn-passed mutates the session
+        case 'agent-left':
+        case 'agent-kicked':
+          session.agents = session.agents.filter((a) => a !== event.agent);
+          session.navigators = session.navigators.filter((a) => a !== event.agent);
+          removed.add(event.agent);
+          await mailboxFs.claimAll(event.agent);
+          sessionDirty = true;
+          break;
+        case 'agent-joined':
+          session.agents = [...session.agents, event.agent];
+          session.navigators = session.agents.filter((a) => a !== session.driver);
           sessionDirty = true;
           break;
         case 'grant-issued':
