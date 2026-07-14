@@ -83,6 +83,17 @@ async function spawnDetachedBroker(root: string): Promise<void> {
   const compiled = join(packageRoot, 'dist', 'pair-broker.exe');
   const bun = Bun.which('bun');
   const argv = bun ? [bun, 'run', source, root] : [compiled, root];
-  const child = Bun.spawn(argv, { cwd: root, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', env: process.env });
+  // node:child_process with detached:true — Bun.spawn+unref leaves the
+  // daemon in the parent's Windows process tree, so it died with the pwsh
+  // shim (found live: broker.lease pid gone the moment the CLI exited).
+  // detached:true gives it its own process group/console on every platform.
+  const { spawn } = await import('node:child_process');
+  const child = spawn(argv[0]!, argv.slice(1), {
+    cwd: root,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: process.env,
+  });
   child.unref();
 }
