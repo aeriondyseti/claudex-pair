@@ -1,87 +1,71 @@
 import { describe, test } from 'bun:test';
 
 /**
- * Failure mode test matrix (F1-F14) mapping to BROKER-SPEC.md sections:
- * 
- * Storage / Journal Recovery:
- * - F1: Torn tail (Storage)
- * - F2: Crash before ack (Storage)
- * - F6: CRC corruption (Storage)
- * - F8: Mirror states (Storage)
- * - F11: Unacked deliveries across restarts (Storage)
- * - F12: Snapshot/segment boundaries (Storage)
- * 
- * Lifecycle / Election:
- * - F3: Double spawn race (Lifecycle)
- * - F7: Hung broker / fencing (Identity & discovery)
- * - F9: Idle shutdown race (Lifecycle)
- * - F13: Stale Unix socket (Lifecycle)
- * 
- * Wire Protocol / Delivery:
- * - F4: Client death with unacked delivery (Wire protocol)
- * - F5: Duplicate wait (Wire protocol)
- * - F14: Client ack-ordering (Wire protocol)
- * 
- * Commit Path:
- * - F10: Race conditions (Commit path)
+ * BROKER-SPEC failure-matrix COVERAGE MAP. The W1 skeleton's F1–F14 todos
+ * are all implemented as concrete tests; this file records where, so the
+ * matrix has one canonical index and `bun test` no longer reports
+ * implemented behavior as TODO:
+ *
+ * - F1  torn tail                    → tests/broker/journal.test.ts
+ * - F2  crash-before-ack dedup       → tests/broker/journal.test.ts
+ *                                      + live wire replay in tests/integration/broker-client.test.ts
+ * - F3  double spawn race            → tests/integration/broker-client.test.ts (spawn readiness);
+ *                                      real-daemon variant in tests/e2e/broker-real.test.ts (non-Windows)
+ * - F4  unacked delivery → lease expiry → redelivery
+ *                                    → tests/integration/broker-client.test.ts; real-daemon (non-Windows)
+ * - F5  duplicate wait, exactly-once ack (+ open/unacked beats cursor on
+ *       out-of-order-ack resubscribe) → tests/integration/broker-client.test.ts
+ * - F6  crc corruption mid-history   → tests/broker/journal.test.ts
+ * - F7  hung broker fencing / PID-reuse refusal / unverifiable identity
+ *                                    → tests/broker/matrix-server.test.ts
+ * - F8  mirror lag rebuild vs tamper-at-parity conflict
+ *                                    → tests/broker/matrix-server.test.ts
+ * - F9  idle shutdown vs racing connection
+ *                                    → tests/e2e/broker-real.test.ts (non-Windows; Windows covered by
+ *                                      manual daemon smoke — Bun test jobs kill detached grandchildren)
+ * - F10 end-vs-grant-accept race     → tests/broker/matrix-server.test.ts
+ * - F11 restart redelivery from durable ledger
+ *                                    → tests/broker/journal.test.ts + real-daemon (non-Windows)
+ * - F12 snapshot/rotation boundaries → tests/broker/journal.test.ts
+ * - F13 stale unix socket probe/unlink
+ *                                    → src/adapters/ipc/ipc.test.ts (platform-skipped on Windows,
+ *                                      where pipe names cannot go stale)
+ * - F14 print+flush-before-ack, both crash boundaries + open-beats-cursor resume
+ *                                    → tests/integration/broker-client.test.ts (loopback), unit in brokerWait
+ *
+ * F15–F22 (turn revocation 8a + roster/close authority 11) are W2c scope —
+ * real todos below, quoting the spec so implementers convert without
+ * re-reading it.
  */
 
-describe('F1', () => {
-  test.todo('kill -9 mid-append → restart truncates torn tail, state consistent', () => {});
+describe('F15', () => {
+  test.todo('revoke-vs-reply race → broker-serialized: whichever envelope commits first wins; the late reply is archived advisory (stale-turn), never a turn mutation — at no point do two agents hold the turn', () => {});
 });
 
-describe('F2', () => {
-  test.todo('crash after fsync before ack → retry with same (clientId, reqId) replays recorded outcome from the journal-rebuilt dedup index; no double event', () => {});
+describe('F16', () => {
+  test.todo('revoke attempt while the navigator holds a live delivery lease (heartbeating) → rejected partner-active; after lease expiry with no ack, the same revoke commits', () => {});
 });
 
-describe('F3', () => {
-  test.todo('double spawn race → OS lock yields exactly one holder; loser connects', () => {});
+describe('F17', () => {
+  test.todo('navigator leaves while holding the turn → turn returns to the driver in the same committed txn; a post-rejoin reply bearing the old turn is stale (per F15)', () => {});
 });
 
-describe('F4', () => {
-  test.todo('client dies with unacked delivery → lease expiry → redelivery to next wait', () => {});
+describe('F18', () => {
+  test.todo('leave/kick with enqueued undelivered deliveries → voided to the archive in the same committed txn; nothing is ever delivered to a removed agent; a later rejoin starts from a fresh delivery cursor (no stale redelivery)', () => {});
 });
 
-describe('F5', () => {
-  test.todo('duplicate wait (same identity, two connections) → each delivery acked exactly once', () => {});
+describe('F19', () => {
+  test.todo('navigator end-session or done-send → rejected end-not-driver; the rejection makes no state change and is not journaled (retried rejections re-evaluate per the retry contract)', () => {});
 });
 
-describe('F6', () => {
-  test.todo('journal crc corruption mid-history → refuse start with doctor guidance', () => {});
+describe('F20', () => {
+  test.todo('voluntary leave while holding an offered/active grant → rejected leave-with-grant; after grant-done or a driver cancel, the same leave commits', () => {});
 });
 
-describe('F7', () => {
-  test.todo('hung broker (lock held, heartbeat stale) → fencing by verified termination of the exact {pid, startTime, nonce} identity, then normal acquisition with epoch bump', () => {});
-  test.todo('identity mismatch (PID reuse) → refuse and report', () => {});
-  test.todo('termination unavailable → "broker hung" surfaced, no takeover', () => {});
+describe('F21', () => {
+  test.todo('kick of a grant-holding navigator → open grants cancelled in the same committed txn (the stop-notice to the kicked agent is voided with its other deliveries); grant scope/worktree ownership released; driver reissues to reassign', () => {});
 });
 
-describe('F8', () => {
-  test.todo('mirror states: manifest behind journal head (incl. mismatched hashes from the broker\'s own partial update) → unconditional rebuild', () => {});
-  test.todo('divergence AT parity → read-only conflict state', () => {});
-});
-
-describe('F9', () => {
-  test.todo('idle shutdown vs racing new connection → connection wins or clean respawn', () => {});
-});
-
-describe('F10', () => {
-  test.todo('end-vs-grant-accept race → broker-serialized, grant mutation rejected post-end', () => {});
-});
-
-describe('F11', () => {
-  test.todo('broker crash/restart with outstanding unacked deliveries → all redelivered from the durable ledger, none lost, none duplicated post-ack', () => {});
-});
-
-describe('F12', () => {
-  test.todo('crash at snapshot/segment-rotation boundaries → recovery from either the old or new artifact, never a mixed state', () => {});
-});
-
-describe('F13', () => {
-  test.todo('stale Unix socket after kill -9 → bind gets EADDRINUSE → probe: connection refused ⇒ unlink dead socket and bind; connection accepted ⇒ live broker, back off', () => {});
-});
-
-describe('F14', () => {
-  test.todo('client ack-ordering, both boundaries: (a) wait crashes after receiving a delivery but before printing → no ack was sent → redelivery, nothing lost', () => {});
-  test.todo('(b) wait crashes after stdout flush but before ack → redelivery produces a duplicate print → consumer dedups by deliveryId; the invariant under test: ack is sent only after stdout write+flush returns', () => {});
+describe('F22', () => {
+  test.todo('init issued by a principal other than the declared driver → rejected init-not-driver (roster authority is uniform from session creation onward)', () => {});
 });
