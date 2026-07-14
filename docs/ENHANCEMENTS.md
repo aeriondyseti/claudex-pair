@@ -372,6 +372,7 @@ M6. **Sequencing constraint**: parameterize the P0 spec over **topology capabili
 
 U1. **Interactive `watch`: a first-class user channel with honest provenance**
     *(user request; extends the Agent Teams trust rule)*
+    Implementation handoff: [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md).
     `pair watch` grows an input line: alongside the live transcript, the human can
     send instructions into the session as the reserved identity **`user`** — to one
     agent or broadcast. This closes the gap where a relayed "my user said X" is
