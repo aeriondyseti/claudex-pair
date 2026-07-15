@@ -26,8 +26,27 @@ export async function runWatch(root: string, options: WatchOptions): Promise<num
     let userToken: string | undefined;
     let credentialError: string | undefined;
     if (interactive) {
+      // Discover the AUTHORITATIVE registration state BEFORE touching the
+      // store (codex slice review #3): a missing credential with an
+      // existing binding is a loud error, never a regenerated token — and
+      // an empty journal falls to fs mode having touched nothing.
+      const { BrokerGateway } = await import('./brokerGateway.ts');
+      const probe = BrokerGateway.forRoot(root);
+      let registered: boolean | undefined;
+      try {
+        registered = Boolean((await probe.status()).session.userChannelTokenHash);
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (code === 'session-not-active') {
+          await probe.close();
+          return runFsEventLoop(root, options, reduceWatch);
+        }
+        registered = undefined; // unreachable: undetermined — never create
+      } finally {
+        await probe.close().catch(() => undefined);
+      }
       const { loadOrCreateUserToken } = await import('./credentialStore.ts');
-      const credential = await loadOrCreateUserToken(root);
+      const credential = await loadOrCreateUserToken(root, { createIfMissing: registered === false });
       if (credential.kind === 'error') credentialError = credential.detail;
       else userToken = credential.token;
     }

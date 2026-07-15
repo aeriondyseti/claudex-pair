@@ -26,8 +26,17 @@ export type TerminalHandlers = {
  */
 export class InputDecoder {
   #utf8 = new TextDecoder('utf-8');
+  /** ESC/CSI state survives chunk boundaries (codex slice review #5): a
+   * chunk ending in ESC or ESC-[ must not emit escape/text prematurely. */
+  #escape: Buffer = Buffer.alloc(0);
+  #lastWasCR = false;
+
   decode(chunk: Buffer | string, handlers: Pick<TerminalHandlers, 'onQuit' | 'onText' | 'onKey'>): void {
-    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    let bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    if (this.#escape.length > 0) {
+      bytes = Buffer.concat([this.#escape, bytes]);
+      this.#escape = Buffer.alloc(0);
+    }
     let text = '';
     const flush = () => {
       if (text.length > 0) handlers.onText?.(text);
@@ -35,17 +44,23 @@ export class InputDecoder {
     };
     for (let i = 0; i < bytes.length; i++) {
       const byte = bytes[i]!;
+      const wasCR = this.#lastWasCR;
+      this.#lastWasCR = byte === 0x0d;
       if (byte === 0x03 || byte === 0x11) { flush(); handlers.onQuit(); continue; } // Ctrl+C / Ctrl+Q
-      if (byte === 0x0d || byte === 0x0a) { flush(); handlers.onKey?.('submit'); continue; }
+      if (byte === 0x0d) { flush(); handlers.onKey?.('submit'); continue; }
+      if (byte === 0x0a) { if (!wasCR) { flush(); handlers.onKey?.('submit'); } continue; } // CRLF = ONE submit
       if (byte === 0x7f || byte === 0x08) { flush(); handlers.onKey?.('backspace'); continue; }
       if (byte === 0x09) { flush(); handlers.onKey?.('tab'); continue; }
       if (byte === 0x06) { flush(); handlers.onKey?.('filter'); continue; } // Ctrl+F
       if (byte === 0x1b) {
         flush();
-        // CSI sequences: consume through the final byte (0x40-0x7e).
+        if (i === bytes.length - 1) { this.#escape = Buffer.from([0x1b]); return; } // ESC at boundary: hold
         if (bytes[i + 1] === 0x5b) {
+          // CSI: consume through the final byte (0x40-0x7e); if the chunk
+          // ends mid-sequence, hold the prefix for the next decode call.
           let j = i + 2;
           while (j < bytes.length && (bytes[j]! < 0x40 || bytes[j]! > 0x7e)) j++;
+          if (j >= bytes.length) { this.#escape = Buffer.from(bytes.subarray(i)); return; }
           const body = bytes.subarray(i + 2, j + 1).toString('latin1');
           if (body === '5~') handlers.onKey?.('page-up');
           else if (body === '6~') handlers.onKey?.('page-down');

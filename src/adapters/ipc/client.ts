@@ -41,8 +41,11 @@ export class IpcClient {
   }
   async subscribe(as: string, afterDeliverySeq = 0, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'subscribe', reqId, as, afterDeliverySeq }, this.options.retryCount ?? 1); }
   async observe(reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'observe', reqId }, this.options.retryCount ?? 1); }
-  /** U1: token travels ONCE here; user-send is tokenless (connection-bound auth). */
-  async userAttach(userToken: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'user-attach', reqId, userToken }, this.options.retryCount ?? 1); }
+  /** U1: token travels ONCE here; user-send is tokenless (connection-bound
+   * auth). NO internal retry: a handshake retry on a fresh socket would
+   * poison the caller's already-armed push queue — the host rebuilds the
+   * whole session instead (codex slice review #6). */
+  async userAttach(userToken: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'user-attach', reqId, userToken }, 0); }
   async userSend(to: string, body: string, reqId: string) { return this.#requestWithRetry({ ...this.#base(), kind: 'user-send', reqId, to, body }, 0); }
   async ack(deliveryId: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'ack', reqId, deliveryId }, this.options.retryCount ?? 1); }
   async extend(deliveryId: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'extend', reqId, deliveryId }, this.options.retryCount ?? 1); }

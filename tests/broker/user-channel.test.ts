@@ -172,6 +172,9 @@ describe('user-send', () => {
     await core.userAttach('a1', sink('conn-1'), 'user-client', 'e'.repeat(64));
     const first = await core.userSend('req-9', 'user-client', 'conn-1', 'codex', 'persist me');
     expect(first.ok).toBeTrue();
+    // Windows: let the first core's async mirror chain settle before a
+    // second instance rebuilds the same files (EPERM rename flake).
+    await Bun.sleep(200);
 
     const reopened = makeCore(root);
     await reopened.recover();

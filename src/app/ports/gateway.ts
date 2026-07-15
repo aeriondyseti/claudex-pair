@@ -195,8 +195,8 @@ export interface ObserverSession {
  * composer-visible (pending-error → Enter re-submits the SAME reqId after
  * the host reattached/reauthenticated), and journal dedup makes them safe.
  */
-export interface UserChannelSession extends ObserverSession {
-  send(reqId: string, target: string, body: string): Promise<void>;
+export interface UserObserverSession extends ObserverSession {
+  send(reqId: string, target: AgentId | '*', body: string): Promise<void>;
 }
 
 /** Broker daemon status — meaningful before/without any session. */

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentId, Grant } from '@core/types.ts';
 import type {
   BrokerControl, BrokerStatusDto, Delivery, DeliverySubscription, ExecuteOutcome,
-  ExecuteRequest, ObserverPush, ObserverSession, ObserverSnapshotDto, ProtocolGateway, StatusDto, UserChannelSession,
+  ExecuteRequest, ObserverPush, ObserverSession, ObserverSnapshotDto, ProtocolGateway, StatusDto, UserObserverSession,
 } from '@app/ports/gateway.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 import { IpcClient } from '@adapters/ipc/client.ts';
@@ -57,11 +57,14 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     const client = await this.getClient(spawn);
     const queue = new AsyncQueue<ObserverPush>();
     const offPush = client.onObserverPush((frame) => queue.push(frame as ObserverPush));
-    const offClose = client.onClose((error) => queue.fail(error));
     let response: ResponseFrame;
     try { response = await client.observe(); }
-    catch (error) { offPush(); offClose(); queue.close(); throw error; }
-    if (!response.ok) { offPush(); offClose(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    catch (error) { offPush(); queue.close(); throw error; }
+    if (!response.ok) { offPush(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    // Same transactional shape as userAttach/subscribe: close semantics arm
+    // only for the socket that completed the handshake.
+    const offClose = client.onClose((error) => queue.fail(error));
+    if (!client.connected) queue.fail(new Error('IPC connection closed'));
     return {
       snapshot: response.data as ObserverSnapshotDto,
       pushes: queue,
@@ -81,16 +84,21 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
    */
   /** U1: authenticated user-channel attach — observe semantics plus send
    * on the SAME connection. Reattach (a fresh userAttach) is the host's
-   * job, exactly like observe. */
-  async userAttach(userToken: string, spawn = true): Promise<UserChannelSession> {
+   * job, exactly like observe. Transactional like the subscription seam
+   * (codex slice review #6): push listener installs before the handshake,
+   * close semantics arm only on SUCCESS with a connected-race check —
+   * IpcClient.userAttach never retries internally, so a mid-handshake drop
+   * rejects here instead of returning a session with a poisoned queue. */
+  async userAttach(userToken: string, spawn = true): Promise<UserObserverSession> {
     const client = await this.getClient(spawn);
     const queue = new AsyncQueue<ObserverPush>();
     const offPush = client.onObserverPush((frame) => queue.push(frame as ObserverPush));
-    const offClose = client.onClose((error) => queue.fail(error));
     let response: ResponseFrame;
     try { response = await client.userAttach(userToken); }
-    catch (error) { offPush(); offClose(); queue.close(); throw error; }
-    if (!response.ok) { offPush(); offClose(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    catch (error) { offPush(); queue.close(); throw error; }
+    if (!response.ok) { offPush(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    const offClose = client.onClose((error) => queue.fail(error));
+    if (!client.connected) queue.fail(new Error('IPC connection closed')); // close raced the arming
     return {
       snapshot: response.data as ObserverSnapshotDto,
       pushes: queue,

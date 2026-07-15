@@ -3,7 +3,7 @@ import { systemClock } from '@adapters/clock/index.ts';
 import { diffWatchFrame } from '@adapters/tui/frame.ts';
 import { initialWatchState, type WatchEffect, type WatchReducer, type WatchTuiState } from '@adapters/tui/events.ts';
 import type { AgentPresence, TranscriptEntry, WatchViewModel } from '@adapters/tui/viewmodel.ts';
-import type { ObserverSession, UserChannelSession } from '@app/ports/gateway.ts';
+import type { ObserverSession, UserObserverSession } from '@app/ports/gateway.ts';
 import type { SessionState } from '@core/types.ts';
 import * as uc from '@app/usecases.ts';
 import { bindFsDeps } from './bind.ts';
@@ -39,7 +39,7 @@ export class NoBrokerSessionError extends Error {}
 /** Injection seams for deterministic loop tests (real defaults in prod). */
 export type ObserverGatewayLike = {
   observe(spawn?: boolean): Promise<ObserverSession>;
-  userAttach?(userToken: string, spawn?: boolean): Promise<UserChannelSession>;
+  userAttach?(userToken: string, spawn?: boolean): Promise<UserObserverSession>;
   close(): Promise<void>;
 };
 export type WatchLoopHooks = {
@@ -107,7 +107,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
     onKey: (key) => queue.push(key === 'submit' ? { kind: 'key', key, reqId: randomUUID() } : { kind: 'key', key }),
   });
   const state = initialWatchState({ width: term.width(), tail: options.tail, now: systemClock.now() });
-  let session: ObserverSession | UserChannelSession | undefined;
+  let session: ObserverSession | UserObserverSession | undefined;
   let spawnAllowed = true; // flips only after the first SUCCESSFUL attach
   let everAttached = false; // no model yet → banner feedback during retries
   let pumpGeneration = 0;
@@ -132,7 +132,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           try {
             // U1: attach authenticated when a token is present; an auth
             // failure (foreign binding) degrades LOUDLY to read-only.
-            let next: ObserverSession | UserChannelSession;
+            let next: ObserverSession | UserObserverSession;
             if (options.userToken && gateway.userAttach) {
               try {
                 next = await gateway.userAttach(options.userToken, spawnAllowed);
@@ -161,7 +161,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
             }
             await gateway.close();
             queue.push({ kind: 'connection', state: 'reattaching' });
-            if (!everAttached) banner.draw(`pair watch: broker unreachable (${message(error)}) — retrying every ${reattachDelayMs / 1000}s. q to quit.`);
+            if (!everAttached) banner.draw(`pair watch: broker unreachable (${message(error)}) — retrying every ${reattachDelayMs / 1000}s. Ctrl+C to quit.`);
             await systemClock.sleep(reattachDelayMs);
           }
         }

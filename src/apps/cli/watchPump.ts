@@ -33,7 +33,13 @@ export function toStored(event: Extract<Event, { kind: 'message-sent' }>): Store
   const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body };
   return {
     name: fsMessageCodec.filename(pair),
-    header: { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at },
+    header: {
+      id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at,
+      // U1: composer reconciliation and badges key on these — dropping them
+      // here made live sends never clear pending (codex slice review #1).
+      ...(event.groupId === undefined ? {} : { groupId: event.groupId }),
+      ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
+    },
     body: event.body,
     raw: fsMessageCodec.raw(pair),
   };
