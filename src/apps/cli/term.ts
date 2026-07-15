@@ -29,6 +29,18 @@ export function frameWidth(): number {
   return Math.max(60, (process.stdout.columns ?? 100) - 1);
 }
 
+/** Clear-and-redraw with a frame-equality gate — the FINAL render coalescer
+ * (seam amendment 4); the reducer's render effect is only semantic
+ * eligibility. */
+export class Screen {
+  #last = '';
+  draw(frame: string): void {
+    if (frame === this.#last) return;
+    process.stdout.write(`\x1b[2J\x1b[H${frame}`);
+    this.#last = frame;
+  }
+}
+
 export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: boolean } = {}): TerminalSession {
   const stdin = process.stdin;
   const stdout = process.stdout;

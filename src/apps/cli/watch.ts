@@ -8,6 +8,7 @@ import { renderWatchFrame } from '@adapters/tui/watch.ts';
 import type { AgentPresence, TranscriptEntry, WatchViewModel } from '@adapters/tui/viewmodel.ts';
 import { bindFsDeps } from './bind.ts';
 import { BrokerGateway } from './brokerGateway.ts';
+import { Screen } from './term.ts';
 import { toStored } from './watchPump.ts';
 
 /**
@@ -230,16 +231,6 @@ async function runFsWatch(root: string, options: WatchOptions): Promise<number> 
   }
 }
 
-/** Clear-and-redraw with a change gate; slice 2 replaces this with a real
- * event loop (coalesced redraw, resize handling, cursor cleanup). */
-class Screen {
-  #last = '';
-  draw(frame: string): void {
-    if (frame === this.#last) return;
-    process.stdout.write(`\x1b[2J\x1b[H${frame}`);
-    this.#last = frame;
-  }
-}
 
 function render(vm: WatchViewModel, options: WatchOptions): string {
   const width = Math.max(60, (process.stdout.columns ?? 100) - 1);
