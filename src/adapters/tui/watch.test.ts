@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { Grant, SessionState } from '@core/types.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 import { ageSeconds, derivePresence, formatAge } from './derive.ts';
+import type { ComposerState } from './events.ts';
 import { renderWatchFrame } from './watch.ts';
 import type { WatchViewModel } from './viewmodel.ts';
 
@@ -28,6 +29,23 @@ const message = (overrides: Partial<StoredMessage['header']> = {}): StoredMessag
   },
   body: 'Please review the observer. This line is intentionally long.',
   raw: '',
+});
+
+const userMessage = (id: string, to: string, pending: boolean, groupId = 'request-1') => ({
+  message: message({
+    id,
+    from: 'user',
+    to,
+    type: 'info',
+    turn: 'keep',
+    groupId,
+    provenance: 'trusted_user_client',
+  } as Partial<StoredMessage['header']>),
+  pending,
+});
+
+const composer = (overrides: Partial<ComposerState> = {}): ComposerState => ({
+  channel: 'registered', buffer: '', target: '*', scrollOffset: 0, filter: 'all', ...overrides,
 });
 
 const grant: Grant = {
@@ -131,5 +149,45 @@ describe('watch renderer', () => {
     const frame = renderWatchFrame({ model: model({ transcript: [{ message: message(), pending: false }] }), width: 24, tail: 1 });
     expect(frame).toContain('   Please review the obs');
     expect(frame).toContain('   erver. This line is i');
+  });
+
+  test('groups trusted user deliveries and renders per-recipient ack badges', () => {
+    const frame = renderWatchFrame({
+      model: model({ transcript: [userMessage('u1', 'claude', false), userMessage('u2', 'codex', true)] }),
+      width: 100,
+      tail: 10,
+      composer: composer(),
+    });
+    expect(frame.match(/Please review the observer/g)?.length).toBe(1);
+    expect(frame).toContain('claude ✓ codex ○');
+    expect(frame).toContain('to:*');
+    expect(frame).toContain('filter:all');
+  });
+
+  test('renders filtering, scrollback, pending state, and credential guidance', () => {
+    const transcript = [
+      { message: message({ id: 'ask', type: 'ask' }), pending: false },
+      { message: message({ id: 'notice', type: 'info' }), pending: false },
+      userMessage('user-1', 'claude', true, 'group-1'),
+      userMessage('user-2', 'claude', false, 'group-2'),
+    ];
+    const filtered = renderWatchFrame({
+      model: model({ transcript }), width: 100, tail: 1,
+      composer: composer({
+        filter: 'user', scrollOffset: 1,
+        pending: { reqId: 'request-2', target: 'codex', body: 'retry me', state: 'error', error: 'connection lost' },
+      }),
+    });
+    expect(filtered).toContain('[scrollback]');
+    expect(filtered).toContain('filter:user');
+    expect(filtered).toContain('send failed: connection lost');
+
+    const credentialError = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({ channel: 'credential-error', channelDetail: 'DPAPI decrypt failed' }),
+    });
+    expect(credentialError).toContain('USER CREDENTIAL ERROR: DPAPI decrypt failed');
+    expect(credentialError).toContain('cannot silently regenerate');
+    expect(credentialError).not.toContain('to:*');
   });
 });

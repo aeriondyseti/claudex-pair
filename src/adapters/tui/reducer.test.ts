@@ -19,6 +19,16 @@ const stored = (id: string, to = 'codex', sent = '2026-07-14 19:00:30'): StoredM
   raw: '',
 });
 
+const userStored = (id: string, to: string, groupId: string): StoredMessage => ({
+  ...stored(id, to),
+  header: {
+    ...stored(id, to).header,
+    from: 'user',
+    groupId,
+    provenance: 'trusted_user_client',
+  },
+} as StoredMessage);
+
 const liveness: LivenessDto = {
   broker: { pid: 10, epoch: 2, heartbeatAt: '2026-07-14 19:01:00' },
   agents: { codex: { connectedSince: '2026-07-14 19:00:00', lastActivity: '2026-07-14 19:00:45' } },
@@ -144,6 +154,116 @@ describe('watch reducer terminal and time events', () => {
     expect(reattaching.effects).toEqual(['render']);
     expect(reattaching.state.model?.notices[0]).toContain('broker unreachable');
     expect(reduceWatch(reattaching.state, { kind: 'key', key: 'quit' }).effects).toEqual(['exit']);
+  });
+});
+
+describe('watch reducer composer', () => {
+  function interactive() {
+    return reduceWatch(attached(snapshot({ transcript: [] })), { kind: 'user-channel', state: 'registered' }).state;
+  }
+
+  test('always routes printable q/f as text and command chords separately', () => {
+    let state = interactive();
+    ({ state } = reduceWatch(state, { kind: 'text', text: 'qfé' }));
+    expect(state.composer?.buffer).toBe('qfé');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'backspace' }));
+    expect(state.composer?.buffer).toBe('qf');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'filter' }));
+    expect(state.composer).toMatchObject({ buffer: 'qf', filter: 'dialogue' });
+    expect(reduceWatch(state, { kind: 'key', key: 'quit' }).effects).toEqual(['exit']);
+  });
+
+  test('cycles broadcast and roster targets and normalizes a removed target', () => {
+    let state = interactive();
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'tab' }));
+    expect(state.composer?.target).toBe('claude');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'tab' }));
+    expect(state.composer?.target).toBe('codex');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'tab' }));
+    expect(state.composer?.target).toBe('*');
+
+    state = { ...state, composer: { ...state.composer!, target: 'departed' } };
+    ({ state } = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: state.now }));
+    expect(state.composer?.target).toBe('*');
+  });
+
+  test('submits immutable snapshots, keeps success pending until commit, and reuses reqId on retry', () => {
+    let state = interactive();
+    ({ state } = reduceWatch(state, { kind: 'text', text: 'hello agents' }));
+    const submit = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'request-1' });
+    state = submit.state;
+    expect(submit.effects).toEqual([
+      'render',
+      { kind: 'submit', reqId: 'request-1', target: '*', body: 'hello agents' },
+    ]);
+    expect(state.composer).toMatchObject({ buffer: '', pending: { reqId: 'request-1', state: 'sending' } });
+
+    ({ state } = reduceWatch(state, { kind: 'submit-result', reqId: 'request-1', ok: true }));
+    expect(state.composer?.pending?.reqId).toBe('request-1');
+    ({ state } = reduceWatch(state, { kind: 'submit-result', reqId: 'request-1', ok: false, error: 'dropped' }));
+    expect(state.composer?.pending).toMatchObject({ state: 'error', error: 'dropped' });
+
+    const retry = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'fresh-id-must-be-ignored' });
+    state = retry.state;
+    expect(retry.effects[1]).toEqual({ kind: 'submit', reqId: 'request-1', target: '*', body: 'hello agents' });
+    expect(state.composer?.pending).toMatchObject({ reqId: 'request-1', state: 'sending' });
+
+    const committed: WatchActivity = {
+      seq: 5,
+      session: active,
+      entries: [{ deliveryId: 'u1:claude', message: userStored('u1', 'claude', 'request-1') }],
+      ackedDeliveryIds: [],
+      voidedDeliveryIds: [],
+    };
+    ({ state } = reduceWatch(state, { kind: 'activity', activity: committed }));
+    expect(state.composer?.pending).toBeUndefined();
+  });
+
+  test('escape discards a failed submit, while mismatched results are ignored', () => {
+    let state = interactive();
+    ({ state } = reduceWatch(state, { kind: 'text', text: 'body' }));
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r1' }));
+    const unchanged = reduceWatch(state, { kind: 'submit-result', reqId: 'other', ok: false });
+    expect(unchanged.state).toBe(state);
+    ({ state } = reduceWatch(state, { kind: 'submit-result', reqId: 'r1', ok: false }));
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'escape' }));
+    expect(state.composer?.pending).toBeUndefined();
+  });
+
+  test('scrolls by logical pages, preserves a scrolled viewport, and End follows', () => {
+    const transcript = Array.from({ length: 5 }, (_, index) => ({ message: stored(`m${index}`), pending: false }));
+    let state = reduceWatch(attached(snapshot({ transcript })), { kind: 'user-channel', state: 'registered' }).state;
+    state = { ...state, tail: 2 };
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'page-up' }));
+    expect(state.composer?.scrollOffset).toBe(2);
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'page-up' }));
+    expect(state.composer?.scrollOffset).toBe(3);
+
+    const add: WatchActivity = {
+      seq: 5, session: active,
+      entries: [{ deliveryId: 'new:codex', message: stored('new') }],
+      ackedDeliveryIds: [], voidedDeliveryIds: [],
+    };
+    ({ state } = reduceWatch(state, { kind: 'activity', activity: add }));
+    expect(state.composer?.scrollOffset).toBe(4);
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'end' }));
+    expect(state.composer?.scrollOffset).toBe(0);
+  });
+
+  test('credential errors are local render state and fs projections cannot gain composer authority', () => {
+    let state = attached(snapshot({ transcript: [] }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'credential-error', detail: 'DPAPI failed' }));
+    expect(state.composer).toMatchObject({ channel: 'credential-error', channelDetail: 'DPAPI failed' });
+
+    const fsModel: WatchViewModel = {
+      source: { kind: 'fs-diagnostic', reason: 'broker-unreachable' }, session: active,
+      navigators: [], openGrants: [], transcript: [], presence: [], now: 'now', notices: [],
+    };
+    ({ state } = reduceWatch(state, { kind: 'replace-model', model: fsModel }));
+    expect(state.composer).toBeUndefined();
+    const attempted = reduceWatch(state, { kind: 'user-channel', state: 'registered' });
+    expect(attempted.state.composer).toBeUndefined();
+    expect(reduceWatch(attempted.state, { kind: 'text', text: 'forbidden' }).effects).toEqual([]);
   });
 });
 

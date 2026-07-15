@@ -1,6 +1,6 @@
 import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
-import type { SessionState } from '@core/types.ts';
+import type { AgentId, SessionState } from '@core/types.ts';
 import type { TranscriptEntry, WatchViewModel } from './viewmodel.ts';
 
 /**
@@ -44,7 +44,11 @@ export type WatchEvent =
    * text (the input line is always focused — `q` types `q`); commands are
    * non-printable chords only, decoded by the host. */
   | { kind: 'text'; text: string }
-  | { kind: 'key'; key: 'quit' | 'submit' | 'escape' | 'backspace' | 'tab' | 'page-up' | 'page-down' | 'end' | 'filter' }
+  | { kind: 'key'; key: 'quit' | 'escape' | 'backspace' | 'tab' | 'page-up' | 'page-down' | 'end' | 'filter' }
+  /** The host allocates reqId when decoding Enter; the pure reducer cannot
+   * mint IDs. On retry, the reducer intentionally reuses pending.reqId and
+   * ignores this fresh candidate. */
+  | { kind: 'key'; key: 'submit'; reqId: string }
   /** Host result of a submit effect's wire call; reqId === groupId. */
   | { kind: 'submit-result'; reqId: string; ok: boolean; error?: string }
   /** User-channel bootstrap/handshake state. `credential-error` is LOCAL
@@ -63,7 +67,7 @@ export type WatchEffect =
   | 'render'
   | 'exit'
   | 'reattach'
-  | { readonly kind: 'submit'; readonly reqId: string; readonly target: string; readonly body: string };
+  | { readonly kind: 'submit'; readonly reqId: string; readonly target: AgentId | '*'; readonly body: string };
 
 /**
  * Reducer-owned state (amendment 1). `model` is the renderable view;
@@ -94,13 +98,13 @@ export type ComposerState = {
   readonly channelDetail?: string;
   readonly buffer: string;
   /** '*' = broadcast, else an AgentId; Tab cycles. */
-  readonly target: string;
+  readonly target: AgentId | '*';
   /** Scrollback offset in entries from the tail; 0 = following. */
   readonly scrollOffset: number;
   readonly filter: 'all' | 'dialogue' | 'user' | 'protocol';
   /** In-flight submit (no optimistic transcript insertion): cleared when
    * the committed activity with groupId === reqId arrives. */
-  readonly pending?: { readonly reqId: string; readonly target: string; readonly body: string; readonly state: 'sending' | 'error'; readonly error?: string };
+  readonly pending?: { readonly reqId: string; readonly target: AgentId | '*'; readonly body: string; readonly state: 'sending' | 'error'; readonly error?: string };
 };
 
 export type WatchStep = { readonly state: WatchTuiState; readonly effects: readonly WatchEffect[] };
