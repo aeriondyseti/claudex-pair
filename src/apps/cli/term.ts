@@ -22,8 +22,27 @@ export type TerminalSession = {
   close(): void;
 };
 
-const ENTER_ALT = '\x1b[?1049h\x1b[?25l'; // alt buffer + hide cursor
-const LEAVE_ALT = '\x1b[?25h\x1b[?1049l'; // restore cursor + main buffer
+/** Structural stream types so cleanup behavior is unit-testable with fakes
+ * (codex close-out review: render-only smoke is not cleanup coverage). */
+export type TermIn = {
+  isTTY?: boolean;
+  setRawMode?(mode: boolean): unknown;
+  resume(): void;
+  pause(): void;
+  on(event: 'data', listener: (chunk: Buffer | string) => void): unknown;
+  off(event: 'data', listener: (chunk: Buffer | string) => void): unknown;
+};
+export type TermOut = {
+  isTTY?: boolean;
+  columns?: number;
+  write(chunk: string): unknown;
+  on(event: 'resize', listener: () => void): unknown;
+  off(event: 'resize', listener: () => void): unknown;
+};
+export type TermIo = { stdin: TermIn; stdout: TermOut };
+
+export const ENTER_ALT = '\x1b[?1049h\x1b[?25l'; // alt buffer + hide cursor
+export const LEAVE_ALT = '\x1b[?25h\x1b[?1049l'; // restore cursor + main buffer
 
 export function frameWidth(): number {
   return Math.max(60, (process.stdout.columns ?? 100) - 1);
@@ -41,11 +60,12 @@ export class Screen {
   }
 }
 
-export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: boolean } = {}): TerminalSession {
-  const stdin = process.stdin;
-  const stdout = process.stdout;
+export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: boolean; io?: TermIo } = {}): TerminalSession {
+  const stdin: TermIn = options.io?.stdin ?? process.stdin;
+  const stdout: TermOut = options.io?.stdout ?? process.stdout;
   const interactive = stdin.isTTY === true && stdout.isTTY === true;
   const altScreen = (options.altScreen ?? true) && interactive;
+  const width = () => Math.max(60, (stdout.columns ?? 100) - 1);
 
   const onData = (chunk: Buffer | string) => {
     const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
@@ -54,7 +74,7 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
       if (byte === 0x71 || byte === 0x51 || byte === 0x03) handlers.onQuit();
     }
   };
-  const onResize = () => handlers.onResize(frameWidth());
+  const onResize = () => handlers.onResize(width());
   const onSignal = () => handlers.onQuit();
 
   let closed = false;
@@ -67,7 +87,7 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
     if (interactive) {
       stdin.off('data', onData);
       try {
-        stdin.setRawMode(false);
+        stdin.setRawMode?.(false);
       } catch {
         /* stdin already detached */
       }
@@ -83,7 +103,7 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
   try {
     if (altScreen) stdout.write(ENTER_ALT);
     if (interactive) {
-      stdin.setRawMode(true);
+      stdin.setRawMode!(true);
       stdin.resume();
       stdin.on('data', onData);
     }
@@ -95,5 +115,5 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
     throw error;
   }
 
-  return { interactive, width: frameWidth, close };
+  return { interactive, width, close };
 }

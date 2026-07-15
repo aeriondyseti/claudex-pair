@@ -35,6 +35,8 @@ export type WatchLoopHooks = {
   gateway?: ObserverGatewayLike;
   terminal?: (handlers: Parameters<typeof openTerminal>[0]) => ReturnType<typeof openTerminal>;
   reattachDelayMs?: number;
+  /** fs-diagnostic mode: injected deps for deterministic poller tests. */
+  fsDeps?: ReturnType<typeof bindFsDeps>;
 };
 
 const REATTACH_DELAY_MS = 1_000;
@@ -170,26 +172,39 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   }
 }
 
-export async function runFsEventLoop(root: string, options: WatchLoopOptions, reduce: WatchReducer): Promise<number> {
-  const deps = bindFsDeps(root);
+export async function runFsEventLoop(root: string, options: WatchLoopOptions, reduce: WatchReducer, hooks: WatchLoopHooks = {}): Promise<number> {
+  const deps = hooks.fsDeps ?? bindFsDeps(root);
   const queue = new WatchEventQueue();
-  const term = openTerminal({
+  const openTerm = hooks.terminal ?? openTerminal;
+  const term = openTerm({
     onQuit: () => queue.push({ kind: 'key', key: 'quit' }),
     onResize: (width) => queue.push({ kind: 'resize', width }),
   });
   const state = initialWatchState({ width: term.width(), tail: options.tail, now: deps.clock.now() });
 
-  const poll = async (): Promise<void> => {
-    const model = await buildFsViewModel(deps);
-    if (model) queue.push({ kind: 'replace-model', model });
+  // Recursive-timeout poller (codex close-out review): the next poll is
+  // scheduled only after the current one settles — max concurrency 1 by
+  // construction, so a slow older read can never overwrite a newer model.
+  // A failed read retains the last model and retries next cycle.
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const pollLoop = async (): Promise<void> => {
+    try {
+      const model = await buildFsViewModel(deps);
+      if (model) queue.push({ kind: 'replace-model', model });
+    } catch {
+      /* transient mirror read failure — keep last model, retry next cycle */
+    } finally {
+      if (!stopped) pollTimer = setTimeout(() => void pollLoop(), options.refreshSec * 1000);
+    }
   };
-  await poll();
-  const poller = setInterval(() => void poll(), options.refreshSec * 1000);
+  void pollLoop();
   const ticker = setInterval(() => queue.push({ kind: 'tick', now: deps.clock.now() }), AGE_TICK_MS);
   try {
     return await consumeEvents(queue, reduce, state, { render: frameSink() });
   } finally {
-    clearInterval(poller);
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
     clearInterval(ticker);
     term.close();
     queue.close();
