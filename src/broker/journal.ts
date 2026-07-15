@@ -218,15 +218,6 @@ export class Journal {
         if (ref) {
           this.open_.set(ref.deliveryId, { ...ref, message: event });
           this.transcript_.set(ref.deliveryId, { deliveryId: ref.deliveryId, message: event, state: 'open' });
-          // Cap evicts CLOSED history only — an open delivery is live mail
-          // the watch must never undercount (codex review); the ring may
-          // temporarily exceed the cap if everything in it is still open.
-          if (this.transcript_.size > TRANSCRIPT_RING_MAX) {
-            for (const [key, record] of this.transcript_) {
-              if (this.transcript_.size <= TRANSCRIPT_RING_MAX) break;
-              if (record.state !== 'open') this.transcript_.delete(key);
-            }
-          }
         }
       }
     }
@@ -250,6 +241,22 @@ export class Journal {
       if (d.deliverySeq > this.lastDeliverySeq) this.lastDeliverySeq = d.deliverySeq;
     }
     this.rememberOutcome(record.txn.clientId, record.txn.reqId, record.outcome);
+    // After EVERY transition (insert, ack, void): entries closed by this
+    // record are trimmable now — without this, 200+ open records that later
+    // all close with no further send would exceed the cap forever (codex
+    // review round 3).
+    this.trimClosedHistory();
+  }
+
+  /** Cap evicts CLOSED history only — an open delivery is live mail the
+   * watch must never undercount; the ring may exceed the cap while
+   * everything in it is still open. */
+  private trimClosedHistory(): void {
+    if (this.transcript_.size <= TRANSCRIPT_RING_MAX) return;
+    for (const [key, record] of this.transcript_) {
+      if (this.transcript_.size <= TRANSCRIPT_RING_MAX) break;
+      if (record.state !== 'open') this.transcript_.delete(key);
+    }
   }
 
   private rememberOutcome(clientId: string, reqId: string, outcome: unknown): void {

@@ -310,6 +310,28 @@ describe('transcript ring cap (codex review round 2)', () => {
     expect(snapshot.transcript.length).toBe(200); // trimmed back to cap
     expect(snapshot.transcript.filter((e) => e.pending).length).toBe(196); // 195 survivors + final, none evicted
   }, 30_000);
+
+  test('acks alone trim the ring — no later send required (codex round 3)', async () => {
+    const root = await tempRoot();
+    let n = 0;
+    const core = new BrokerCore(
+      join(root, '.pair'),
+      { clock: systemClock, ids: { messageId: () => `t${String(++n).padStart(4, '0')}` }, mirrors: new FsMirrors(root), codec: fsMessageCodec },
+      DEFAULT_CONFIG,
+      { onStopped: () => undefined, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
+    );
+    await core.recover();
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'trim', agents: ['claude', 'codex'], driver: 'claude' } });
+    for (let i = 0; i < 210; i++) {
+      await core.execute(`send-${i}`, 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: `q${i}` } });
+    }
+    const openIds = core.journal.openDeliveries().slice(0, 15).map((d) => d.deliveryId);
+    for (const [i, id] of openIds.entries()) await core.ack(`ack-${i}`, id, 'client-b');
+    // NO further send: the ack transitions themselves must trim.
+    const snapshot = await observe(core, 'trim-1', []);
+    expect(snapshot.transcript.length).toBe(200);
+    expect(snapshot.transcript.filter((e) => e.pending).length).toBe(195); // every open record retained
+  }, 30_000);
 });
 
 describe('observer idle semantics', () => {
