@@ -42,7 +42,13 @@ export function reduceWatch(state: WatchTuiState, event: WatchEvent): WatchStep 
     case 'connection':
       return connection(state, event.state);
     case 'key':
-      return step(state, ['exit']);
+      return event.key === 'quit' ? step(state, ['exit']) : step(state);
+    case 'text':
+    case 'submit-result':
+    case 'user-channel':
+      // U1 slice-3 composer events — inert until the composer reducer lane
+      // (codex/watch-tui-3) lands; the seam is frozen in events.ts.
+      return step(state);
   }
 }
 
