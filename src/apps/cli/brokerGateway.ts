@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentId, Grant } from '@core/types.ts';
 import type {
   BrokerControl, BrokerStatusDto, Delivery, DeliverySubscription, ExecuteOutcome,
-  ExecuteRequest, ObserverPush, ObserverSession, ObserverSnapshotDto, ProtocolGateway, StatusDto,
+  ExecuteRequest, ObserverPush, ObserverSession, ObserverSnapshotDto, ProtocolGateway, StatusDto, UserChannelSession,
 } from '@app/ports/gateway.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 import { IpcClient } from '@adapters/ipc/client.ts';
