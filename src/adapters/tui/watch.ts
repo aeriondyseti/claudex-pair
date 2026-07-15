@@ -1,4 +1,6 @@
 import { derivePresence, formatAge } from './derive.ts';
+import type { ComposerState } from './events.ts';
+import type { TranscriptEntry } from './viewmodel.ts';
 import type { WatchViewModel } from './viewmodel.ts';
 
 /** Pure frame rendering for the human's `pair watch` pane (ANSI). */
@@ -16,7 +18,13 @@ export type WatchInput = {
   readonly model: WatchViewModel;
   readonly width: number;
   readonly tail: number;
+  readonly composer?: ComposerState;
   readonly stalledAfterSec?: number;
+};
+
+type LogicalTranscriptEntry = {
+  readonly entries: readonly TranscriptEntry[];
+  readonly userGroup: boolean;
 };
 
 function sourceLabel(source: WatchViewModel['source']): string {
@@ -28,7 +36,7 @@ function sourceLabel(source: WatchViewModel['source']): string {
   return `${ESC}[32mbroker authoritative${RESET} | epoch ${source.epoch} | head ${source.headSeq} | pid ${source.pid} | ${connection}`;
 }
 
-export function renderWatchFrame({ model, width, tail, stalledAfterSec = 90 }: WatchInput): string {
+export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec = 90 }: WatchInput): string {
   const { session } = model;
   const frameWidth = Math.max(20, width);
   const bodyWidth = Math.max(1, frameWidth - 3);
@@ -79,15 +87,25 @@ export function renderWatchFrame({ model, width, tail, stalledAfterSec = 90 }: W
   }
   lines.push(DIM + '─'.repeat(frameWidth) + RESET);
 
+  const logical = logicalTranscript(model.transcript).filter((entry) => matchesFilter(entry, composer?.filter ?? 'all'));
   const tailCount = Math.max(0, tail);
-  const shown = tailCount === 0 ? [] : model.transcript.slice(-tailCount);
+  const scrollOffset = Math.min(composer?.scrollOffset ?? 0, Math.max(0, logical.length - tailCount));
+  const end = Math.max(0, logical.length - scrollOffset);
+  const shown = tailCount === 0 ? [] : logical.slice(Math.max(0, end - tailCount), end);
   if (!shown.length) lines.push(`${DIM} (no messages yet)${RESET}`);
-  for (const { message, pending, voided } of shown) {
+  for (const logicalEntry of shown) {
+    const first = logicalEntry.entries[0];
+    if (!first) continue;
+    const { message } = first;
     const header = message.header;
-    const pendingFlag = pending ? ` ${ESC}[35m[pending]${RESET}` : '';
-    const voidedFlag = voided ? ` ${ERROR}[voided]${RESET}` : '';
+    const pendingFlag = !logicalEntry.userGroup && logicalEntry.entries[0]!.pending ? ` ${ESC}[35m[pending]${RESET}` : '';
+    const voidedFlag = !logicalEntry.userGroup && logicalEntry.entries[0]!.voided ? ` ${ERROR}[voided]${RESET}` : '';
+    const deliveryBadges = logicalEntry.userGroup
+      ? ` ${logicalEntry.entries.map((entry) => `${entry.message.header.to} ${entry.voided ? '×' : entry.pending ? '○' : '✓'}`).join(' ')}`
+      : '';
     lines.push('');
-    lines.push(`${color.get(header.from) ?? ''}${BOLD}${header.from}${RESET} ${DIM}-> ${header.to} | ${header.type} | turn:${header.turn} | ${header.sent}${RESET}${pendingFlag}${voidedFlag}`);
+    const to = logicalEntry.userGroup ? logicalEntry.entries.map((entry) => entry.message.header.to).join(',') : header.to;
+    lines.push(`${color.get(header.from) ?? ''}${BOLD}${header.from}${RESET} ${DIM}-> ${to} | ${header.type} | turn:${header.turn} | ${header.sent}${RESET}${pendingFlag}${voidedFlag}${deliveryBadges}`);
     for (let line of message.body.split(/\r?\n/)) {
       while (line.length > bodyWidth) {
         lines.push(`   ${line.slice(0, bodyWidth)}`);
@@ -96,8 +114,70 @@ export function renderWatchFrame({ model, width, tail, stalledAfterSec = 90 }: W
       lines.push(`   ${line}`);
     }
   }
+  if (composer?.pending) {
+    const status = composer.pending.state === 'sending'
+      ? `${WARN}sending…${RESET}`
+      : `${ERROR}send failed: ${composer.pending.error ?? 'unknown error'} (Enter retries; Esc discards)${RESET}`;
+    lines.push('', ` ${status} ${DIM}to:${composer.pending.target} | ${composer.pending.body}${RESET}`);
+  }
   lines.push('');
   lines.push(DIM + '─'.repeat(frameWidth) + RESET);
-  lines.push(`${DIM} last ${tail} messages | Ctrl+C to exit${RESET}`);
+  if (composer?.channel === 'registered') {
+    lines.push(` ${BOLD}to:${composer.target}${RESET} ${composer.buffer}`);
+  } else if (composer?.channel === 'unregistered') {
+    lines.push(` ${WARN}! user channel is not registered; waiting for secure registration${RESET}`);
+  } else if (composer?.channel === 'credential-error') {
+    lines.push(` ${ERROR}! USER CREDENTIAL ERROR: ${composer.channelDetail ?? 'the local credential is missing or unreadable'}${RESET}`);
+    lines.push(` ${ERROR}  This channel cannot silently regenerate; an explicit reset ceremony is required.${RESET}`);
+  }
+  const scroll = scrollOffset > 0 ? ' | [scrollback] End to follow' : '';
+  const filter = composer ? ` | filter:${composer.filter}` : '';
+  lines.push(`${DIM} last ${tail} messages${scroll}${filter} | Ctrl+C/Ctrl+Q to exit${RESET}`);
   return lines.join('\n');
+}
+
+/** Group a user broadcast into one logical transcript item while preserving
+ * the commit order of all other entries. */
+export function logicalTranscript(entries: readonly TranscriptEntry[]): readonly LogicalTranscriptEntry[] {
+  const result: LogicalTranscriptEntry[] = [];
+  const groups = new Map<string, number>();
+  for (const entry of entries) {
+    const metadata = userMetadata(entry);
+    if (!metadata) {
+      result.push({ entries: [entry], userGroup: false });
+      continue;
+    }
+    const existing = groups.get(metadata.groupId);
+    if (existing === undefined) {
+      groups.set(metadata.groupId, result.length);
+      result.push({ entries: [entry], userGroup: true });
+    } else {
+      const previous = result[existing]!;
+      result[existing] = { ...previous, entries: [...previous.entries, entry] };
+    }
+  }
+  return result;
+}
+
+export function visibleTranscriptCount(entries: readonly TranscriptEntry[], filter: ComposerState['filter']): number {
+  return logicalTranscript(entries).filter((entry) => matchesFilter(entry, filter)).length;
+}
+
+function matchesFilter(entry: LogicalTranscriptEntry, filter: ComposerState['filter']): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'user') return entry.userGroup;
+  if (entry.userGroup) return false;
+  const type = entry.entries[0]?.message.header.type;
+  const dialogue = type === 'ask' || type === 'answer' || type === 'review';
+  return filter === 'dialogue' ? dialogue : !dialogue;
+}
+
+function userMetadata(entry: TranscriptEntry): { groupId: string } | undefined {
+  const header = entry.message.header as typeof entry.message.header & {
+    readonly groupId?: string;
+    readonly provenance?: string;
+  };
+  return header.provenance === 'trusted_user_client' && header.groupId
+    ? { groupId: header.groupId }
+    : undefined;
 }
