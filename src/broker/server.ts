@@ -33,11 +33,18 @@ export type BrokerConfig = {
 
 export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 10_000, deliveryLeaseMs: 90_000 };
 
+/** PUBLIC command kinds — what the generic execute path accepts. The U1
+ * user-channel kinds are deliberately absent: they exist only in their
+ * internal shape, constructed by the authenticated user-connection handler
+ * (transport gate, U1-SLICE3-DESIGN.md). */
 const COMMAND_KINDS = new Set([
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
 ]);
+
+/** Rejected on the generic path with a SPECIFIC error, even when forged. */
+const USER_CHANNEL_KINDS = new Set(['user-message', 'register-user-channel']);
 
 export type BrokerResponse =
   | { reqId: string; ok: true; seq?: number; events?: readonly Event[]; data?: unknown }
@@ -182,6 +189,12 @@ export class BrokerCore {
     if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
     const recorded = this.#journal.recordedOutcome(clientId, reqId);
     if (recorded !== undefined) return recorded as BrokerResponse; // F2: replay, never re-execute
+    const forged = userChannelKindFrom(payload);
+    if (forged) {
+      // Transport gate (U1): even a forged as:'user' envelope on the
+      // generic path never reaches decide.
+      return err(reqId, 'user-channel-required', `'${forged}' may only originate from the authenticated user channel (user-attach connection).`);
+    }
     const command = commandFrom(payload);
     if (!command) return err(reqId, 'bad-command', 'execute payload must be {command: {kind: <known-kind>, ...}}');
     const envelope: CommandEnvelope = {
@@ -509,6 +522,14 @@ function commandFrom(payload: unknown): Command | undefined {
   const kind = (command as { kind?: unknown }).kind;
   if (typeof kind !== 'string' || !COMMAND_KINDS.has(kind)) return undefined;
   return command as Command;
+}
+
+function userChannelKindFrom(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const command = (payload as { command?: unknown }).command;
+  if (!command || typeof command !== 'object') return undefined;
+  const kind = (command as { kind?: unknown }).kind;
+  return typeof kind === 'string' && USER_CHANNEL_KINDS.has(kind) ? kind : undefined;
 }
 
 const err = (reqId: string, code: string, message: string): BrokerResponse => ({ ...(reqId ? { reqId } : {}), ok: false, error: { code, message } });

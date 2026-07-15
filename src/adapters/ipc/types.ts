@@ -10,7 +10,16 @@ export type ExtendFrame = WireBase & { kind: 'extend'; reqId: string; deliveryId
  * acks, and never appears in agent liveness (TUI-UPGRADE-NOTES constraint 2).
  */
 export type ObserveFrame = WireBase & { kind: 'observe'; reqId: string };
-export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame;
+/**
+ * U1 slice 3 (U1-SLICE3-DESIGN.md, approved). `user-attach` carries the
+ * user-channel token ONCE, validates (or TOFU-registers) and tags the
+ * connection, then behaves as observe. `user-send` is TOKENLESS — valid
+ * only on a tagged connection (connection-bound auth); the broker stamps
+ * the `user` principal from the connection, never from payload.
+ */
+export type UserAttachFrame = WireBase & { kind: 'user-attach'; reqId: string; userToken: string };
+export type UserSendFrame = WireBase & { kind: 'user-send'; reqId: string; to: string; body: string };
+export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame;
 
 export type ErrorFrame = { reqId?: string; ok: false; error: { code: string; message: string } };
 export type ResponseFrame = { reqId: string; ok: true; seq?: number; events?: unknown[]; data?: unknown } | ErrorFrame;
