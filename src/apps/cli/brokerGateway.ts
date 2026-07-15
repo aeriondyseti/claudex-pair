@@ -96,20 +96,25 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       reconnecting = reconnect().finally(() => { reconnecting = undefined; });
     };
     /**
-     * Transactional attach (codex live review): listeners install BEFORE the
-     * subscribe round-trip (an early delivery must not be dropped), but a
-     * FAILED attach unregisters them and closes the socket — retries never
-     * leak; the outer handles publish only on success.
+     * Transactional attach (codex live review, two rounds): the delivery
+     * listener installs BEFORE the subscribe round-trip (an early push must
+     * not be dropped), but onClose→reconnect arms ONLY after the handshake
+     * succeeds — a drop during the INITIAL handshake must reject subscribe()
+     * without launching orphan background retries. After the handshake,
+     * `active` is re-checked (close() may have raced the round-trip: publish
+     * nothing, close the replacement socket), and a close that raced the
+     * onClose arming itself is caught by the connected guard.
      */
     const attach = async (next: IpcClient): Promise<void> => {
       const offD = next.onDelivery((frame) => { sequences.set(frame.deliveryId, frame.deliverySeq); queue.push(toDelivery(frame)); });
-      const offC = next.onClose(() => scheduleReconnect());
       try { expectOk(await next.subscribe(as, cursor)); }
-      catch (error) { offD(); offC(); next.close(); throw error; }
+      catch (error) { offD(); next.close(); throw error; }
+      if (!active) { offD(); next.close(); return; } // cancelled mid-handshake
       offDelivery = offD;
-      offClose = offC;
+      offClose = next.onClose(() => scheduleReconnect());
       client = next;
       this.client = next;
+      if (!next.connected) scheduleReconnect(); // close raced the arming
     };
     /** Backoff sleep that close() can break immediately — cancellation never
      * waits out a 4s delay or spends one more rediscover. */

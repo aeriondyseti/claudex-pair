@@ -24,6 +24,9 @@ export class IpcClient {
   }
 
   close() { this.#socket?.destroy(); this.#socket = undefined; }
+  /** True while the underlying socket is usable — lets a caller detect a
+   * close that raced the registration of its onClose listener. */
+  get connected(): boolean { return this.#socket !== undefined && !this.#socket.destroyed; }
   onDelivery(listener: (frame: DeliveryFrame) => void) { this.#deliveries.add(listener); return () => this.#deliveries.delete(listener); }
   onObserverPush(listener: (frame: ObserverPushFrame) => void) { this.#observerPushes.add(listener); return () => this.#observerPushes.delete(listener); }
   onClose(listener: (error: Error) => void) { this.#closes.add(listener); return () => this.#closes.delete(listener); }

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { createServer } from 'node:net';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -219,5 +220,76 @@ describe('subscription reconnect', () => {
     expect(opens.length).toBe(3); // one connection per attempt
     expect(closes.length).toBe(opens.length); // and every one was closed — nothing leaked
     await subscription.close();
+  }, 15_000);
+
+  test('drop during the INITIAL handshake: subscribe() rejects with zero orphan reconnect work', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-initdrop-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 8);
+    // Raw server: accepts, then destroys — the handshake can never complete.
+    const dropper = createServer((socket) => { setTimeout(() => socket.destroy(), 20); });
+    await new Promise<void>((resolve, reject) => { dropper.once('error', reject); dropper.listen(endpoint, resolve); });
+    cleanups.push(() => new Promise<void>((resolve) => dropper.close(() => resolve())));
+
+    let rediscoveries = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'initdrop-client',
+        connect: async () => { const c = new IpcClient({ endpoint, token: 'token', epoch: 8, clientId: 'initdrop-client' }); await c.connect(); return c; },
+        rediscover: async () => { rediscoveries += 1; throw new Error('must not be called'); },
+      },
+      { maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    let failed = false;
+    try { await gateway.subscribe('codex', 0); } catch { failed = true; }
+    expect(failed).toBeTrue(); // the caller learns immediately
+    await Bun.sleep(150);
+    expect(rediscoveries).toBe(0); // no background retries were orphaned
+  }, 15_000);
+
+  test('close() during a reconnect handshake: nothing is published and the replacement socket is closed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-midhs-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpointA = endpointFor(root, 9);
+    const endpointB = endpointFor(root, 10);
+    const serverA = server(endpointA, 9, () => undefined);
+    await serverA.listen();
+
+    const opens: string[] = [];
+    const closes: string[] = [];
+    const serverB = new IpcServer({
+      endpoint: endpointB, token: 'token', epoch: 10,
+      handler: async (frame) => {
+        if (frame.kind === 'subscribe') await Bun.sleep(300); // slow handshake
+        return { reqId: (frame as { reqId: string }).reqId, ok: true };
+      },
+      onConnection: (id, event) => void (event === 'open' ? opens.push(id) : closes.push(id)),
+    });
+    await serverB.listen();
+    cleanups.push(() => serverB.close().catch(() => undefined));
+
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'midhs-client',
+        connect: async () => new IpcClient({ endpoint: endpointA, token: 'token', epoch: 9, clientId: 'midhs-client' }),
+        rediscover: async () => new IpcClient({ endpoint: endpointB, token: 'token', epoch: 10, clientId: 'midhs-client' }),
+      },
+      { maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    await serverA.close(); // triggers reconnect into the slow handshake
+    const deadline = Date.now() + 2_000;
+    while (opens.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+    expect(opens.length).toBe(1); // handshake with the replacement in flight
+    const started = Date.now();
+    await subscription.close(); // cancel mid-handshake
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const closeDeadline = Date.now() + 2_000;
+    while (closes.length < 1 && Date.now() < closeDeadline) await Bun.sleep(10);
+    expect(closes.length).toBe(1); // replacement socket closed, not published
   }, 15_000);
 });
