@@ -79,6 +79,26 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
    * flight. close() cancels an in-progress reconnect; attempts exhausted
    * fails the delivery stream.
    */
+  /** U1: authenticated user-channel attach — observe semantics plus send
+   * on the SAME connection. Reattach (a fresh userAttach) is the host's
+   * job, exactly like observe. */
+  async userAttach(userToken: string, spawn = true): Promise<UserChannelSession> {
+    const client = await this.getClient(spawn);
+    const queue = new AsyncQueue<ObserverPush>();
+    const offPush = client.onObserverPush((frame) => queue.push(frame as ObserverPush));
+    const offClose = client.onClose((error) => queue.fail(error));
+    let response: ResponseFrame;
+    try { response = await client.userAttach(userToken); }
+    catch (error) { offPush(); offClose(); queue.close(); throw error; }
+    if (!response.ok) { offPush(); offClose(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    return {
+      snapshot: response.data as ObserverSnapshotDto,
+      pushes: queue,
+      send: async (reqId, target, body) => { expectOk(await client.userSend(target, body, reqId)); },
+      close: async () => { offPush(); offClose(); queue.close(); },
+    };
+  }
+
   async subscribe(as: AgentId, afterDeliverySeq: number): Promise<DeliverySubscription> {
     const queue = new AsyncQueue<Delivery>();
     let client = await this.getClient(true);

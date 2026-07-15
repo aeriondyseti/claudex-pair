@@ -558,12 +558,14 @@ export class BrokerCore {
       }
       const recorded = this.#journal.recordedOutcome(clientId, reqId);
       if (recorded !== undefined) return recorded as BrokerResponse; // replay BEFORE allocation
-      // Fresh allocation AFTER dedup (frozen contract): the base comes from
-      // #ids, so ids are unique across clients sharing reqId values and
-      // beyond the dedup window; recipients suffix deterministically within
-      // this txn. groupId stays the reqId (composer correlation).
+      // Fresh allocation AFTER dedup (frozen contract). Collision-proof by
+      // construction: ids embed the NEXT journal seq (single-writer, so it
+      // is unique per committed txn even within one millisecond) plus the
+      // recipient index — and nothing user-controlled (reqId never reaches
+      // a filename).
       const base = this.#ids.messageId();
-      const recipients = (to === '*' ? state.agents : [to]).map((agent) => ({ to: agent, messageId: `${base}-${agent}` }));
+      const seq = this.#journal.headSeq + 1;
+      const recipients = (to === '*' ? state.agents : [to]).map((agent, i) => ({ to: agent, messageId: `${base}-s${seq}-r${i}` }));
       const envelope: CommandEnvelope = {
         command: { kind: 'user-message', groupId: reqId, recipients, body },
         meta: { id: base, at: this.#clock.now(), principal: USER_IDENTITY },

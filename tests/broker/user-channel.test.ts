@@ -155,6 +155,36 @@ describe('user-send', () => {
     expect(sendActivity).toBeDefined();
   });
 
+  test('two clients reusing the same reqId never collide in message ids', async () => {
+    const core = await seeded(await tempRoot());
+    await core.userAttach('a1', sink('conn-1'), 'user-client-1', 'e'.repeat(64));
+    await core.userAttach('a2', sink('conn-2'), 'user-client-2', 'e'.repeat(64));
+    await core.userSend('shared-req', 'user-client-1', 'conn-1', '*', 'from one');
+    await core.userSend('shared-req', 'user-client-2', 'conn-2', '*', 'from two');
+    const userMail = core.journal.openDeliveries().filter((d) => d.message.groupId === 'shared-req');
+    expect(userMail.length).toBe(4); // both logical sends delivered in full
+    expect(new Set(userMail.map((d) => d.message.id)).size).toBe(4); // no id collisions
+  });
+
+  test('restart replay of a committed user-send returns a complete outcome including session', async () => {
+    const root = await tempRoot();
+    const core = await seeded(root);
+    await core.userAttach('a1', sink('conn-1'), 'user-client', 'e'.repeat(64));
+    const first = await core.userSend('req-9', 'user-client', 'conn-1', 'codex', 'persist me');
+    expect(first.ok).toBeTrue();
+
+    const reopened = makeCore(root);
+    await reopened.recover();
+    await reopened.userAttach('a2', sink('conn-2'), 'user-client-2', 'e'.repeat(64));
+    // Same identity replays the journaled outcome — it must be complete.
+    const replayed = await reopened.userSend('req-9', 'user-client', 'conn-2', 'codex', 'persist me');
+    expect(replayed.ok).toBeTrue();
+    if (replayed.ok) {
+      const data = replayed.data as { session?: { task?: string } };
+      expect(data.session?.task).toBe('user-channel'); // not undefined after restart
+    }
+  });
+
   test('turn is never mutated by a user broadcast landing mid-exchange', async () => {
     const core = await seeded(await tempRoot());
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });

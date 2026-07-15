@@ -187,6 +187,18 @@ export interface ObserverSession {
   close(): Promise<void>;
 }
 
+/**
+ * U1: the authenticated user channel — ONE object owning snapshot, pushes,
+ * and send over the SAME connection (connection-bound auth; separate
+ * observer and sender connections would violate the frozen contract).
+ * send() is a single wire attempt with an IMMUTABLE identity: retries are
+ * composer-visible (pending-error → Enter re-submits the SAME reqId after
+ * the host reattached/reauthenticated), and journal dedup makes them safe.
+ */
+export interface UserChannelSession extends ObserverSession {
+  send(reqId: string, target: string, body: string): Promise<void>;
+}
+
 /** Broker daemon status — meaningful before/without any session. */
 export type BrokerStatusDto = {
   readonly running: boolean;
