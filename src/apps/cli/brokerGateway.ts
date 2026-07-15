@@ -88,6 +88,36 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     const sequences = new Map<string, number>();
     let offDelivery = () => {};
     let offClose = () => {};
+    let cancelBackoff: (() => void) | undefined;
+
+    const scheduleReconnect = () => {
+      if (!active || reconnecting) return;
+      offDelivery(); offClose();
+      reconnecting = reconnect().finally(() => { reconnecting = undefined; });
+    };
+    /**
+     * Transactional attach (codex live review): listeners install BEFORE the
+     * subscribe round-trip (an early delivery must not be dropped), but a
+     * FAILED attach unregisters them and closes the socket — retries never
+     * leak; the outer handles publish only on success.
+     */
+    const attach = async (next: IpcClient): Promise<void> => {
+      const offD = next.onDelivery((frame) => { sequences.set(frame.deliveryId, frame.deliverySeq); queue.push(toDelivery(frame)); });
+      const offC = next.onClose(() => scheduleReconnect());
+      try { expectOk(await next.subscribe(as, cursor)); }
+      catch (error) { offD(); offC(); next.close(); throw error; }
+      offDelivery = offD;
+      offClose = offC;
+      client = next;
+      this.client = next;
+    };
+    /** Backoff sleep that close() can break immediately — cancellation never
+     * waits out a 4s delay or spends one more rediscover. */
+    const backoffSleep = (ms: number): Promise<void> =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => { cancelBackoff = undefined; resolve(); }, ms);
+        cancelBackoff = () => { clearTimeout(timer); cancelBackoff = undefined; resolve(); };
+      });
     const reconnect = async (): Promise<void> => {
       let delay = this.reconnectPolicy.baseDelayMs;
       for (let attempt = 1; active; attempt++) {
@@ -99,29 +129,19 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
         } catch (error) {
           if (!active) return;
           if (attempt >= this.reconnectPolicy.maxAttempts) { queue.fail(error); return; }
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          await backoffSleep(delay);
           delay = Math.min(delay * 2, this.reconnectPolicy.maxDelayMs);
         }
       }
     };
-    const attach = async (next: IpcClient) => {
-      client = next;
-      this.client = next;
-      offDelivery = client.onDelivery((frame) => { sequences.set(frame.deliveryId, frame.deliverySeq); queue.push(toDelivery(frame)); });
-      offClose = client.onClose(() => {
-        if (!active || reconnecting) return;
-        offDelivery(); offClose();
-        reconnecting = reconnect().finally(() => { reconnecting = undefined; });
-      });
-      expectOk(await client.subscribe(as, cursor));
-    };
+
     try { await attach(client); }
-    catch (error) { offDelivery(); offClose(); queue.fail(error); throw error; }
+    catch (error) { queue.fail(error); throw error; }
     return {
       deliveries: queue,
       ack: async (id) => { expectOk(await client.ack(id)); cursor = Math.max(cursor, sequences.get(id) ?? cursor); },
       extend: async (id) => { expectOk(await client.extend(id)); },
-      close: async () => { active = false; offDelivery(); offClose(); queue.close(); await reconnecting?.catch(() => {}); },
+      close: async () => { active = false; cancelBackoff?.(); offDelivery(); offClose(); queue.close(); await reconnecting?.catch(() => {}); },
     };
   }
 
@@ -167,12 +187,31 @@ class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
   private values: T[] = [];
   private waiters: Array<{ resolve: (r: IteratorResult<T>) => void; reject: (e: unknown) => void }> = [];
   private ended = false;
-  push(value: T) { const waiter = this.waiters.shift(); if (waiter) waiter.resolve({ done: false, value }); else this.values.push(value); }
-  fail(error: unknown) { for (const waiter of this.waiters.splice(0)) waiter.reject(error); this.ended = true; }
-  close() { this.ended = true; for (const waiter of this.waiters.splice(0)) waiter.resolve({ done: true, value: undefined }); }
+  private error: unknown;
+  push(value: T) {
+    if (this.ended) return; // late transport callback after fail/close
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve({ done: false, value });
+    else this.values.push(value);
+  }
+  /** Terminal error is STORED: a failure with no waiter pending must still
+   * reject the consumer's next call (after buffered values drain), never
+   * silently end the stream (codex live review). */
+  fail(error: unknown) {
+    if (this.ended) return;
+    this.ended = true;
+    this.error = error;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+  }
+  close() {
+    if (this.ended) return;
+    this.ended = true;
+    for (const waiter of this.waiters.splice(0)) waiter.resolve({ done: true, value: undefined });
+  }
   next(): Promise<IteratorResult<T>> {
     const value = this.values.shift();
     if (value !== undefined) return Promise.resolve({ done: false, value });
+    if (this.error !== undefined) return Promise.reject(this.error);
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }

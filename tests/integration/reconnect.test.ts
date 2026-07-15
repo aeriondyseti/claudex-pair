@@ -118,7 +118,7 @@ describe('subscription reconnect', () => {
     await subscription.close();
   }, 15_000);
 
-  test('close() during reconnect cancels cleanly', async () => {
+  test('close() during backoff cancels promptly — no extra rediscover, no waiting out the delay', async () => {
     const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-cancel-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const endpoint = endpointFor(root, 4);
@@ -132,16 +132,92 @@ describe('subscription reconnect', () => {
         connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 4, clientId: 'cancel-client' }),
         rediscover: async () => { attempts += 1; throw new Error('still down'); },
       },
-      { maxAttempts: 100, baseDelayMs: 30, maxDelayMs: 30 },
+      { maxAttempts: 100, baseDelayMs: 5_000, maxDelayMs: 5_000 }, // close must NOT wait this out
     );
     cleanups.push(() => gateway.close());
 
     const subscription = await gateway.subscribe('codex', 0);
     await serverA.close();
-    await Bun.sleep(50); // let a reconnect cycle start
-    await subscription.close(); // must cancel the in-progress reconnect
-    const settled = attempts;
-    await Bun.sleep(120);
-    expect(attempts - settled).toBeLessThanOrEqual(1); // no further retry churn after close
+    // First rediscover fails fast, then the loop parks in a 5s backoff.
+    const deadline = Date.now() + 2_000;
+    while (attempts === 0 && Date.now() < deadline) await Bun.sleep(10);
+    expect(attempts).toBe(1);
+    const started = Date.now();
+    await subscription.close(); // breaks the backoff sleep immediately
+    expect(Date.now() - started).toBeLessThan(500);
+    await Bun.sleep(100);
+    expect(attempts).toBe(1); // cancellation spent zero additional rediscoveries
+  }, 15_000);
+
+  test('retries exhausted BEFORE the consumer calls next(): the stored terminal error still rejects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-late-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 5);
+    const serverA = server(endpoint, 5, () => undefined);
+    await serverA.listen();
+
+    let attempts = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'late-client',
+        connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 5, clientId: 'late-client' }),
+        rediscover: async () => { attempts += 1; throw new Error('gone'); },
+      },
+      { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    await serverA.close();
+    const deadline = Date.now() + 2_000;
+    while (attempts < 2 && Date.now() < deadline) await Bun.sleep(10); // exhaust with NO waiter pending
+    await Bun.sleep(50);
+    let failed = false;
+    try { await subscription.deliveries[Symbol.asyncIterator]().next(); } catch { failed = true; }
+    expect(failed).toBeTrue(); // error was stored, not silently swallowed as done
+    await subscription.close();
+  }, 15_000);
+
+  test('failed attach is transactional: every failed retry closes its socket (no connection/listener leak)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-leak-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpointA = endpointFor(root, 6);
+    const endpointB = endpointFor(root, 7);
+    const serverA = server(endpointA, 6, () => undefined);
+    await serverA.listen();
+
+    // Broken replacement broker: connections accepted, subscribe always
+    // rejected — every attach attempt fails AFTER connecting.
+    const opens: string[] = [];
+    const closes: string[] = [];
+    const serverB = new IpcServer({
+      endpoint: endpointB, token: 'token', epoch: 7,
+      handler: async (frame) => ({ reqId: (frame as { reqId: string }).reqId, ok: false, error: { code: 'broker-stopping', message: 'draining' } }),
+      onConnection: (id, event) => void (event === 'open' ? opens.push(id) : closes.push(id)),
+    });
+    await serverB.listen();
+    cleanups.push(() => serverB.close().catch(() => undefined));
+
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'leak-client',
+        connect: async () => new IpcClient({ endpoint: endpointA, token: 'token', epoch: 6, clientId: 'leak-client' }),
+        rediscover: async () => new IpcClient({ endpoint: endpointB, token: 'token', epoch: 7, clientId: 'leak-client' }),
+      },
+      { maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    const next = subscription.deliveries[Symbol.asyncIterator]().next();
+    await serverA.close();
+    let failed = false;
+    try { await next; } catch { failed = true; }
+    expect(failed).toBeTrue();
+    const deadline = Date.now() + 2_000;
+    while (closes.length < opens.length && Date.now() < deadline) await Bun.sleep(10);
+    expect(opens.length).toBe(3); // one connection per attempt
+    expect(closes.length).toBe(opens.length); // and every one was closed — nothing leaked
+    await subscription.close();
   }, 15_000);
 });
