@@ -1,7 +1,7 @@
 # U1 slice 3 — advisory user channel (design, pre-code)
 
-Status: REV 2 — codex design-review round 1 amendments applied
-(2026-07-14 20:05). Draft until codex approves. Builds on slices 1+2 (broker observer,
+Status: REV 3 — codex design-review rounds 1+2 applied (2026-07-14).
+Draft until codex approves. Builds on slices 1+2 (broker observer,
 watch event loop). Constraints inherited from [ENHANCEMENTS.md](ENHANCEMENTS.md)
 U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
 2026-07-14: **DPAPI user-scope credential**, **full v1 interaction scope**
@@ -37,7 +37,9 @@ U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
   logged, journaled, or mirrored — only its sha256.
 - **Registration is trust-on-first-use, made LOUD:** the first `user-attach`
   presenting a token when no binding exists commits the journaled
-  registration event, fanned out to every agent inbox and the archive — a
+  registration event, whose per-agent notices are ordinary INBOX deliveries
+  that reach the archive through normal ack/ledger semantics (never a
+  simultaneous inbox+archive fan-out bypassing the delivery ledger) — a
   hijacked registration is visible to everyone immediately, and `pair watch`
   shows the registration state. (Codex concurrence: a pairing-code ceremony
   adds nothing under the same-OS-user threat model — agents share the
@@ -50,7 +52,8 @@ U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
 
 ## 3. Wire protocol
 
-Two new client frame kinds (both carry the user token, never an agent id):
+Two new client frame kinds (only `user-attach` ever carries the token;
+neither carries an agent id):
 
 - `{kind:'user-attach', reqId, userToken}` → validates (or TOFU-registers)
   the token ONCE and tags the connection as the authenticated user channel
@@ -68,6 +71,22 @@ Two new client frame kinds (both carry the user token, never an agent id):
   journal dedup replays a committed outcome instead of re-sending. A submit
   while the broker is idle-exited may rediscover/spawn (same reqId); the
   observer attach itself still never pins the daemon.
+- **Frozen correlation rule: `groupId === reqId`.** The pending TUI element
+  reconciles deterministically with the committed observer activity (and
+  with submit-result) — no separate mapping exists or is needed. Only the
+  per-recipient message IDs are freshly allocated.
+- **Frozen client seam — `UserObserverSession`:** ONE object owning
+  snapshot + pushes + send over the SAME authenticated connection
+  (connection-bound auth makes separate observer and sender connections a
+  contract violation). Its reconnect path is: reattach → reauthenticate via
+  user-attach → retry the same immutable {reqId, target, body}.
+- **Snapshot exposes user-channel state:** ObserverSnapshotDto (user
+  variant) carries {registered: boolean, authenticated: boolean} so the
+  reducer can render the input line, a registration prompt, or the
+  credential-error guidance. If the journal says a binding exists but the
+  local DPAPI credential is missing or fails to decrypt, watch shows a LOUD
+  guided error — it never silently generates or registers a replacement
+  (slice 3 has no reset path).
 
 Rejections: `user-auth-failed` (bad token), `user-channel-unregistered`
 (send before any attach registered), `session-not-active`.
@@ -82,14 +101,19 @@ New command kind `user-message {to: AgentId | '*', body}` with principal
   before decide runs (`user-channel-required`). Only the handler for a
   user-tagged connection constructs this command; decide additionally
   asserts principal === 'user' as defense in depth.
-- decide: session must be active; recipients = roster (broadcast) or the
-  named agent (must exist). Emits one `message-sent` per recipient with
-  `from:'user'`, `turn:'keep'`, a shared **`groupId`** (one logical user
-  send), a **unique per-recipient message id** (archive filenames collide
-  otherwise), and **`provenance: 'trusted_user_client'`** carried through
-  the event and StoredMessage projection so the reducer aggregates
-  per-recipient ack badges by groupId (amendment 5). NEVER a turn mutation;
-  the existing delivery ledger + ack txns ARE the acknowledgement state.
+- **ID allocation is the HANDLER's job, not core's** (pure decide cannot
+  mint IDs): the authenticated user-connection handler first checks dedup by
+  (clientId, reqId) — a retry replays the recorded outcome BEFORE any
+  allocation — then allocates `groupId = reqId` plus a unique per-recipient
+  messageId, and constructs the internal command
+  `user-message {groupId, recipients: [{to, messageId}], body}`.
+- decide: session must be active; every named recipient must exist (roster
+  for broadcast). Emits one `message-sent` per recipient with `from:'user'`,
+  `turn:'keep'`, the shared groupId, its pre-allocated unique messageId, and
+  **`provenance: 'trusted_user_client'`** carried through the event and
+  StoredMessage projection so the reducer aggregates per-recipient ack
+  badges by groupId. NEVER a turn mutation; the existing delivery ledger +
+  ack txns ARE the acknowledgement state.
 - evolve: the registration event records tokenHash into broker-authoritative
   state (journal/snapshot); turn:keep message-sent changes nothing else.
 
@@ -120,9 +144,10 @@ DISCRIMINATED events — `{kind:'text', text}` for printable input (UTF-8
 aggregated; unknown ANSI escape sequences consumed and ignored in v1) and
 `{kind:'key', key}` for command keys, which are NON-PRINTABLE chords only:
 Enter (submit), Esc, Backspace, Tab (target), PgUp/PgDn, End, Ctrl+F
-(filter), Ctrl+C (quit). A plain `f` while typing therefore types `f`;
-`q` quits only when the reducer sees an empty input buffer (reducer
-decision, not decoder). New effect: `submit` carrying an IMMUTABLE
+(filter), Ctrl+C / Ctrl+Q (quit). **The input line is ALWAYS focused in
+v1**: every printable character is text — `q` types `q` (a message starting
+with "q" must be possible); quit is chord-only, no modal navigate/compose
+split. New effect: `submit` carrying an IMMUTABLE
 `{reqId, target, body}` snapshot; the host performs the wire call and
 pushes `{kind:'submit-result', reqId, ok, error?}` back through the queue
 (amendment 7: decoder + idle semantics defined here). Reducer owns
@@ -157,11 +182,20 @@ and reqId reuse.
 - Broadcast: ONE txn, N deliveries, UNIQUE per-recipient message ids, a
   shared groupId, provenance `trusted_user_client` on every projection;
   partial ack renders one ✓ one ○ aggregated by groupId.
-- Reducer: text-vs-command focus routing (`f` types while the buffer is
-  non-empty; `q` quits only on an empty buffer); pending-submit →
-  submit-result → committed-entry lifecycle (no optimistic insertion);
-  target-cycle/scroll/filter transitions; input disabled in fs mode;
-  scrollback follow semantics.
+- Reducer: printable chars are ALWAYS text (`q`/`f` type; a message body
+  starting with "q" is possible); quit/filter only via chords;
+  pending-submit → submit-result → committed-entry lifecycle keyed by
+  groupId === reqId (no optimistic insertion);
+  target-cycle/scroll/filter transitions; scrollback follow semantics.
+- Handler allocation: a retried (clientId, reqId) replays the recorded
+  outcome BEFORE any ID allocation — no duplicate groupId/messageIds ever
+  minted for one logical send.
+- Credential recovery: journal binding present + DPAPI credential
+  missing/corrupt → loud guided error state in the snapshot/render; no
+  silent regeneration or re-registration.
+- Non-TTY / fs-diagnostic host test: the watch host never loads or creates
+  a DPAPI credential, never issues user-attach, and exposes no user-send
+  path — not merely a hidden input line.
 - E2E: user broadcast wakes both agents' waits with `turn: keep` FYI wording.
 
 ## 8. Proposed lanes (after design approval)
