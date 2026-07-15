@@ -1,10 +1,11 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Command, CommandEnvelope } from '@core/commands.ts';
 import { decide } from '@core/decide.ts';
 import { ProtocolError } from '@core/errors.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
 import { navigators, openGrants } from '@core/queries.ts';
-import type { AgentId, SessionState } from '@core/types.ts';
+import { USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
 import type { Clock, Ids, StoredMessage } from '@app/ports/index.ts';
 import type { BrokerStatusDto, StatusDto } from '@app/ports/gateway.ts';
 import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
@@ -90,6 +91,9 @@ export class BrokerCore {
    * busyness — a forgotten watch pane must not pin the daemon. Watch
    * reattaches without spawning; agents respawn the broker on demand. */
   #observers = new Map<string, ObserverSink>(); // sink id → observer
+  /** Connections tagged by a successful user-attach (connection-bound
+   * auth, U1): only these may user-send; the tag dies with the socket. */
+  #userConnections = new Set<string>();
   #leases = new Map<string, Lease>(); // deliveryId → lease
   #connections = new Set<string>();
   #stopping = false;
@@ -164,6 +168,7 @@ export class BrokerCore {
     this.#connections.delete(id);
     const wasListener = this.#subscriptions.delete(id);
     this.#observers.delete(id);
+    this.#userConnections.delete(id);
     // Leases held by the vanished connection expire naturally (F4); the
     // expiry sweep redelivers to the next live subscriber.
     if (wasListener) this.#notifyPresence(); // item 8: listener set changed
@@ -400,15 +405,10 @@ export class BrokerCore {
       // txns with seq > N — no stale push for commits its snapshot already
       // contains, no gap, by construction.
       this.#observers.set(sink.id, sink);
-      const transcript = this.#journal.transcript().map((t) => ({
-        message: this.#toStored({ deliveryId: t.deliveryId, deliverySeq: 0, message: t.message }),
-        pending: t.state === 'open',
-        ...(t.state === 'voided' ? { voided: true } : {}),
-      }));
       const snapshot: ObserverSnapshotDto = {
         seq: this.#journal.headSeq,
         session: state,
-        transcript,
+        transcript: this.#observerTranscript(),
         liveness: this.#liveness(),
         broker: { pid: this.#host.pid, epoch: this.#host.epoch, endpoint: this.#host.endpoint, heartbeatAt: this.#host.heartbeatAt() },
       };
@@ -477,6 +477,126 @@ export class BrokerCore {
     return err(reqId, 'unknown-query', `Unknown query: ${what}`);
   }
 
+  /**
+   * U1 user-channel attach: validate (or TOFU-register) the token ONCE,
+   * tag the connection, then behave exactly as observe — non-consuming,
+   * never idle-pinning. Registration is a normal committed txn (loud
+   * notices ride the delivery ledger); its dedup key is this request's
+   * (clientId, reqId), so an attach retry never re-registers.
+   */
+  userAttach(reqId: string, sink: ObserverSink, clientId: string, userToken: string): Promise<BrokerResponse> {
+    return this.#chain(async () => {
+      if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
+      if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
+      const state = this.#journal.sessionState;
+      if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      const hash = sha256Hex(userToken);
+      if (state.userChannelTokenHash) {
+        if (!constantTimeEqualHex(hash, state.userChannelTokenHash)) {
+          return err(reqId, 'user-auth-failed', 'User-channel token rejected.');
+        }
+      } else if (this.#journal.recordedOutcome(clientId, reqId) === undefined) {
+        const envelope: CommandEnvelope = {
+          command: { kind: 'register-user-channel', tokenHash: hash },
+          meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: USER_IDENTITY },
+        };
+        const committed = await this.#commitUserEnvelope(reqId, clientId, envelope);
+        if (!committed.ok) return committed;
+      }
+      this.#observers.set(sink.id, sink);
+      this.#userConnections.add(sink.id);
+      const snapshot: ObserverSnapshotDto = {
+        seq: this.#journal.headSeq,
+        session: this.#journal.sessionState!,
+        transcript: this.#observerTranscript(),
+        liveness: this.#liveness(),
+        broker: { pid: this.#host.pid, epoch: this.#host.epoch, endpoint: this.#host.endpoint, heartbeatAt: this.#host.heartbeatAt() },
+        userChannel: { registered: true, authenticated: true },
+      };
+      return { reqId, ok: true, data: snapshot };
+    });
+  }
+
+  /**
+   * U1 advisory send. Connection-bound auth (no token on this frame);
+   * dedup by (clientId, reqId) happens BEFORE any allocation; groupId is
+   * the reqId (frozen contract) and per-recipient ids are deterministic
+   * `${reqId}-${agent}` — retry-stable even beyond the dedup window.
+   */
+  userSend(reqId: string, clientId: string, connectionId: string, to: string, body: string): Promise<BrokerResponse> {
+    this.#lastBusyAt = Date.now();
+    return this.#chain(async () => {
+      if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
+      if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
+      if (!this.#userConnections.has(connectionId)) {
+        return err(reqId, 'user-channel-required', 'user-send requires an authenticated user-attach on this connection.');
+      }
+      const state = this.#journal.sessionState;
+      if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      if (!state.userChannelTokenHash) return err(reqId, 'user-channel-unregistered', 'No user channel is registered for this session.');
+      const recorded = this.#journal.recordedOutcome(clientId, reqId);
+      if (recorded !== undefined) return recorded as BrokerResponse; // replay BEFORE allocation
+      const recipients = (to === '*' ? state.agents : [to]).map((agent) => ({ to: agent, messageId: `${reqId}-${agent}` }));
+      const envelope: CommandEnvelope = {
+        command: { kind: 'user-message', groupId: reqId, recipients, body },
+        meta: { id: reqId, at: this.#clock.now(), principal: USER_IDENTITY },
+      };
+      return this.#commitUserEnvelope(reqId, clientId, envelope);
+    });
+  }
+
+  /** Shared commit flow for user-channel envelopes (already inside #chain).
+   * Simplified from #execute: user commands never init, revoke, or remove
+   * agents — no liveness pre-check, no roster voiding, no init mirror. */
+  async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope): Promise<BrokerResponse> {
+    const decided = decide(this.#journal.sessionState, envelope);
+    if (!decided.ok) {
+      const code = decided.error instanceof ProtocolError ? decided.error.code : 'rejected';
+      return err(reqId, code, decided.error.message);
+    }
+    const events = decided.value;
+    const receipt = {
+      messageFiles: events.flatMap((e) =>
+        e.kind === 'message-sent' ? [this.#codec.filename({ id: e.id, from: e.from, to: e.to, type: e.type, turn: e.turn, sent: e.at, body: e.body })] : [],
+      ),
+    };
+    const response: BrokerResponse = {
+      reqId,
+      ok: true,
+      seq: this.#journal.headSeq + 1,
+      events: [...events],
+      data: { session: undefined as unknown, receipt, groupId: envelope.command.kind === 'user-message' ? envelope.command.groupId : undefined },
+    };
+    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId });
+    const post = this.#journal.sessionState!;
+    (response as { data: { session: unknown } }).data.session = post;
+    const open = this.#journal.openDeliveries();
+    const fresh = record.deliveries.flatMap((d) => {
+      const match = open.find((o) => o.deliveryId === d.deliveryId);
+      return match ? [match] : [];
+    });
+    this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh));
+    this.#notifyObservers({
+      kind: 'activity',
+      seq: record.seq,
+      at: record.at,
+      principal: record.principal,
+      events: record.events,
+      session: post,
+      ackedDeliveryIds: [],
+      voidedDeliveryIds: [],
+    });
+    return response;
+  }
+
+  #observerTranscript(): { message: StoredMessage; pending: boolean; voided?: boolean }[] {
+    return this.#journal.transcript().map((t) => ({
+      message: this.#toStored({ deliveryId: t.deliveryId, deliverySeq: 0, message: t.message }),
+      pending: t.state === 'open',
+      ...(t.state === 'voided' ? { voided: true } : {}),
+    }));
+  }
+
   async #status(state: SessionState): Promise<StatusDto> {
     const pending: Record<string, StoredMessage[]> = {};
     for (const agent of state.agents) pending[agent] = this.#journal.openDeliveriesFor(agent).map((d) => this.#toStored(d));
@@ -533,3 +653,13 @@ function userChannelKindFrom(payload: unknown): string | undefined {
 }
 
 const err = (reqId: string, code: string, message: string): BrokerResponse => ({ ...(reqId ? { reqId } : {}), ok: false, error: { code, message } });
+
+const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
+
+/** Constant-time hex-hash comparison — never a string equality on secrets. */
+function constantTimeEqualHex(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'hex');
+  const bufB = Buffer.from(b, 'hex');
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return timingSafeEqual(bufA, bufB);
+}

@@ -148,6 +148,10 @@ export type ObserverSnapshotDto = {
   readonly transcript: readonly ObserverTranscriptEntry[];
   readonly liveness: LivenessDto;
   readonly broker: { readonly pid: number; readonly epoch: number; readonly endpoint: string; readonly heartbeatAt: string };
+  /** U1: present only on a SUCCESSFUL user-attach snapshot — plain observe
+   * never carries it. Client-local credential errors are pre-attach host
+   * state, never observable here (approved design, editorial fix 3). */
+  readonly userChannel?: { readonly registered: boolean; readonly authenticated: boolean };
 };
 
 /**

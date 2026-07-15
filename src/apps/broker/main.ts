@@ -129,6 +129,10 @@ async function main(): Promise<number> {
         return (await core.subscribe(frame.reqId, asSink(connection), frame.as, frame.afterDeliverySeq)) as ServerFrame;
       case 'observe':
         return (await core.observe(frame.reqId, asObserverSink(connection))) as ServerFrame;
+      case 'user-attach':
+        return (await core.userAttach(frame.reqId, asObserverSink(connection), frame.clientId, frame.userToken)) as ServerFrame;
+      case 'user-send':
+        return (await core.userSend(frame.reqId, frame.clientId, connection.id, frame.to, frame.body)) as ServerFrame;
       case 'ack':
         return (await core.ack(frame.reqId, frame.deliveryId, frame.clientId)) as ServerFrame;
       case 'extend':
