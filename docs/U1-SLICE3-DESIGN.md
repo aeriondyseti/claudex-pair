@@ -80,21 +80,28 @@ neither carries an agent id):
   (connection-bound auth makes separate observer and sender connections a
   contract violation). Its reconnect path is: reattach → reauthenticate via
   user-attach → retry the same immutable {reqId, target, body}.
-- **Snapshot exposes user-channel state:** ObserverSnapshotDto (user
-  variant) carries {registered: boolean, authenticated: boolean} so the
-  reducer can render the input line, a registration prompt, or the
-  credential-error guidance. If the journal says a binding exists but the
-  local DPAPI credential is missing or fails to decrypt, watch shows a LOUD
-  guided error — it never silently generates or registers a replacement
-  (slice 3 has no reset path).
+- **Snapshot exposes user-channel state — for SUCCESSFUL attaches only:**
+  the user-attach snapshot/handshake carries {registered: boolean,
+  authenticated: boolean} so the reducer renders the input line or a
+  registration prompt. **Credential errors are LOCAL, pre-attach state**
+  (the broker can never observe a client-side DPAPI decrypt failure): if
+  the journal binding exists but the local credential is missing or fails
+  to decrypt, the HOST emits a bootstrap credential-error event rendered by
+  the reducer BEFORE any UserObserverSession is created — a loud guided
+  error, never a silent regeneration or re-registration (slice 3 has no
+  reset path).
 
 Rejections: `user-auth-failed` (bad token), `user-channel-unregistered`
 (send before any attach registered), `session-not-active`.
 
 ## 4. Core changes
 
-New command kind `user-message {to: AgentId | '*', body}` with principal
-`user`:
+ONE new command kind exists, and only in its INTERNAL shape:
+`user-message {groupId, recipients: [{to, messageId}], body}` with
+principal `user`. The public `{to, body}` shape exists solely on the
+`user-send` WIRE frame; the authenticated handler translates it. The
+generic execute path rejects any attempt to submit the internal command
+kind directly.
 
 - **Transport gate (amendment 3):** the broker REJECTS `user-message` on the
   generic execute path unconditionally — even with a forged `as: 'user'` —
@@ -134,8 +141,10 @@ agreement, then frozen again.
 - **Scrolling**: PgUp/PgDn move a scrollOffset in reducer state; End (or new
   activity while at bottom) resumes follow mode; a `[scrollback]` marker
   shows when not following.
-- **Filtering**: `f` cycles transcript filters: all → asks/answers/reviews →
-  user messages → protocol notices. Filter state renders in the footer.
+- **Filtering**: `Ctrl+F` cycles transcript filters: all →
+  asks/answers/reviews → user messages → protocol notices. Filter state
+  renders in the footer. (Plain `f` is text — the input line is always
+  focused.)
 - **fs-diagnostic mode: none of the above.** No input line is rendered, key
   events other than quit are ignored — read-only forever per user decision.
 
@@ -191,8 +200,9 @@ and reqId reuse.
   outcome BEFORE any ID allocation — no duplicate groupId/messageIds ever
   minted for one logical send.
 - Credential recovery: journal binding present + DPAPI credential
-  missing/corrupt → loud guided error state in the snapshot/render; no
-  silent regeneration or re-registration.
+  missing/corrupt → local host bootstrap event → reducer renders the loud
+  guided error before any UserObserverSession exists; no silent
+  regeneration or re-registration.
 - Non-TTY / fs-diagnostic host test: the watch host never loads or creates
   a DPAPI credential, never issues user-attach, and exposes no user-send
   path — not merely a hidden input line.
