@@ -67,6 +67,10 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state && { ...state, agents: [...state.agents, event.agent] };
     case 'message-sent':
       return state; // delivery is the Mailbox port's concern, not session state
+    case 'user-channel-registered':
+      // U1: journal-authoritative binding — replay restores it; mirrors can
+      // never rebind (they are views of this, not sources).
+      return state && { ...state, userChannelTokenHash: event.tokenHash };
   }
 }
 

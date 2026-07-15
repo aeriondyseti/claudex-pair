@@ -32,7 +32,15 @@ export type ProtocolErrorCode =
   | 'join-not-driver'
   | 'already-participant'
   | 'kick-not-driver'
-  | 'kick-driver';
+  | 'kick-driver'
+  // U1 slice 3 — user channel (U1-SLICE3-DESIGN.md, approved)
+  | 'reserved-identity'
+  | 'user-not-addressable'
+  | 'user-channel-required'
+  | 'user-channel-unregistered'
+  | 'user-channel-already-registered'
+  | 'user-auth-failed'
+  | 'invalid-recipient';
 
 export class ProtocolError extends Error {
   constructor(

@@ -25,7 +25,14 @@ export type Command =
   // ENHANCEMENTS 11: roster mutations — driver authority, uniformly.
   | { kind: 'leave-session' }
   | { kind: 'join-session'; agent: AgentId }
-  | { kind: 'kick-agent'; agent: AgentId; reason: string };
+  | { kind: 'kick-agent'; agent: AgentId; reason: string }
+  // U1 slice 3 (U1-SLICE3-DESIGN.md, approved): INTERNAL shape only — the
+  // authenticated user-channel handler allocates groupId (=== reqId) and
+  // unique per-recipient messageIds BEFORE decide; the generic execute path
+  // rejects this kind unconditionally. Advisory: never a turn mutation.
+  | { kind: 'user-message'; groupId: string; recipients: readonly { to: AgentId; messageId: MessageId }[]; body: string }
+  // U1 slice 3: journal-authoritative user-channel binding (TOFU, loud).
+  | { kind: 'register-user-channel'; tokenHash: string };
 
 export type GrantScopeInput =
   | { mode: 'worktree'; worktree: string }

@@ -21,7 +21,7 @@ export type JournalRecord = {
 };
 export type Event =
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp }
-  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp }
+  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client' }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
   | { kind: 'session-ended'; by: AgentId; summary: string; at: Timestamp }
@@ -36,4 +36,8 @@ export type Event =
   | { kind: 'turn-revoked'; from: AgentId; reason: string; at: Timestamp }
   | { kind: 'agent-left'; agent: AgentId; at: Timestamp }
   | { kind: 'agent-joined'; agent: AgentId; at: Timestamp }
-  | { kind: 'agent-kicked'; agent: AgentId; reason: string; at: Timestamp };
+  | { kind: 'agent-kicked'; agent: AgentId; reason: string; at: Timestamp }
+  // U1 slice 3 — user channel. message-sent gains OPTIONAL groupId +
+  // provenance below (user sends only); the binding event is what makes the
+  // journal authoritative for the registered credential hash.
+  | { kind: 'user-channel-registered'; tokenHash: string; at: Timestamp };

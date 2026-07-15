@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { AGENT_NAME_PATTERN, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -53,7 +53,89 @@ export function decide(
       return withActive(state, (s) => decideJoin(s, command, envelope));
     case 'kick-agent':
       return withActive(state, (s) => decideKick(s, command, envelope));
+    case 'user-message':
+      return withActive(state, (s) => decideUserMessage(s, command, envelope));
+    case 'register-user-channel':
+      return withActive(state, (s) => decideRegisterUserChannel(s, command, envelope));
   }
+}
+
+/**
+ * U1 slice 3: advisory user broadcast/direct message. Defense in depth —
+ * the broker's transport gate already rejects this kind on the generic
+ * execute path; here we additionally require the `user` principal, which
+ * only the authenticated user-channel handler can stamp. IDs arrive
+ * pre-allocated by that handler (pure core cannot mint them; dedup by
+ * (clientId, reqId) happened before allocation). NEVER a turn mutation.
+ */
+function decideUserMessage(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-message' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  if (envelope.meta.principal !== USER_IDENTITY) {
+    return err(new ProtocolError('user-channel-required', 'user-message may only originate from the authenticated user channel.'));
+  }
+  if (command.recipients.length === 0) {
+    return err(new ProtocolError('invalid-recipient', 'user-message requires at least one recipient.'));
+  }
+  const ids = new Set(command.recipients.map((r) => r.messageId));
+  if (ids.size !== command.recipients.length) {
+    return err(new ProtocolError('invalid-recipient', 'per-recipient message ids must be unique (allocation bug).'));
+  }
+  for (const r of command.recipients) {
+    if (!s.agents.includes(r.to)) {
+      return err(new ProtocolError('not-a-participant', `'${r.to}' is not a participant in this session.`));
+    }
+  }
+  return ok(
+    command.recipients.map((r) => ({
+      kind: 'message-sent' as const,
+      id: r.messageId,
+      from: USER_IDENTITY,
+      to: r.to,
+      type: 'info' as const,
+      turn: 'keep' as const,
+      body: command.body,
+      at: envelope.meta.at,
+      groupId: command.groupId,
+      provenance: 'trusted_user_client' as const,
+    })),
+  );
+}
+
+/**
+ * U1 slice 3: journal-authoritative TOFU binding, made LOUD — the
+ * registration txn carries per-agent notices as ordinary inbox deliveries
+ * (distinct ids per the decideEnd fan-out pattern). No reset in slice 3:
+ * a second registration is rejected regardless of mirror-file state.
+ */
+function decideRegisterUserChannel(
+  s: SessionState,
+  command: Extract<Command, { kind: 'register-user-channel' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  if (envelope.meta.principal !== USER_IDENTITY) {
+    return err(new ProtocolError('user-channel-required', 'register-user-channel may only originate from the user channel.'));
+  }
+  if (s.userChannelTokenHash) {
+    return err(new ProtocolError('user-channel-already-registered', 'A user channel is already bound to this session; slice 3 has no reset path.'));
+  }
+  if (!command.tokenHash) {
+    return err(new ProtocolError('user-auth-failed', 'register-user-channel requires a token hash.'));
+  }
+  const events: Event[] = [{ kind: 'user-channel-registered', tokenHash: command.tokenHash, at: envelope.meta.at }];
+  s.agents.forEach((agent, i) => {
+    const msg = messageEvent(
+      envelope,
+      USER_IDENTITY,
+      agent,
+      'info',
+      'USER CHANNEL REGISTERED: a trusted_user_client is now bound to this session (trust-on-first-use). User messages from `user` carry that provenance. If nobody attached a watch pane just now, flag this to your human immediately.',
+    );
+    events.push(i === 0 ? msg : { ...msg, id: `${envelope.meta.id}-${i}` });
+  });
+  return ok(events);
 }
 
 /**
@@ -129,6 +211,9 @@ function decideJoin(
   if (bad) return err(bad);
   if (by !== s.driver) {
     return err(new ProtocolError('join-not-driver', `Only the driver (${s.driver}) admits agents to the roster (you are '${by}').`));
+  }
+  if (command.agent === USER_IDENTITY) {
+    return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity and cannot join the roster.`));
   }
   if (s.agents.includes(command.agent)) {
     return err(new ProtocolError('already-participant', `'${command.agent}' is already a participant.`));
@@ -233,6 +318,9 @@ function decideInit(
   if (new Set(agents).size !== agents.length) {
     return err(new ProtocolError('invalid-agents', `agent names must be unique (got: ${agents.join(', ')})`));
   }
+  if (agents.includes(USER_IDENTITY)) {
+    return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity and cannot be a session agent.`));
+  }
   for (const a of agents) {
     if (!AGENT_NAME_PATTERN.test(a)) {
       return err(
@@ -278,6 +366,10 @@ function decideSend(
   envelope: CommandEnvelope,
 ): Result<Event[], ProtocolError> {
   const from = envelope.meta.principal;
+  // U1: the user reads via the transcript; agents get no user inbox (v1).
+  if (command.to === USER_IDENTITY) {
+    return err(new ProtocolError('user-not-addressable', `'${USER_IDENTITY}' is a reserved identity and cannot receive messages (v1); the user reads the transcript via pair watch.`));
+  }
   const bad = assertParticipant(s, from, '-From') ?? assertParticipant(s, command.to, '-To');
   if (bad) return err(bad);
   if (from === command.to) {

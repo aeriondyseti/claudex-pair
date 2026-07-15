@@ -56,7 +56,15 @@ export type SessionState = {
   readonly status: SessionStatus;
   readonly started: Timestamp;
   readonly grants: Readonly<Record<GrantId, Grant>>;
+  /** U1: sha256 of the bound user-channel token. Journal-authoritative via
+   * the user-channel-registered event — a hash is safe in agent-readable
+   * mirrors (auth needs the preimage); slice 3 has no reset path. */
+  readonly userChannelTokenHash?: string;
 };
+
+/** U1: the reserved user identity — outside the roster, never a
+ * participant, turn holder, grant assignee, or message recipient (v1). */
+export const USER_IDENTITY = 'user';
 
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
