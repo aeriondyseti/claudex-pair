@@ -1,6 +1,7 @@
 # U1 slice 3 — advisory user channel (design, pre-code)
 
-Status: DRAFT for codex design review. Builds on slices 1+2 (broker observer,
+Status: REV 2 — codex design-review round 1 amendments applied
+(2026-07-14 20:05). Draft until codex approves. Builds on slices 1+2 (broker observer,
 watch event loop). Constraints inherited from [ENHANCEMENTS.md](ENHANCEMENTS.md)
 U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
 2026-07-14: **DPAPI user-scope credential**, **full v1 interaction scope**
@@ -25,16 +26,22 @@ U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
   use, **DPAPI-encrypted (CurrentUser scope)** at
   `%LOCALAPPDATA%\claudex\user\<repoHash>.cred`. Never written to the repo,
   never in env vars, never in `.pair/`.
-- The broker stores only `sha256(token)` in `.pair/user-channel.json`,
-  written at registration time. A hash in agent-readable space is safe:
-  authentication requires the preimage.
+- **The JOURNAL is authoritative for the binding** (amendment 1): the
+  `user-channel-registered {tokenHash, at}` event is a committed txn; the
+  hash is part of recovered broker state and of snapshots.
+  `.pair/user-channel.json` is a broker-written MIRROR only — deleting or
+  editing that agent-writable file MUST NOT reset or rebind anything
+  (recovery restores the binding from the journal). Slice 3 ships NO reset
+  path; a later slice adds an explicit, audited reset ceremony.
+- Verification is a constant-time hash comparison; the token value is never
+  logged, journaled, or mirrored — only its sha256.
 - **Registration is trust-on-first-use, made LOUD:** the first `user-attach`
-  presenting a token when no hash is registered binds that token and commits
-  a journaled `user-channel-registered` event that fans out to every agent
-  inbox and the archive — a hijacked registration is visible to everyone
-  immediately, and `pair watch` shows who is registered. Re-registration
-  requires deleting `.pair/user-channel.json` (visible in transcript as a
-  fresh registration event).
+  presenting a token when no binding exists commits the journaled
+  registration event, fanned out to every agent inbox and the archive — a
+  hijacked registration is visible to everyone immediately, and `pair watch`
+  shows the registration state. (Codex concurrence: a pairing-code ceremony
+  adds nothing under the same-OS-user threat model — agents share the
+  terminal and DPAPI identity anyway.)
 - **What this does and does not claim:** provenance label is
   `trusted_user_client`. Agents run arbitrary shell as the same OS user and
   could in principle call DPAPI decrypt against the watch store; the bar is
@@ -45,15 +52,22 @@ U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
 
 Two new client frame kinds (both carry the user token, never an agent id):
 
-- `{kind:'user-attach', reqId, userToken}` → registers/validates against the
-  stored hash, then behaves as `observe` (same ObserverSnapshotDto response,
-  same activity/presence pushes, same non-consuming guarantees) with input
-  rights bound to THIS connection. The broker stamps the `user` principal
-  from the authenticated connection type — never from payload fields.
-- `{kind:'user-send', reqId, userToken, to: AgentId | '*', body}` → one
-  committed txn. Broadcast (`'*'`) fans out to every roster agent inside
+- `{kind:'user-attach', reqId, userToken}` → validates (or TOFU-registers)
+  the token ONCE and tags the connection as the authenticated user channel
+  (amendment 2 — connection-bound auth); then behaves as `observe` (same
+  ObserverSnapshotDto response, same pushes, same non-consuming guarantees)
+  with input rights bound to THIS connection. The broker stamps the `user`
+  principal from the authenticated connection — never from payload fields.
+- `{kind:'user-send', reqId, to: AgentId | '*', body}` → carries NO token;
+  valid ONLY on a connection tagged by a successful user-attach. One
+  committed txn; broadcast (`'*'`) fans out to every roster agent inside
   that single txn — per-recipient deliveries and ack state, never N
   independent sends that can partially fail undisclosed.
+- **Submit reliability (amendment 4):** the user client presents a stable
+  clientId and reuses the SAME reqId verbatim across reconnect retries —
+  journal dedup replays a committed outcome instead of re-sending. A submit
+  while the broker is idle-exited may rediscover/spawn (same reqId); the
+  observer attach itself still never pins the daemon.
 
 Rejections: `user-auth-failed` (bad token), `user-channel-unregistered`
 (send before any attach registered), `session-not-active`.
@@ -61,17 +75,23 @@ Rejections: `user-auth-failed` (bad token), `user-channel-unregistered`
 ## 4. Core changes
 
 New command kind `user-message {to: AgentId | '*', body}` with principal
-`user` (only the broker's user-channel path can construct that principal):
+`user`:
 
+- **Transport gate (amendment 3):** the broker REJECTS `user-message` on the
+  generic execute path unconditionally — even with a forged `as: 'user'` —
+  before decide runs (`user-channel-required`). Only the handler for a
+  user-tagged connection constructs this command; decide additionally
+  asserts principal === 'user' as defense in depth.
 - decide: session must be active; recipients = roster (broadcast) or the
   named agent (must exist). Emits one `message-sent` per recipient with
-  `from:'user'`, `turn:'keep'`. NEVER a turn mutation. Advisory-until-
-  acknowledged: the existing delivery ledger + ack txns ARE the
-  acknowledgement state; nothing new to invent.
-- evolve: no session-state change beyond what message-sent already does for
-  turn:keep (none).
-- New event `user-channel-registered {tokenHash, at}` (journaled; mirrors to
-  a notice in every inbox + archive).
+  `from:'user'`, `turn:'keep'`, a shared **`groupId`** (one logical user
+  send), a **unique per-recipient message id** (archive filenames collide
+  otherwise), and **`provenance: 'trusted_user_client'`** carried through
+  the event and StoredMessage projection so the reducer aggregates
+  per-recipient ack badges by groupId (amendment 5). NEVER a turn mutation;
+  the existing delivery ledger + ack txns ARE the acknowledgement state.
+- evolve: the registration event records tokenHash into broker-authoritative
+  state (journal/snapshot); turn:keep message-sent changes nothing else.
 
 ## 5. Watch TUI (full v1 scope)
 
@@ -79,10 +99,12 @@ Seam discipline: `events.ts`/`viewmodel.ts` extensions by cross-lane
 agreement, then frozen again.
 
 - **Input line** (broker mode + registered credential only): visible at the
-  bottom; typing buffers locally in reducer state; Enter submits via
-  `user-send`; Esc clears. Submission renders immediately as a transcript
-  entry with per-recipient ack badges (✓ acked / ○ pending), updated from
-  the normal activity stream.
+  bottom; typing buffers locally in reducer state; Enter submits; Esc
+  clears. **No optimistic transcript insertion (amendment 4):** a submit
+  renders as a distinct `sending…` element (error + retry state driven by a
+  `submit-result` event) until the COMMITTED entry arrives via the observer
+  activity stream; only committed entries join the transcript, with
+  per-recipient ack badges (✓ acked / ○ pending) aggregated by groupId.
 - **Target picker**: Tab cycles `[broadcast] → agent1 → agent2 → …`;
   the prompt shows the target (`to: *` / `to: codex`).
 - **Scrolling**: PgUp/PgDn move a scrollOffset in reducer state; End (or new
@@ -93,10 +115,19 @@ agreement, then frozen again.
 - **fs-diagnostic mode: none of the above.** No input line is rendered, key
   events other than quit are ignored — read-only forever per user decision.
 
-New WatchEvent variants (draft): `{kind:'key', key:'quit'|'submit'|'tab'|
-'backspace'|'escape'|'page-up'|'page-down'|'end'|'filter'|{char}}`;
-new effects: `submit` (host performs user-send with the buffered input).
-Reducer owns buffer/target/scroll/filter state; host owns the wire call.
+**Key decoding and focus (amendment 6):** the host decoder emits
+DISCRIMINATED events — `{kind:'text', text}` for printable input (UTF-8
+aggregated; unknown ANSI escape sequences consumed and ignored in v1) and
+`{kind:'key', key}` for command keys, which are NON-PRINTABLE chords only:
+Enter (submit), Esc, Backspace, Tab (target), PgUp/PgDn, End, Ctrl+F
+(filter), Ctrl+C (quit). A plain `f` while typing therefore types `f`;
+`q` quits only when the reducer sees an empty input buffer (reducer
+decision, not decoder). New effect: `submit` carrying an IMMUTABLE
+`{reqId, target, body}` snapshot; the host performs the wire call and
+pushes `{kind:'submit-result', reqId, ok, error?}` back through the queue
+(amendment 7: decoder + idle semantics defined here). Reducer owns
+buffer/target/scroll/filter/pending-submit state; host owns the wire call
+and reqId reuse.
 
 ## 6. Slice boundaries
 
@@ -111,16 +142,26 @@ Reducer owns buffer/target/scroll/filter state; host owns the wire call.
 - Reserved identity: init/join/kick with `user` rejected; send TO user
   rejected; user-message never moves the turn (assert turn unchanged across
   broadcast into an active turn-passing exchange).
-- Credential: bad token → `user-auth-failed`; TOFU registration commits the
-  journaled event and fans out notices; second registration attempt with a
-  different token rejected until the registration file is removed.
-- Broadcast: ONE txn, N deliveries, independent per-recipient ack state
-  visible through the observer stream; partial ack renders one ✓ one ○.
-- Authority stamping: a `user-send` with a forged `from` field in the body
-  is impossible by construction (principal from connection, not payload) —
-  wire test asserting an agent-token connection cannot invoke user-send.
-- Reducer: typing/submit/target-cycle/scroll/filter transitions; input
-  disabled in fs mode; scrollback follow semantics.
+- Credential: bad token → `user-auth-failed` (constant-time compare); TOFU
+  registration commits the journaled event and fans out notices; a second
+  registration attempt with a different token is rejected — there is NO
+  reset path in slice 3.
+- Journal authority: delete/tamper `.pair/user-channel.json`, restart the
+  broker — the binding survives (restored from journal/snapshot); a
+  different token still fails auth.
+- Transport gate: `user-message` on the generic execute path with forged
+  `as: 'user'` rejected `user-channel-required`; `user-send` on an
+  agent-token connection likewise rejected.
+- Submit idempotency: kill the connection mid-submit, retry with the SAME
+  reqId after reconnect — exactly one committed send (dedup replay).
+- Broadcast: ONE txn, N deliveries, UNIQUE per-recipient message ids, a
+  shared groupId, provenance `trusted_user_client` on every projection;
+  partial ack renders one ✓ one ○ aggregated by groupId.
+- Reducer: text-vs-command focus routing (`f` types while the buffer is
+  non-empty; `q` quits only on an empty buffer); pending-submit →
+  submit-result → committed-entry lifecycle (no optimistic insertion);
+  target-cycle/scroll/filter transitions; input disabled in fs mode;
+  scrollback follow semantics.
 - E2E: user broadcast wakes both agents' waits with `turn: keep` FYI wording.
 
 ## 8. Proposed lanes (after design approval)
