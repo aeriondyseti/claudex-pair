@@ -7,7 +7,7 @@ import { IpcServer } from '@adapters/ipc/server.ts';
 import { endpointFor } from '@adapters/ipc/endpoint.ts';
 import type { ClientFrame, ServerConnection, ServerFrame } from '@adapters/ipc/types.ts';
 import { ElectionLock, currentProcessStartTime, electionEndpointFor, fenceByVerifiedTermination, writeLease } from '@broker/election.ts';
-import type { DeliverySink } from '@broker/ports.ts';
+import type { DeliverySink, ObserverSink } from '@broker/ports.ts';
 import { BrokerCore, DEFAULT_CONFIG, type BrokerConfig, type BrokerResponse } from '@broker/server.ts';
 
 /**
@@ -36,6 +36,13 @@ function asSink(connection: ServerConnection): DeliverySink {
     id: connection.id,
     sendDelivery: (push) => connection.send(push as ServerFrame),
     sendError: (code, message) => connection.send({ ok: false, error: { code, message } }),
+  };
+}
+
+function asObserverSink(connection: ServerConnection): ObserverSink {
+  return {
+    id: connection.id,
+    sendObserver: (push) => connection.send(push as ServerFrame),
   };
 }
 
@@ -120,6 +127,8 @@ async function main(): Promise<number> {
       }
       case 'subscribe':
         return (await core.subscribe(frame.reqId, asSink(connection), frame.as, frame.afterDeliverySeq)) as ServerFrame;
+      case 'observe':
+        return (await core.observe(frame.reqId, asObserverSink(connection))) as ServerFrame;
       case 'ack':
         return (await core.ack(frame.reqId, frame.deliveryId, frame.clientId)) as ServerFrame;
       case 'extend':

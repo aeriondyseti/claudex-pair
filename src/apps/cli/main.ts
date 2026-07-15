@@ -351,30 +351,13 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case 'watch': {
-      const root = findRoot(rootFlag);
-      const deps = bindFsDeps(root);
-      const tail = num(flags, 'tail', 10);
-      const refreshSec = Math.max(1, num(flags, 'refreshsec', 2));
-      const { renderWatchFrame } = await import('@adapters/tui/watch.ts');
-      let lastFrame = '';
-      for (;;) {
-        const state = await deps.store.load();
-        if (state) {
-          const entries: { message: Awaited<ReturnType<typeof deps.mailbox.archived>>[number]; pending: boolean }[] = [];
-          for (const m of await deps.mailbox.archived()) entries.push({ message: m, pending: false });
-          for (const agent of state.agents) {
-            for (const m of await deps.mailbox.pending(agent)) entries.push({ message: m, pending: true });
-          }
-          entries.sort((a, b) => a.message.name.localeCompare(b.message.name));
-          const width = Math.max(60, (process.stdout.columns ?? 100) - 1);
-          const frame = renderWatchFrame({ view: uc.view(state), entries, width, tail, refreshSec });
-          if (frame !== lastFrame) {
-            process.stdout.write(`\x1b[2J\x1b[H${frame}`);
-            lastFrame = frame;
-          }
-        }
-        await deps.clock.sleep(refreshSec * 1000);
-      }
+      // Broker-native by default (non-consuming observer, authoritative);
+      // legacy/no-journal sessions fall back to the fs-diagnostic poller.
+      const { runWatch } = await import('./watch.ts');
+      return runWatch(findRoot(rootFlag), {
+        tail: num(flags, 'tail', 10),
+        refreshSec: Math.max(1, num(flags, 'refreshsec', 2)),
+      });
     }
     default: {
       out(HELP);

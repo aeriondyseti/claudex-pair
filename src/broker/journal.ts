@@ -39,6 +39,17 @@ export type OpenDelivery = {
   message: Extract<Event, { kind: 'message-sent' }>;
 };
 
+/**
+ * One transcript entry in the journal's bounded recent-history ring —
+ * authoritative message history for observer snapshots (watch), so the
+ * broker never has to trust a mirror read for its own served views.
+ */
+export type TranscriptRecord = {
+  deliveryId: string;
+  message: Extract<Event, { kind: 'message-sent' }>;
+  state: 'open' | 'acked' | 'voided';
+};
+
 export type Snapshot = {
   state: SessionState | undefined;
   lastSeq: number;
@@ -59,6 +70,10 @@ export class CorruptJournalError extends Error {
 
 const DEDUP_WINDOW_PER_CLIENT = 32;
 const SEGMENT_ROTATE_BYTES = 4 * 1024 * 1024;
+/** Transcript ring cap. Bounded so a long session cannot grow the broker's
+ * memory; observers see at most this much history (older history lives in
+ * the archive mirrors, which are a diagnostic view, not this snapshot). */
+const TRANSCRIPT_RING_MAX = 200;
 
 /** CRC-32 (IEEE), table-based, over the record JSON without the crc32 field. */
 const CRC_TABLE = (() => {
@@ -103,6 +118,10 @@ export class Journal {
   private lastDeliverySeq = 0;
   private dedup = new Map<string, Map<string, unknown>>();
   private open_ = new Map<string, OpenDelivery>();
+  /** Insertion-ordered (= commit-ordered) recent messages, capped. Rebuilt
+   * on recover from the replayed tail — a fresh restart serves only the
+   * post-snapshot history, which is honest: it is what the journal holds. */
+  private transcript_ = new Map<string, TranscriptRecord>();
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -125,6 +144,10 @@ export class Journal {
   }
   openDeliveriesFor(recipient: string): OpenDelivery[] {
     return this.openDeliveries().filter((d) => d.message.to === recipient);
+  }
+  /** Commit-ordered recent message history (authoritative, journal-derived). */
+  transcript(): TranscriptRecord[] {
+    return [...this.transcript_.values()];
   }
 
   /** Committed-success dedup lookup (spec: rejections re-evaluate). */
@@ -182,16 +205,32 @@ export class Journal {
       this.state = evolve(this.state, event);
       if (event.kind === 'message-sent') {
         const ref = record.deliveries.find((d) => d.deliveryId === `${event.id}:${event.to}`);
-        if (ref) this.open_.set(ref.deliveryId, { ...ref, message: event });
+        if (ref) {
+          this.open_.set(ref.deliveryId, { ...ref, message: event });
+          this.transcript_.set(ref.deliveryId, { deliveryId: ref.deliveryId, message: event, state: 'open' });
+          while (this.transcript_.size > TRANSCRIPT_RING_MAX) {
+            const oldest = this.transcript_.keys().next().value;
+            if (oldest === undefined) break;
+            this.transcript_.delete(oldest);
+          }
+        }
       }
     }
     // Ack txns carry events: [] and list the acked ids in `deliveries`.
     if (record.events.length === 0) {
-      for (const d of record.deliveries) this.open_.delete(d.deliveryId);
+      for (const d of record.deliveries) {
+        this.open_.delete(d.deliveryId);
+        const entry = this.transcript_.get(d.deliveryId);
+        if (entry) entry.state = 'acked';
+      }
     }
     // Voided deliveries close in the SAME txn (F18/F21) — after enqueues, so
     // a notice enqueued and voided by one record nets out closed on replay.
-    for (const d of record.voided ?? []) this.open_.delete(d.deliveryId);
+    for (const d of record.voided ?? []) {
+      this.open_.delete(d.deliveryId);
+      const entry = this.transcript_.get(d.deliveryId);
+      if (entry) entry.state = 'voided';
+    }
     this.lastSeq = record.seq;
     for (const d of record.deliveries) {
       if (d.deliverySeq > this.lastDeliverySeq) this.lastDeliverySeq = d.deliverySeq;

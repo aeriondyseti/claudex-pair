@@ -7,8 +7,9 @@ import { navigators, openGrants } from '@core/queries.ts';
 import type { AgentId, SessionState } from '@core/types.ts';
 import type { Clock, Ids, StoredMessage } from '@app/ports/index.ts';
 import type { BrokerStatusDto, StatusDto } from '@app/ports/gateway.ts';
+import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
 import { Journal, type OpenDelivery } from './journal.ts';
-import { MirrorConflictError, type DeliverySink, type MessageCodec, type MirrorStore } from './ports.ts';
+import { MirrorConflictError, type DeliverySink, type MessageCodec, type MirrorStore, type ObserverPushWire, type ObserverSink } from './ports.ts';
 
 /**
  * Broker commit loop (BROKER-SPEC "Commit path"): receive → authenticate
@@ -75,6 +76,13 @@ export class BrokerCore {
    * inbox write (found live: kick-void racing the kicked mail's write). */
   #mirrorSerial: Promise<unknown> = Promise.resolve();
   #subscriptions = new Map<string, Subscription>(); // sink id → sub
+  /** Watch observers — never in #subscriptions, so they can never hold a
+   * lease, receive an agent delivery, or block revoke-turn (partner-active
+   * scans #subscriptions only). Agreed design ruling (claude proposal,
+   * codex review 2026-07-14): observers do NOT count toward idle-exit
+   * busyness — a forgotten watch pane must not pin the daemon. Watch
+   * reattaches without spawning; agents respawn the broker on demand. */
+  #observers = new Map<string, ObserverSink>(); // sink id → observer
   #leases = new Map<string, Lease>(); // deliveryId → lease
   #connections = new Set<string>();
   #stopping = false;
@@ -119,7 +127,10 @@ export class BrokerCore {
 
   startIdleMonitor(): void {
     this.#idleTimer = setInterval(() => {
-      const idle = this.#connections.size === 0 && this.#inFlight === 0 && this.#journal.openDeliveries().length === 0;
+      // Observer connections are excluded: watching is not work (F9's "no
+      // connections" reads "no participant connections" by design ruling).
+      const participants = [...this.#connections].filter((id) => !this.#observers.has(id)).length;
+      const idle = participants === 0 && this.#inFlight === 0 && this.#journal.openDeliveries().length === 0;
       if (!idle) {
         this.#lastBusyAt = Date.now();
         return;
@@ -144,9 +155,11 @@ export class BrokerCore {
       return;
     }
     this.#connections.delete(id);
-    this.#subscriptions.delete(id);
+    const wasListener = this.#subscriptions.delete(id);
+    this.#observers.delete(id);
     // Leases held by the vanished connection expire naturally (F4); the
     // expiry sweep redelivers to the next live subscriber.
+    if (wasListener) this.#notifyPresence(); // item 8: listener set changed
   }
 
   /** Single-writer serialization for every mutating path. */
@@ -245,6 +258,21 @@ export class BrokerCore {
     // with mirror application serialized in commit order.
     const voided = [...voidedPreexisting, ...voidedNew];
     this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh, voided));
+    // Observer fan-out happens HERE, synchronously at commit inside the
+    // single-writer chain — never on the mirror chain. Commit order = call
+    // order = per-socket write order, so an ack activity (also emitted
+    // in-chain) can never overtake the send activity it acknowledges
+    // (codex live review 2026-07-14).
+    this.#notifyObservers({
+      kind: 'activity',
+      seq: record.seq,
+      at: record.at,
+      principal: record.principal,
+      events: record.events,
+      session: post,
+      ackedDeliveryIds: [],
+      voidedDeliveryIds: voided.map((d) => d.deliveryId),
+    });
     return response;
   }
 
@@ -257,6 +285,29 @@ export class BrokerCore {
       /* mirror lag is recoverable by rebuild on next recovery */
     }
     for (const delivery of deliveries) this.#push(delivery);
+  }
+
+  /** Best-effort observer fan-out: a dead observer is dropped, never retried
+   * (it owns nothing — reattach serves a fresh snapshot). */
+  #notifyObservers(push: ObserverPushWire): void {
+    for (const [id, observer] of this.#observers) {
+      void observer.sendObserver(push).catch(() => this.#observers.delete(id));
+    }
+  }
+
+  #notifyPresence(): void {
+    if (this.#observers.size) this.#notifyObservers({ kind: 'presence', liveness: this.#liveness() });
+  }
+
+  #liveness(): LivenessDto {
+    const agents: Record<string, { connectedSince?: string; lastActivity?: string }> = {};
+    for (const sub of this.#subscriptions.values()) {
+      agents[sub.as] = { connectedSince: sub.connectedSince, lastActivity: sub.lastActivity };
+    }
+    return {
+      broker: { pid: this.#host.pid, epoch: this.#host.epoch, heartbeatAt: this.#host.heartbeatAt() },
+      agents,
+    };
   }
 
   /** Push one open delivery to a live subscriber (single lease holder, F5). */
@@ -274,6 +325,7 @@ export class BrokerCore {
     void sub.sink
       .sendDelivery({ kind: 'delivery', deliverySeq: delivery.deliverySeq, deliveryId: delivery.deliveryId, message: this.#toStored(delivery) })
       .catch(() => this.#leases.delete(delivery.deliveryId));
+    this.#notifyPresence(); // lastActivity moved (item 8 progress signal)
     this.#scheduleLeaseSweep();
   }
 
@@ -305,6 +357,7 @@ export class BrokerCore {
         return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
       }
       this.#subscriptions.set(sink.id, { sink, as, connectedSince: this.#clock.now(), lastActivity: this.#clock.now() });
+      this.#notifyPresence(); // item 8: listener appeared
       // Open/unacked beats cursor (frozen rule): every open delivery for
       // this agent is offered regardless of the presented cursor; the
       // ledger holds no closed history to replay, so the cursor's job ends
@@ -314,17 +367,65 @@ export class BrokerCore {
     });
   }
 
+  /**
+   * Attach a read-only observer (watch). Non-consuming by contract: the
+   * sink is registered OUTSIDE #subscriptions, so it can never receive an
+   * agent delivery, hold a lease, or count as partner-active. The snapshot
+   * is 100% journal-derived (session state + transcript ring) — the broker
+   * never trusts its own mirrors for a view it labels authoritative (codex
+   * review ruling: mirrors would need parity/tamper validation here).
+   * No history replay: reattach = fresh snapshot. Deliberately does NOT
+   * touch #lastBusyAt — watching is not work; see #observers on idle.
+   */
+  observe(reqId: string, sink: ObserverSink): Promise<BrokerResponse> {
+    return this.#chain(async () => {
+      if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
+      const state = this.#journal.sessionState;
+      if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      // Registration and every activity notify both run inside the commit
+      // chain, so an observer registered at head N receives exactly the
+      // txns with seq > N — no stale push for commits its snapshot already
+      // contains, no gap, by construction.
+      this.#observers.set(sink.id, sink);
+      const transcript = this.#journal.transcript().map((t) => ({
+        message: this.#toStored({ deliveryId: t.deliveryId, deliverySeq: 0, message: t.message }),
+        pending: t.state === 'open',
+        ...(t.state === 'voided' ? { voided: true } : {}),
+      }));
+      const snapshot: ObserverSnapshotDto = {
+        seq: this.#journal.headSeq,
+        session: state,
+        transcript,
+        liveness: this.#liveness(),
+        broker: { pid: this.#host.pid, epoch: this.#host.epoch, endpoint: this.#host.endpoint, heartbeatAt: this.#host.heartbeatAt() },
+      };
+      return { reqId, ok: true, data: snapshot };
+    });
+  }
+
   ack(reqId: string, deliveryId: string, clientId: string): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
     return this.#chain(async () => {
       const open = this.#journal.openDeliveries().find((d) => d.deliveryId === deliveryId);
       if (!open) return { reqId, ok: true }; // idempotent (F5/F11)
-      await this.#journal.ackDelivery(deliveryId, clientId, this.#clock.now());
+      const at = this.#clock.now();
+      await this.#journal.ackDelivery(deliveryId, clientId, at);
       this.#leases.delete(deliveryId);
       const seq = this.#journal.headSeq;
       this.#mirrorSerial = this.#mirrorSerial.then(() =>
         this.#mirrors.applyAck(open, seq).catch(() => undefined /* mirror lag recoverable */),
       );
+      // Ack txns flip a transcript entry pending → delivered in the watch.
+      this.#notifyObservers({
+        kind: 'activity',
+        seq,
+        at,
+        principal: clientId,
+        events: [],
+        session: this.#journal.sessionState!,
+        ackedDeliveryIds: [deliveryId],
+        voidedDeliveryIds: [],
+      });
       return { reqId, ok: true };
     });
   }
@@ -366,20 +467,13 @@ export class BrokerCore {
   async #status(state: SessionState): Promise<StatusDto> {
     const pending: Record<string, StoredMessage[]> = {};
     for (const agent of state.agents) pending[agent] = this.#journal.openDeliveriesFor(agent).map((d) => this.#toStored(d));
-    const agents: Record<string, { connectedSince?: string; lastActivity?: string }> = {};
-    for (const sub of this.#subscriptions.values()) {
-      agents[sub.as] = { connectedSince: sub.connectedSince, lastActivity: sub.lastActivity };
-    }
     return {
       session: state,
       navigators: navigators(state),
       openGrants: openGrants(state),
       pending,
       recent: await this.#mirrors.archived(3),
-      liveness: {
-        broker: { pid: this.#host.pid, epoch: this.#host.epoch, heartbeatAt: this.#host.heartbeatAt() },
-        agents,
-      },
+      liveness: this.#liveness(),
     };
   }
 

@@ -125,6 +125,64 @@ export interface ProtocolGateway {
   close(): Promise<void>;
 }
 
+/** One transcript entry as the observer snapshot serves it. */
+export type ObserverTranscriptEntry = {
+  readonly message: StoredMessage;
+  /** Enqueued and not yet acked (open delivery). */
+  readonly pending: boolean;
+  /** Closed without consumption — recipient was removed (F18/F21). */
+  readonly voided?: boolean;
+};
+
+/**
+ * Authoritative watch snapshot, served by the broker at observe-attach time
+ * (TUI-UPGRADE-NOTES "broker-native read-only watch"). `seq` is the journal
+ * head the snapshot was assembled at. The transcript is journal-derived
+ * (bounded recent-history ring) — never a mirror read, so no parity/tamper
+ * validation is owed here. A freshly restarted broker serves only the
+ * post-snapshot history it actually holds.
+ */
+export type ObserverSnapshotDto = {
+  readonly seq: number;
+  readonly session: SessionState;
+  readonly transcript: readonly ObserverTranscriptEntry[];
+  readonly liveness: LivenessDto;
+  readonly broker: { readonly pid: number; readonly epoch: number; readonly endpoint: string; readonly heartbeatAt: string };
+};
+
+/**
+ * Observer stream elements. `activity` mirrors one committed txn: post-commit
+ * session state rides along so consumers never evolve state client-side;
+ * ack txns arrive with empty events and the acked delivery ids. `presence`
+ * is non-journaled listener liveness (item 8), pushed when it changes.
+ */
+export type ObserverPush =
+  | {
+      readonly kind: 'activity';
+      /** Journal commit seq — NOT a delivery cursor (different sequence space). */
+      readonly seq: number;
+      readonly at: string;
+      readonly principal: string;
+      readonly events: readonly Event[];
+      readonly session: SessionState;
+      readonly ackedDeliveryIds: readonly string[];
+      readonly voidedDeliveryIds: readonly string[];
+    }
+  | { readonly kind: 'presence'; readonly liveness: LivenessDto };
+
+/**
+ * A live read-only observation of the session. NON-CONSUMING by contract:
+ * attaching never creates a delivery lease, never acks or voids mail, never
+ * moves an agent cursor, and never blocks revoke-turn as partner-active.
+ * There is no history replay: a reconnecting observer attaches fresh and
+ * rebuilds its view from the new snapshot (compaction-safe by construction).
+ */
+export interface ObserverSession {
+  readonly snapshot: ObserverSnapshotDto;
+  readonly pushes: AsyncIterable<ObserverPush>;
+  close(): Promise<void>;
+}
+
 /** Broker daemon status — meaningful before/without any session. */
 export type BrokerStatusDto = {
   readonly running: boolean;

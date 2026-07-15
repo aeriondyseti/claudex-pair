@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentId, Grant } from '@core/types.ts';
 import type {
   BrokerControl, BrokerStatusDto, Delivery, DeliverySubscription, ExecuteOutcome,
-  ExecuteRequest, ProtocolGateway, StatusDto,
+  ExecuteRequest, ObserverPush, ObserverSession, ObserverSnapshotDto, ProtocolGateway, StatusDto,
 } from '@app/ports/gateway.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 import { IpcClient } from '@adapters/ipc/client.ts';
@@ -39,8 +39,30 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
   }
   async stop(): Promise<void> { await this.query<unknown>('broker-stop', undefined, false); }
 
+  /**
+   * Attach as a read-only observer (watch). NO reconnect logic here by
+   * design: an observer has no cursor to resume — the caller reattaches
+   * (fresh snapshot) when the pushes iterable fails. `spawn: false` keeps a
+   * reconnect loop from resurrecting a deliberately stopped broker.
+   */
+  async observe(spawn = true): Promise<ObserverSession> {
+    const client = await this.getClient(spawn);
+    const queue = new AsyncQueue<ObserverPush>();
+    const offPush = client.onObserverPush((frame) => queue.push(frame as ObserverPush));
+    const offClose = client.onClose((error) => queue.fail(error));
+    let response: ResponseFrame;
+    try { response = await client.observe(); }
+    catch (error) { offPush(); offClose(); queue.close(); throw error; }
+    if (!response.ok) { offPush(); offClose(); queue.close(); throw new BrokerWireError(response.error.code, response.error.message); }
+    return {
+      snapshot: response.data as ObserverSnapshotDto,
+      pushes: queue,
+      close: async () => { offPush(); offClose(); queue.close(); },
+    };
+  }
+
   async subscribe(as: AgentId, afterDeliverySeq: number): Promise<DeliverySubscription> {
-    const queue = new AsyncDeliveryQueue();
+    const queue = new AsyncQueue<Delivery>();
     let client = await this.getClient(true);
     let cursor = afterDeliverySeq;
     let active = true;
@@ -106,16 +128,16 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
 function toDelivery(frame: DeliveryFrame): Delivery { return { deliverySeq: frame.deliverySeq, deliveryId: frame.deliveryId, message: frame.message as StoredMessage }; }
 function expectOk(response: ResponseFrame): void { if (!response.ok) throw new BrokerWireError(response.error.code, response.error.message); }
 
-class AsyncDeliveryQueue implements AsyncIterable<Delivery>, AsyncIterator<Delivery> {
-  private values: Delivery[] = [];
-  private waiters: Array<{ resolve: (r: IteratorResult<Delivery>) => void; reject: (e: unknown) => void }> = [];
+class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
+  private values: T[] = [];
+  private waiters: Array<{ resolve: (r: IteratorResult<T>) => void; reject: (e: unknown) => void }> = [];
   private ended = false;
-  push(value: Delivery) { const waiter = this.waiters.shift(); if (waiter) waiter.resolve({ done: false, value }); else this.values.push(value); }
+  push(value: T) { const waiter = this.waiters.shift(); if (waiter) waiter.resolve({ done: false, value }); else this.values.push(value); }
   fail(error: unknown) { for (const waiter of this.waiters.splice(0)) waiter.reject(error); this.ended = true; }
   close() { this.ended = true; for (const waiter of this.waiters.splice(0)) waiter.resolve({ done: true, value: undefined }); }
-  next(): Promise<IteratorResult<Delivery>> {
+  next(): Promise<IteratorResult<T>> {
     const value = this.values.shift();
-    if (value) return Promise.resolve({ done: false, value });
+    if (value !== undefined) return Promise.resolve({ done: false, value });
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }

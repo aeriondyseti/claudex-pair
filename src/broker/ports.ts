@@ -59,3 +59,26 @@ export type DeliverySink = {
   sendDelivery(push: DeliveryPush): Promise<void>;
   sendError(code: string, message: string): Promise<void>;
 };
+
+export type ObserverPushWire =
+  | {
+      kind: 'activity';
+      seq: number;
+      at: string;
+      principal: string;
+      events: readonly Event[];
+      session: SessionState;
+      ackedDeliveryIds: readonly string[];
+      voidedDeliveryIds: readonly string[];
+    }
+  | { kind: 'presence'; liveness: unknown };
+
+/**
+ * A live watch connection. Observers are NOT subscribers: no delivery
+ * leases, no acks, no agent identity — a failed push just drops the
+ * observer (it reattaches with a fresh snapshot; nothing is owed to it).
+ */
+export type ObserverSink = {
+  readonly id: string;
+  sendObserver(push: ObserverPushWire): Promise<void>;
+};
