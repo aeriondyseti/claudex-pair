@@ -8,11 +8,65 @@
  */
 
 export type TerminalHandlers = {
-  /** 'q'/'Q'/Ctrl+C in raw mode; SIGINT/SIGTERM otherwise. */
+  /** Ctrl+C/Ctrl+Q in raw mode; SIGINT/SIGTERM otherwise. */
   onQuit: () => void;
   /** Fired with the new usable frame width. */
   onResize: (width: number) => void;
+  /** U1 composer input (raw mode only): printable text, UTF-8 aggregated. */
+  onText?: (text: string) => void;
+  /** U1 command chords (raw mode only). */
+  onKey?: (key: 'submit' | 'escape' | 'backspace' | 'tab' | 'page-up' | 'page-down' | 'end' | 'filter') => void;
 };
+
+/**
+ * Frozen v1 decoder (U1-SLICE3-DESIGN.md): printable input is ALWAYS text
+ * (input line always focused — `q` types `q`); commands are non-printable
+ * chords only. Unknown ANSI escape sequences are consumed and ignored.
+ * UTF-8 is aggregated across chunk boundaries via a streaming decoder.
+ */
+export class InputDecoder {
+  #utf8 = new TextDecoder('utf-8');
+  decode(chunk: Buffer | string, handlers: Pick<TerminalHandlers, 'onQuit' | 'onText' | 'onKey'>): void {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    let text = '';
+    const flush = () => {
+      if (text.length > 0) handlers.onText?.(text);
+      text = '';
+    };
+    for (let i = 0; i < bytes.length; i++) {
+      const byte = bytes[i]!;
+      if (byte === 0x03 || byte === 0x11) { flush(); handlers.onQuit(); continue; } // Ctrl+C / Ctrl+Q
+      if (byte === 0x0d || byte === 0x0a) { flush(); handlers.onKey?.('submit'); continue; }
+      if (byte === 0x7f || byte === 0x08) { flush(); handlers.onKey?.('backspace'); continue; }
+      if (byte === 0x09) { flush(); handlers.onKey?.('tab'); continue; }
+      if (byte === 0x06) { flush(); handlers.onKey?.('filter'); continue; } // Ctrl+F
+      if (byte === 0x1b) {
+        flush();
+        // CSI sequences: consume through the final byte (0x40-0x7e).
+        if (bytes[i + 1] === 0x5b) {
+          let j = i + 2;
+          while (j < bytes.length && (bytes[j]! < 0x40 || bytes[j]! > 0x7e)) j++;
+          const body = bytes.subarray(i + 2, j + 1).toString('latin1');
+          if (body === '5~') handlers.onKey?.('page-up');
+          else if (body === '6~') handlers.onKey?.('page-down');
+          else if (body === 'F' || body === '4~') handlers.onKey?.('end');
+          // other sequences (arrows etc.): consumed, ignored in v1
+          i = j;
+          continue;
+        }
+        handlers.onKey?.('escape');
+        continue;
+      }
+      if (byte < 0x20) { flush(); continue; } // other control bytes: ignored
+      // Printable: find the run end, stream-decode (multibyte-safe).
+      let j = i;
+      while (j < bytes.length && bytes[j]! >= 0x20 && bytes[j]! !== 0x7f) j++;
+      text += this.#utf8.decode(bytes.subarray(i, j), { stream: true });
+      i = j - 1;
+    }
+    flush();
+  }
+}
 
 export type TerminalSession = {
   /** False when stdin is not a TTY (piped) — no raw mode, no key input. */
@@ -71,13 +125,10 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
   const altScreen = (options.altScreen ?? true) && interactive;
   const width = () => Math.max(60, (stdout.columns ?? 100) - 1);
 
-  const onData = (chunk: Buffer | string) => {
-    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
-    for (const byte of bytes) {
-      // q / Q / Ctrl+C — raw mode swallows SIGINT, so 0x03 must quit here.
-      if (byte === 0x71 || byte === 0x51 || byte === 0x03) handlers.onQuit();
-    }
-  };
+  // Raw mode swallows SIGINT — Ctrl+C is decoded as quit here. Plain `q`
+  // is TEXT per the frozen v1 input model (chord-only quit).
+  const decoder = new InputDecoder();
+  const onData = (chunk: Buffer | string) => decoder.decode(chunk, handlers);
   const onResize = () => handlers.onResize(width());
   const onSignal = () => handlers.onQuit();
 

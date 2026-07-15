@@ -1,8 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { systemClock } from '@adapters/clock/index.ts';
 import { diffWatchFrame } from '@adapters/tui/frame.ts';
-import { initialWatchState, type WatchReducer, type WatchTuiState } from '@adapters/tui/events.ts';
+import { initialWatchState, type WatchEffect, type WatchReducer, type WatchTuiState } from '@adapters/tui/events.ts';
 import type { AgentPresence, TranscriptEntry, WatchViewModel } from '@adapters/tui/viewmodel.ts';
-import type { ObserverSession } from '@app/ports/gateway.ts';
+import type { ObserverSession, UserChannelSession } from '@app/ports/gateway.ts';
 import type { SessionState } from '@core/types.ts';
 import * as uc from '@app/usecases.ts';
 import { bindFsDeps } from './bind.ts';
@@ -21,7 +22,16 @@ import { attachEvent, decodePush, WatchEventQueue } from './watchPump.ts';
  * FIRST attach; a reattach never resurrects a deliberately stopped broker.
  */
 
-export type WatchLoopOptions = { tail: number; refreshSec: number };
+export type WatchLoopOptions = {
+  tail: number;
+  refreshSec: number;
+  /** U1: present only when the host is interactive AND the credential
+   * loaded — non-TTY hosts never carry a token (frozen exclusion). */
+  userToken?: string;
+  /** U1: local pre-attach credential failure — rendered as loud guidance;
+   * the loop still attaches read-only. */
+  credentialError?: string;
+};
 
 /** Journal holds no session — the fs mirrors are the only view left. */
 export class NoBrokerSessionError extends Error {}
@@ -29,6 +39,7 @@ export class NoBrokerSessionError extends Error {}
 /** Injection seams for deterministic loop tests (real defaults in prod). */
 export type ObserverGatewayLike = {
   observe(spawn?: boolean): Promise<ObserverSession>;
+  userAttach?(userToken: string, spawn?: boolean): Promise<UserChannelSession>;
   close(): Promise<void>;
 };
 export type WatchLoopHooks = {
@@ -61,6 +72,8 @@ type EffectHost = {
   /** Absent in fs mode — a reattach effect there is a reducer-contract
    * violation we tolerate as a no-op rather than crash the pane. */
   reattach?: () => Promise<void>;
+  /** U1: perform the wire send for a submit effect (broker mode only). */
+  submit?: (effect: Extract<WatchEffect, { kind: 'submit' }>) => void;
 };
 
 async function consumeEvents(queue: WatchEventQueue, reduce: WatchReducer, initial: WatchTuiState, host: EffectHost): Promise<number> {
@@ -71,7 +84,8 @@ async function consumeEvents(queue: WatchEventQueue, reduce: WatchReducer, initi
     for (const effect of step.effects) {
       if (effect === 'render') host.render(state);
       else if (effect === 'exit') return 0;
-      else if (host.reattach) await host.reattach();
+      else if (effect === 'reattach') { if (host.reattach) await host.reattach(); }
+      else host.submit?.(effect);
     }
   }
   return 0;
@@ -87,9 +101,13 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   const term = openTerm({
     onQuit: () => queue.push({ kind: 'key', key: 'quit' }),
     onResize: (width) => queue.push({ kind: 'resize', width }),
+    // U1 composer input: the host allocates the submit reqId HERE (the
+    // pure reducer cannot mint ids; retry reuses pending.reqId instead).
+    onText: (text) => queue.push({ kind: 'text', text }),
+    onKey: (key) => queue.push(key === 'submit' ? { kind: 'key', key, reqId: randomUUID() } : { kind: 'key', key }),
   });
   const state = initialWatchState({ width: term.width(), tail: options.tail, now: systemClock.now() });
-  let session: ObserverSession | undefined;
+  let session: ObserverSession | UserChannelSession | undefined;
   let spawnAllowed = true; // flips only after the first SUCCESSFUL attach
   let everAttached = false; // no model yet → banner feedback during retries
   let pumpGeneration = 0;
@@ -112,7 +130,21 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
         for (;;) {
           if (closed) return;
           try {
-            const next = await gateway.observe(spawnAllowed);
+            // U1: attach authenticated when a token is present; an auth
+            // failure (foreign binding) degrades LOUDLY to read-only.
+            let next: ObserverSession | UserChannelSession;
+            if (options.userToken && gateway.userAttach) {
+              try {
+                next = await gateway.userAttach(options.userToken, spawnAllowed);
+              } catch (error) {
+                if (error instanceof BrokerWireError && error.code === 'user-auth-failed') {
+                  queue.push({ kind: 'user-channel', state: 'credential-error', detail: `${error.message} This pane is read-only.` });
+                  next = await gateway.observe(spawnAllowed);
+                } else throw error;
+              }
+            } else {
+              next = await gateway.observe(spawnAllowed);
+            }
             if (closed) {
               await next.close();
               return;
@@ -134,6 +166,11 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           }
         }
         queue.push(attachEvent(session!.snapshot, session!.snapshot.broker.endpoint, systemClock.now()));
+        if (session!.snapshot.userChannel) {
+          queue.push({ kind: 'user-channel', state: session!.snapshot.userChannel.registered ? 'registered' : 'unregistered' });
+        } else if (!options.userToken && !options.credentialError) {
+          queue.push({ kind: 'user-channel', state: 'unavailable' });
+        }
         // Pump generation guards a torn-down session's late callbacks: only
         // the CURRENT pump may signal connection loss.
         const generation = pumpGeneration;
@@ -152,9 +189,22 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   };
 
   try {
+    // Local pre-attach credential failure: loud guidance before anything
+    // else renders (frozen contract — never observable broker-side).
+    if (options.credentialError) queue.push({ kind: 'user-channel', state: 'credential-error', detail: options.credentialError });
     startAttach();
     return await consumeEvents(queue, reduce, state, {
       render: frameSink(write),
+      submit: (effect) => {
+        const current = session;
+        if (!current || !('send' in current)) {
+          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: 'user channel not attached' });
+          return;
+        }
+        void current.send(effect.reqId, effect.target, effect.body)
+          .then(() => queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true }))
+          .catch((error: unknown) => queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: error instanceof Error ? error.message : String(error) }));
+      },
       reattach: async () => {
         // Invalidate BEFORE the intentional close: the dying pump's error
         // callback must never enqueue a stale 'lost' that would tear down
