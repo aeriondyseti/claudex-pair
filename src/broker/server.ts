@@ -247,16 +247,19 @@ export class BrokerCore {
         e.kind === 'message-sent' ? [this.#codec.filename({ id: e.id, from: e.from, to: e.to, type: e.type, turn: e.turn, sent: e.at, body: e.body })] : [],
       ),
     };
+    // Post-state computed purely BEFORE commit — the journaled outcome must
+    // be complete; post-commit mutation of an already-serialized response
+    // made restart replays structurally incomplete (codex handler review;
+    // same latent bug as the user path).
+    const post = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), state)!;
     const response: BrokerResponse = {
       reqId,
       ok: true,
       seq: this.#journal.headSeq + 1,
       events: [...events],
-      data: { session: undefined as unknown, receipt, ...(gitignoreUpdated === undefined ? {} : { gitignoreUpdated }) },
+      data: { session: post, receipt, ...(gitignoreUpdated === undefined ? {} : { gitignoreUpdated }) },
     };
     const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
-    const post = this.#journal.sessionState!;
-    (response as { data: { session: unknown } }).data.session = post;
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
       // Voided-in-same-txn deliveries are already closed — never pushed.
@@ -490,12 +493,27 @@ export class BrokerCore {
       if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
       const state = this.#journal.sessionState;
       if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      // Wire validation: the token encoding is FROZEN as 64 lowercase hex
+      // chars (32 bytes). An empty or malformed token must never reach
+      // sha256 — hashing garbage would mint a real binding.
+      if (!USER_TOKEN_PATTERN.test(userToken)) {
+        return err(reqId, 'user-auth-failed', 'User-channel token must be 64 hex characters (32 bytes).');
+      }
       const hash = sha256Hex(userToken);
       if (state.userChannelTokenHash) {
         if (!constantTimeEqualHex(hash, state.userChannelTokenHash)) {
           return err(reqId, 'user-auth-failed', 'User-channel token rejected.');
         }
-      } else if (this.#journal.recordedOutcome(clientId, reqId) === undefined) {
+      } else {
+        // NO dedup shortcut here (codex review: an unrelated recorded
+        // outcome under this identity must never stand in for registration
+        // proof — that would tag the socket without knowing any token). An
+        // honest attach retry lands in the binding-exists branch above and
+        // re-authenticates with its own token; a reqId collision fails
+        // loudly instead of silently skipping.
+        if (this.#journal.recordedOutcome(clientId, reqId) !== undefined) {
+          return err(reqId, 'user-auth-failed', 'reqId already used by another request — retry user-attach with a fresh reqId.');
+        }
         const envelope: CommandEnvelope = {
           command: { kind: 'register-user-channel', tokenHash: hash },
           meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: USER_IDENTITY },
@@ -534,12 +552,21 @@ export class BrokerCore {
       const state = this.#journal.sessionState;
       if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
       if (!state.userChannelTokenHash) return err(reqId, 'user-channel-unregistered', 'No user channel is registered for this session.');
+      // Runtime shape validation — JSON frames are not made safe by types.
+      if (typeof to !== 'string' || to.length === 0 || typeof body !== 'string' || body.length === 0) {
+        return err(reqId, 'invalid-recipient', 'user-send requires string to and non-empty string body.');
+      }
       const recorded = this.#journal.recordedOutcome(clientId, reqId);
       if (recorded !== undefined) return recorded as BrokerResponse; // replay BEFORE allocation
-      const recipients = (to === '*' ? state.agents : [to]).map((agent) => ({ to: agent, messageId: `${reqId}-${agent}` }));
+      // Fresh allocation AFTER dedup (frozen contract): the base comes from
+      // #ids, so ids are unique across clients sharing reqId values and
+      // beyond the dedup window; recipients suffix deterministically within
+      // this txn. groupId stays the reqId (composer correlation).
+      const base = this.#ids.messageId();
+      const recipients = (to === '*' ? state.agents : [to]).map((agent) => ({ to: agent, messageId: `${base}-${agent}` }));
       const envelope: CommandEnvelope = {
         command: { kind: 'user-message', groupId: reqId, recipients, body },
-        meta: { id: reqId, at: this.#clock.now(), principal: USER_IDENTITY },
+        meta: { id: base, at: this.#clock.now(), principal: USER_IDENTITY },
       };
       return this.#commitUserEnvelope(reqId, clientId, envelope);
     });
@@ -560,16 +587,18 @@ export class BrokerCore {
         e.kind === 'message-sent' ? [this.#codec.filename({ id: e.id, from: e.from, to: e.to, type: e.type, turn: e.turn, sent: e.at, body: e.body })] : [],
       ),
     };
+    // Post-state is computed PURELY before commit so the journaled outcome
+    // is complete — mutating the response after commit serialized it left
+    // restart replays structurally incomplete (codex handler review).
+    const post = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), this.#journal.sessionState)!;
     const response: BrokerResponse = {
       reqId,
       ok: true,
       seq: this.#journal.headSeq + 1,
       events: [...events],
-      data: { session: undefined as unknown, receipt, groupId: envelope.command.kind === 'user-message' ? envelope.command.groupId : undefined },
+      data: { session: post, receipt, groupId: envelope.command.kind === 'user-message' ? envelope.command.groupId : undefined },
     };
     const record = await this.#journal.commit(envelope, events, response, { clientId, reqId });
-    const post = this.#journal.sessionState!;
-    (response as { data: { session: unknown } }).data.session = post;
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
       const match = open.find((o) => o.deliveryId === d.deliveryId);
@@ -660,6 +689,9 @@ function userChannelKindFrom(payload: unknown): string | undefined {
 const err = (reqId: string, code: string, message: string): BrokerResponse => ({ ...(reqId ? { reqId } : {}), ok: false, error: { code, message } });
 
 const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
+
+/** Frozen wire encoding for the user-channel token: 32 bytes as lowercase hex. */
+const USER_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
 /** Constant-time hex-hash comparison — never a string equality on secrets. */
 function constantTimeEqualHex(a: string, b: string): boolean {

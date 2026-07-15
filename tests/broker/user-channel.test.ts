@@ -64,7 +64,7 @@ describe('transport gate', () => {
 describe('user-attach', () => {
   test('TOFU registers through the journal (loud notices as inbox deliveries) and tags the connection', async () => {
     const core = await seeded(await tempRoot());
-    const response = await core.userAttach('attach-1', sink('user-conn'), 'user-client', 'secret-token');
+    const response = await core.userAttach('attach-1', sink('user-conn'), 'user-client', 'a'.repeat(64));
     expect(response.ok).toBeTrue();
     if (!response.ok) return;
     const snapshot = response.data as ObserverSnapshotDto;
@@ -75,19 +75,42 @@ describe('user-attach', () => {
     expect(core.journal.openDeliveriesFor('codex').length).toBe(1);
   });
 
+  test('malformed tokens are rejected before TOFU — no binding from empty/short tokens', async () => {
+    const core = await seeded(await tempRoot());
+    for (const bad of ['', 'short', 'Z'.repeat(64), 'a'.repeat(63)]) {
+      const r = await core.userAttach(`bad-${bad.length}`, sink(`c-${bad.length}`), 'user-client', bad);
+      expect(r.ok).toBeFalse();
+      if (!r.ok) expect(r.error.code).toBe('user-auth-failed');
+    }
+    const status = await core.query('q', 'status');
+    if (status.ok) expect((status.data as { session: { userChannelTokenHash?: string } }).session.userChannelTokenHash).toBeUndefined();
+  });
+
+  test('a reqId colliding with an unrelated recorded outcome fails loudly — never a silent tag (auth bypass fix)', async () => {
+    const core = await seeded(await tempRoot());
+    // 'init' + 'client-a' already has a recorded outcome from seeding.
+    const collided = await core.userAttach('init', sink('sneaky'), 'client-a', 'f'.repeat(64));
+    expect(collided.ok).toBeFalse();
+    if (!collided.ok) expect(collided.error.code).toBe('user-auth-failed');
+    // The connection must NOT be tagged: a user-send on it is rejected.
+    const send = await core.userSend('s1', 'client-a', 'sneaky', '*', 'hi');
+    expect(send.ok).toBeFalse();
+    if (!send.ok) expect(send.error.code).toBe('user-channel-required');
+  });
+
   test('wrong token after binding fails constant-time; correct token attaches; binding survives restart', async () => {
     const root = await tempRoot();
     const core = await seeded(root);
-    expect((await core.userAttach('a1', sink('c1'), 'user-client', 'right-token')).ok).toBeTrue();
-    const wrong = await core.userAttach('a2', sink('c2'), 'user-client-2', 'wrong-token');
+    expect((await core.userAttach('a1', sink('c1'), 'user-client', 'c'.repeat(64))).ok).toBeTrue();
+    const wrong = await core.userAttach('a2', sink('c2'), 'user-client-2', 'd'.repeat(64));
     expect(wrong.ok).toBeFalse();
     if (!wrong.ok) expect(wrong.error.code).toBe('user-auth-failed');
 
     const reopened = makeCore(root);
     await reopened.recover(); // journal-authoritative: mirrors irrelevant
-    const again = await reopened.userAttach('a3', sink('c3'), 'user-client-3', 'right-token');
+    const again = await reopened.userAttach('a3', sink('c3'), 'user-client-3', 'c'.repeat(64));
     expect(again.ok).toBeTrue();
-    const stillWrong = await reopened.userAttach('a4', sink('c4'), 'user-client-4', 'wrong-token');
+    const stillWrong = await reopened.userAttach('a4', sink('c4'), 'user-client-4', 'd'.repeat(64));
     expect(stillWrong.ok).toBeFalse();
   });
 });
@@ -95,7 +118,7 @@ describe('user-attach', () => {
 describe('user-send', () => {
   test('requires a tagged connection (no token on the frame can substitute)', async () => {
     const core = await seeded(await tempRoot());
-    await core.userAttach('a1', sink('user-conn'), 'user-client', 't0k3n');
+    await core.userAttach('a1', sink('user-conn'), 'user-client', 'e'.repeat(64));
     const untagged = await core.userSend('s1', 'user-client', 'other-conn', '*', 'hello');
     expect(untagged.ok).toBeFalse();
     if (!untagged.ok) expect(untagged.error.code).toBe('user-channel-required');
@@ -104,7 +127,7 @@ describe('user-send', () => {
   test('broadcast: one txn, unique per-recipient ids, groupId===reqId + provenance projected; dedup replays before allocation', async () => {
     const core = await seeded(await tempRoot());
     const observed: ObserverPushWire[] = [];
-    await core.userAttach('a1', sink('user-conn', observed), 'user-client', 't0k3n');
+    await core.userAttach('a1', sink('user-conn', observed), 'user-client', 'e'.repeat(64));
     const first = await core.userSend('req-7', 'user-client', 'user-conn', '*', 'focus on tests');
     expect(first.ok).toBeTrue();
     // Registration notices are also from 'user' — key on the groupId.
@@ -135,7 +158,7 @@ describe('user-send', () => {
   test('turn is never mutated by a user broadcast landing mid-exchange', async () => {
     const core = await seeded(await tempRoot());
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
-    await core.userAttach('a1', sink('user-conn'), 'user-client', 't0k3n');
+    await core.userAttach('a1', sink('user-conn'), 'user-client', 'e'.repeat(64));
     await core.userSend('s1', 'user-client', 'user-conn', '*', 'carry on');
     const status = await core.query('q1', 'status');
     expect(status.ok).toBeTrue();
