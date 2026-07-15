@@ -1,16 +1,14 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Event } from '@core/events.ts';
 import type { SessionState } from '@core/types.ts';
 import type { LivenessDto, ObserverPush, ObserverSnapshotDto } from '@app/ports/gateway.ts';
-import type { StoredMessage } from '@app/ports/index.ts';
 import * as uc from '@app/usecases.ts';
 import { systemClock } from '@adapters/clock/index.ts';
-import { fsMessageCodec } from '@adapters/fs/brokerMirrors.ts';
 import { renderWatchFrame } from '@adapters/tui/watch.ts';
 import type { AgentPresence, TranscriptEntry, WatchViewModel } from '@adapters/tui/viewmodel.ts';
 import { bindFsDeps } from './bind.ts';
 import { BrokerGateway } from './brokerGateway.ts';
+import { toStored } from './watchPump.ts';
 
 /**
  * `pair watch` orchestration (TUI-UPGRADE-NOTES slice 1).
@@ -169,16 +167,6 @@ function applyPush(state: BrokerWatchState, push: ObserverPush): 'applied' | 'du
     if (entry) state.entries.set(id, { ...entry, pending: false, voided: true });
   }
   return 'applied';
-}
-
-function toStored(event: Extract<Event, { kind: 'message-sent' }>): StoredMessage {
-  const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body };
-  return {
-    name: fsMessageCodec.filename(pair),
-    header: { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at },
-    body: event.body,
-    raw: fsMessageCodec.raw(pair),
-  };
 }
 
 function brokerVm(state: BrokerWatchState, notices: string[] = []): WatchViewModel {
