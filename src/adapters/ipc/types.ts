@@ -18,7 +18,7 @@ export type ObserveFrame = WireBase & { kind: 'observe'; reqId: string };
  * the `user` principal from the connection, never from payload.
  */
 export type UserAttachFrame = WireBase & { kind: 'user-attach'; reqId: string; userToken: string };
-export type UserSendFrame = WireBase & { kind: 'user-send'; reqId: string; to: string; body: string };
+export type UserSendFrame = WireBase & { kind: 'user-send'; reqId: string; to: string | '*'; body: string };
 export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame;
 
 export type ErrorFrame = { reqId?: string; ok: false; error: { code: string; message: string } };

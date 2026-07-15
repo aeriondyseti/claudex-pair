@@ -628,7 +628,12 @@ export class BrokerCore {
     const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body };
     return {
       name: this.#codec.filename(pair),
-      header: { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at },
+      header: {
+        id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at,
+        // U1 composer reconciliation reads these from the header.
+        ...(m.groupId === undefined ? {} : { groupId: m.groupId }),
+        ...(m.provenance === undefined ? {} : { provenance: m.provenance }),
+      },
       body: m.body,
       raw: this.#codec.raw(pair),
     };

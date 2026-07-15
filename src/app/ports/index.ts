@@ -17,6 +17,12 @@ export type StoredMessage = {
     readonly type: string;
     readonly turn: string;
     readonly sent: Timestamp;
+    /** U1: present on user-channel messages only — one logical send
+     * (groupId === reqId) fanned to recipients; reducers aggregate ack
+     * badges by it. Broker-projected; fs archive round-trip is diagnostic
+     * mode and deliberately drops them (no user channel there). */
+    readonly groupId?: string;
+    readonly provenance?: 'trusted_user_client';
   };
   readonly body: string;
   readonly raw: string;
