@@ -83,6 +83,10 @@ function decideUserMessage(
   if (ids.size !== command.recipients.length) {
     return err(new ProtocolError('invalid-recipient', 'per-recipient message ids must be unique (allocation bug).'));
   }
+  const targets = new Set(command.recipients.map((r) => r.to));
+  if (targets.size !== command.recipients.length) {
+    return err(new ProtocolError('invalid-recipient', 'recipients must be unique — one delivery per agent per logical send.'));
+  }
   for (const r of command.recipients) {
     if (!s.agents.includes(r.to)) {
       return err(new ProtocolError('not-a-participant', `'${r.to}' is not a participant in this session.`));
@@ -244,6 +248,9 @@ function decideKick(
   envelope: CommandEnvelope,
 ): Result<Event[], ProtocolError> {
   const by = envelope.meta.principal;
+  if (command.agent === USER_IDENTITY) {
+    return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity — it is never on the roster and cannot be kicked.`));
+  }
   const bad = assertParticipant(s, by, '-From') ?? assertParticipant(s, command.agent, '-Agent');
   if (bad) return err(bad);
   if (by !== s.driver) {

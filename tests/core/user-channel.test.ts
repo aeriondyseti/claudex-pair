@@ -33,6 +33,12 @@ describe('reserved user identity', () => {
     if (!r.ok) expect(r.error.code).toBe('reserved-identity');
   });
 
+  test('kick of user is rejected reserved-identity (not not-a-participant)', () => {
+    const r = decide(activeSession(), env({ kind: 'kick-agent', agent: 'user', reason: '' }, 'claude'));
+    expect(r.ok).toBeFalse();
+    if (!r.ok) expect(r.error.code).toBe('reserved-identity');
+  });
+
   test('sending TO user is rejected user-not-addressable (v1)', () => {
     const r = decide(activeSession(), env({ kind: 'send-message', to: 'user', type: 'info', turn: 'keep', body: 'hi' }, 'claude'));
     expect(r.ok).toBeFalse();
@@ -78,6 +84,11 @@ describe('user-message (advisory, internal shape)', () => {
     const ru = decide(activeSession(), env(unknown, 'user'));
     expect(ru.ok).toBeFalse();
     if (!ru.ok) expect(ru.error.code).toBe('not-a-participant');
+    // Duplicate recipients: one delivery per agent per logical send.
+    const dupTo = { ...message, recipients: [{ to: 'codex', messageId: 'a' }, { to: 'codex', messageId: 'b' }] };
+    const rt = decide(activeSession(), env(dupTo, 'user'));
+    expect(rt.ok).toBeFalse();
+    if (!rt.ok) expect(rt.error.code).toBe('invalid-recipient');
   });
 });
 
