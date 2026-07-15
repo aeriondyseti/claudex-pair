@@ -47,23 +47,33 @@ export function toStored(event: Extract<Event, { kind: 'message-sent' }>): Store
  */
 export class WatchEventQueue implements AsyncIterable<WatchEvent>, AsyncIterator<WatchEvent> {
   private values: WatchEvent[] = [];
-  private waiters: Array<(r: IteratorResult<WatchEvent>) => void> = [];
+  private waiters: Array<{ resolve: (r: IteratorResult<WatchEvent>) => void; reject: (e: unknown) => void }> = [];
   private ended = false;
+  private error: unknown;
   push(event: WatchEvent): void {
     if (this.ended) return;
     const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value: event });
+    if (waiter) waiter.resolve({ done: false, value: event });
     else this.values.push(event);
+  }
+  /** Poison the stream: the consumer's for-await rethrows (e.g. a
+   * background attach discovering there is no broker session to watch). */
+  fail(error: unknown): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.error = error;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
   }
   close(): void {
     this.ended = true;
-    for (const waiter of this.waiters.splice(0)) waiter({ done: true, value: undefined });
+    for (const waiter of this.waiters.splice(0)) waiter.resolve({ done: true, value: undefined });
   }
   next(): Promise<IteratorResult<WatchEvent>> {
     const value = this.values.shift();
     if (value !== undefined) return Promise.resolve({ done: false, value });
+    if (this.error !== undefined) return Promise.reject(this.error);
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
-    return new Promise((resolve) => this.waiters.push(resolve));
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
   [Symbol.asyncIterator]() {
     return this;

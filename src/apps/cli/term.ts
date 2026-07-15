@@ -57,39 +57,43 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
   const onResize = () => handlers.onResize(frameWidth());
   const onSignal = () => handlers.onQuit();
 
-  if (altScreen) stdout.write(ENTER_ALT);
-  if (interactive) {
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('data', onData);
-  } else {
-    // Piped stdin cannot deliver keys; signals are the only quit path.
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    stdout.off('resize', onResize);
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    if (interactive) {
+      stdin.off('data', onData);
+      try {
+        stdin.setRawMode(false);
+      } catch {
+        /* stdin already detached */
+      }
+      stdin.pause();
+    }
+    if (altScreen) stdout.write(LEAVE_ALT);
+  };
+
+  // Signal handlers are installed UNCONDITIONALLY: raw-mode 0x03 covers the
+  // keyboard only — an external SIGTERM/SIGINT must still restore the
+  // terminal (codex live review). Setup failure rolls back whatever was
+  // already engaged before rethrowing.
+  try {
+    if (altScreen) stdout.write(ENTER_ALT);
+    if (interactive) {
+      stdin.setRawMode(true);
+      stdin.resume();
+      stdin.on('data', onData);
+    }
     process.on('SIGINT', onSignal);
     process.on('SIGTERM', onSignal);
+    stdout.on('resize', onResize);
+  } catch (error) {
+    close();
+    throw error;
   }
-  stdout.on('resize', onResize);
 
-  let closed = false;
-  return {
-    interactive,
-    width: frameWidth,
-    close: () => {
-      if (closed) return;
-      closed = true;
-      stdout.off('resize', onResize);
-      if (interactive) {
-        stdin.off('data', onData);
-        try {
-          stdin.setRawMode(false);
-        } catch {
-          /* stdin already detached */
-        }
-        stdin.pause();
-      } else {
-        process.off('SIGINT', onSignal);
-        process.off('SIGTERM', onSignal);
-      }
-      if (altScreen) stdout.write(LEAVE_ALT);
-    },
-  };
+  return { interactive, width: frameWidth, close };
 }
