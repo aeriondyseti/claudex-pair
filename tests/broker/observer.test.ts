@@ -237,3 +237,118 @@ describe('observer activity stream', () => {
     if (!response.ok) expect(response.error.code).toBe('session-not-active');
   });
 });
+
+describe('observer restart correctness (codex review round 2)', () => {
+  test('transcript ring survives snapshot + restart: acked history and open mail both visible', async () => {
+    const root = await tempRoot();
+    const core = await seeded(root);
+    await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'consumed' } });
+    const got: { deliveryId?: string }[] = [];
+    await core.subscribe('sub1', deliverySink('codex', got), 'codex', 0);
+    await Bun.sleep(50);
+    await core.ack('a1', got[0]!.deliveryId!, 'client-b');
+    await core.execute('answer', 'client-b', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'answer', turn: 'pass', body: 'still-open' } });
+    await core.journal.snapshot(); // compaction trims replayable history
+
+    const reopened = makeCore(root);
+    await reopened.recover();
+    const snapshot = await observe(reopened, 'o2', []);
+    const consumed = snapshot.transcript.filter((e) => e.message.body === 'consumed');
+    const open = snapshot.transcript.filter((e) => e.message.body === 'still-open');
+    expect(consumed.length).toBe(1);
+    expect(consumed[0]!.pending).toBeFalse();
+    expect(open.length).toBe(1);
+    expect(open[0]!.pending).toBeTrue();
+  });
+
+  test('legacy snapshot without a transcript ring seeds from openDeliveries: open mail never invisible', async () => {
+    const root = await tempRoot();
+    const core = await seeded(root);
+    await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'unread' } });
+    await core.journal.snapshot();
+    const snapshotPath = join(root, '.pair', 'journal', 'snapshot.json');
+    const legacy = JSON.parse(await Bun.file(snapshotPath).text()) as Record<string, unknown>;
+    delete legacy['transcript']; // pre-ring snapshot format
+    await Bun.write(snapshotPath, JSON.stringify(legacy));
+
+    const reopened = makeCore(root);
+    await reopened.recover();
+    const snapshot = await observe(reopened, 'o3', []);
+    const unread = snapshot.transcript.filter((e) => e.message.body === 'unread');
+    expect(unread.length).toBe(1);
+    expect(unread[0]!.pending).toBeTrue();
+  });
+});
+
+describe('transcript ring cap (codex review round 2)', () => {
+  test('cap evicts closed history only — open mail is always fully retained, even past the cap', async () => {
+    const root = await tempRoot();
+    let n = 0;
+    const core = new BrokerCore(
+      join(root, '.pair'),
+      { clock: systemClock, ids: { messageId: () => `m${String(++n).padStart(4, '0')}` }, mirrors: new FsMirrors(root), codec: fsMessageCodec },
+      DEFAULT_CONFIG,
+      { onStopped: () => undefined, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
+    );
+    await core.recover();
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'cap', agents: ['claude', 'codex'], driver: 'claude' } });
+    for (let i = 0; i < 210; i++) {
+      const r = await core.execute(`send-${i}`, 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: `q${i}` } });
+      expect(r.ok).toBeTrue();
+    }
+    // 210 open messages with a cap of 200: nothing may be dropped.
+    let snapshot = await observe(core, 'cap-1', []);
+    expect(snapshot.transcript.length).toBe(210);
+    expect(snapshot.transcript.every((e) => e.pending)).toBeTrue();
+    core.onConnection('cap-1', 'close');
+
+    // Close 15, then one more send triggers eviction of CLOSED entries only.
+    const openIds = core.journal.openDeliveries().slice(0, 15).map((d) => d.deliveryId);
+    for (const [i, id] of openIds.entries()) await core.ack(`ack-${i}`, id, 'client-b');
+    await core.execute('send-final', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: 'final' } });
+    snapshot = await observe(core, 'cap-2', []);
+    expect(snapshot.transcript.length).toBe(200); // trimmed back to cap
+    expect(snapshot.transcript.filter((e) => e.pending).length).toBe(196); // 195 survivors + final, none evicted
+  }, 30_000);
+});
+
+describe('observer idle semantics', () => {
+  test('an attached observer does not pin the daemon against idle exit; a participant does', async () => {
+    const root = await tempRoot();
+    let stoppedIdle = 0;
+    const core = new BrokerCore(
+      join(root, '.pair'),
+      { clock: systemClock, ids: systemIds, mirrors: new FsMirrors(root), codec: fsMessageCodec },
+      { ...DEFAULT_CONFIG, idleGraceMs: 1_000 },
+      { onStopped: (reason) => { if (reason === 'idle') stoppedIdle += 1; }, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
+    );
+    await core.recover();
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'idle', agents: ['claude', 'codex'], driver: 'claude' } });
+    // Observer-only connection: must NOT count as busyness.
+    core.onConnection('watch-conn', 'open');
+    const watchSink: ObserverSink = { id: 'watch-conn', sendObserver: async () => undefined };
+    expect((await core.observe('obs', watchSink)).ok).toBeTrue();
+    core.startIdleMonitor();
+    for (let i = 0; i < 60 && stoppedIdle === 0; i++) await Bun.sleep(50);
+    core.stopIdleMonitor();
+    expect(stoppedIdle).toBeGreaterThan(0); // idle fired despite the observer
+
+    // Control: a participant subscription DOES pin the broker.
+    let stoppedIdle2 = 0;
+    const root2 = await tempRoot();
+    const core2 = new BrokerCore(
+      join(root2, '.pair'),
+      { clock: systemClock, ids: systemIds, mirrors: new FsMirrors(root2), codec: fsMessageCodec },
+      { ...DEFAULT_CONFIG, idleGraceMs: 1_000 },
+      { onStopped: (reason) => { if (reason === 'idle') stoppedIdle2 += 1; }, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
+    );
+    await core2.recover();
+    await core2.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'busy', agents: ['claude', 'codex'], driver: 'claude' } });
+    core2.onConnection('sub-conn', 'open');
+    await core2.subscribe('sub', { id: 'sub-conn', sendDelivery: async () => undefined, sendError: async () => undefined }, 'codex', 0);
+    core2.startIdleMonitor();
+    await Bun.sleep(1_800);
+    core2.stopIdleMonitor();
+    expect(stoppedIdle2).toBe(0); // participant connection keeps it alive
+  }, 15_000);
+});

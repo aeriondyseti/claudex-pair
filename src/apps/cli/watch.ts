@@ -75,14 +75,29 @@ async function runBrokerWatch(root: string, options: WatchOptions): Promise<numb
     state = fromSnapshot(session.snapshot);
     const redraw = () => screen.draw(render(brokerVm(state!), options));
     redraw();
+    if (state.session.status !== 'active') {
+      // A completed session pushes nothing more — exit after the final
+      // frame instead of waiting forever on the push loop (codex review);
+      // this also releases the daemon to idle out.
+      await session.close();
+      await gateway.close();
+      process.stdout.write('\nSession is no longer active — watch exiting.\n');
+      return 0;
+    }
     const ticker = setInterval(redraw, AGE_TICK_MS); // ages tick locally
+    let gap = false;
     try {
       for await (const push of session.pushes) {
-        applyPush(state, push);
+        const outcome = applyPush(state, push);
+        if (outcome === 'gap') {
+          // Lost frames — never skip over the hole; rebuild from a fresh
+          // snapshot (stream contract in applyPush).
+          gap = true;
+          break;
+        }
+        if (outcome === 'duplicate') continue;
         redraw();
         if (state.session.status !== 'active') {
-          // Final state rendered; exiting releases the daemon to idle out
-          // instead of an attached watch pinning a completed session.
           clearInterval(ticker);
           await session.close();
           await gateway.close();
@@ -97,12 +112,8 @@ async function runBrokerWatch(root: string, options: WatchOptions): Promise<numb
       await session.close();
       await gateway.close();
     }
-    if (state.session.status !== 'active') {
-      process.stdout.write('\nSession is no longer active — watch exiting.\n');
-      return 0;
-    }
     state.connected = false;
-    screen.draw(render(brokerVm(state, ['broker connection lost — reattaching…']), options));
+    screen.draw(render(brokerVm(state, [gap ? 'observer stream gap — reattaching for a fresh snapshot…' : 'broker connection lost — reattaching…']), options));
     await systemClock.sleep(REATTACH_DELAY_MS);
   }
 }
@@ -126,15 +137,25 @@ function fromSnapshot(snapshot: ObserverSnapshotDto): BrokerWatchState {
   };
 }
 
-function applyPush(state: BrokerWatchState, push: ObserverPush): void {
+/**
+ * Stream continuity contract (codex review, afterSeq-omission rider): every
+ * journal txn is exactly one activity push, so a healthy stream is strictly
+ * seq === head+1. `duplicate` (seq <= head) is dropped; `gap` (seq > head+1)
+ * means frames were lost — the caller must reattach for a fresh snapshot,
+ * never skip over the hole.
+ */
+function applyPush(state: BrokerWatchState, push: ObserverPush): 'applied' | 'duplicate' | 'gap' {
   if (push.kind === 'presence') {
     state.liveness = push.liveness;
-    return;
+    // Presence carries the real broker heartbeat; activity's `at` is txn
+    // time and must never be relabeled as a heartbeat (codex review).
+    if (push.liveness.broker) state.broker = { ...state.broker, heartbeatAt: push.liveness.broker.heartbeatAt };
+    return 'applied';
   }
-  if (push.seq <= state.headSeq) return; // defensive: never re-apply history
+  if (push.seq <= state.headSeq) return 'duplicate';
+  if (push.seq > state.headSeq + 1) return 'gap';
   state.session = push.session;
   state.headSeq = push.seq;
-  if (push.at && state.broker) state.broker = { ...state.broker, heartbeatAt: push.at };
   for (const event of push.events) {
     if (event.kind !== 'message-sent') continue;
     state.entries.set(`${event.id}:${event.to}`, { message: toStored(event), pending: true });
@@ -147,6 +168,7 @@ function applyPush(state: BrokerWatchState, push: ObserverPush): void {
     const entry = state.entries.get(id);
     if (entry) state.entries.set(id, { ...entry, pending: false, voided: true });
   }
+  return 'applied';
 }
 
 function toStored(event: Extract<Event, { kind: 'message-sent' }>): StoredMessage {

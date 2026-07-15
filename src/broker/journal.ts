@@ -56,6 +56,10 @@ export type Snapshot = {
   lastDeliverySeq: number;
   dedup: Record<string, Record<string, unknown>>; // clientId → reqId → outcome
   openDeliveries: OpenDelivery[];
+  /** Bounded recent-history ring (observer snapshots). Optional: legacy
+   * snapshots lack it — recovery then seeds the ring from openDeliveries so
+   * pre-snapshot open mail is never invisible to watch (codex review). */
+  transcript?: TranscriptRecord[];
 };
 
 export class CorruptJournalError extends Error {
@@ -164,6 +168,12 @@ export class Journal {
       this.lastDeliverySeq = snapshot.lastDeliverySeq;
       this.dedup = new Map(Object.entries(snapshot.dedup).map(([c, m]) => [c, new Map(Object.entries(m))]));
       this.open_ = new Map(snapshot.openDeliveries.map((d) => [d.deliveryId, d]));
+      // Restore the transcript ring; a legacy snapshot without one still
+      // must not hide real open mail from observers — seed from open set.
+      const seeded = snapshot.transcript ?? snapshot.openDeliveries.map(
+        (d): TranscriptRecord => ({ deliveryId: d.deliveryId, message: d.message, state: 'open' }),
+      );
+      this.transcript_ = new Map(seeded.map((t) => [t.deliveryId, t]));
     }
     const segments = (await readdir(this.dir)).filter((n) => /^segment-\d{6}\.jsonl$/.test(n)).sort();
     for (let s = 0; s < segments.length; s++) {
@@ -208,10 +218,14 @@ export class Journal {
         if (ref) {
           this.open_.set(ref.deliveryId, { ...ref, message: event });
           this.transcript_.set(ref.deliveryId, { deliveryId: ref.deliveryId, message: event, state: 'open' });
-          while (this.transcript_.size > TRANSCRIPT_RING_MAX) {
-            const oldest = this.transcript_.keys().next().value;
-            if (oldest === undefined) break;
-            this.transcript_.delete(oldest);
+          // Cap evicts CLOSED history only — an open delivery is live mail
+          // the watch must never undercount (codex review); the ring may
+          // temporarily exceed the cap if everything in it is still open.
+          if (this.transcript_.size > TRANSCRIPT_RING_MAX) {
+            for (const [key, record] of this.transcript_) {
+              if (this.transcript_.size <= TRANSCRIPT_RING_MAX) break;
+              if (record.state !== 'open') this.transcript_.delete(key);
+            }
           }
         }
       }
@@ -340,6 +354,7 @@ export class Journal {
       lastDeliverySeq: this.lastDeliverySeq,
       dedup: Object.fromEntries([...this.dedup].map(([c, m]) => [c, Object.fromEntries(m)])),
       openDeliveries: this.openDeliveries(),
+      transcript: this.transcript(),
     };
     const target = join(this.dir, 'snapshot.json');
     const tmp = join(this.dir, `snapshot.json.${process.pid}.tmp`);
