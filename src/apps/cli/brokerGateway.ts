@@ -13,12 +13,20 @@ export class BrokerWireError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = 'BrokerWireError'; }
 }
 
+/** Subscription reconnect policy: ~250ms → 4s capped backoff, bounded so a
+ * permanently-gone broker fails the stream instead of retrying forever
+ * (and each rediscover may spawn — bounding prevents a spawn storm). */
+export type ReconnectPolicy = { maxAttempts: number; baseDelayMs: number; maxDelayMs: number };
+const DEFAULT_RECONNECT: ReconnectPolicy = { maxAttempts: 6, baseDelayMs: 250, maxDelayMs: 4_000 };
+
 type Connector = { readonly clientId: string; connect(spawnIfAbsent?: boolean): Promise<IpcClient>; rediscover(): Promise<IpcClient> };
 
 export class BrokerGateway implements ProtocolGateway, BrokerControl {
   private client: IpcClient | undefined;
   readonly clientId: string;
-  constructor(private readonly connector: Connector) { this.clientId = connector.clientId; }
+  constructor(private readonly connector: Connector, private readonly reconnectPolicy: ReconnectPolicy = DEFAULT_RECONNECT) {
+    this.clientId = connector.clientId;
+  }
 
   static forRoot(root: string): BrokerGateway { return new BrokerGateway(new BrokerDiscovery({ root })); }
   static forClient(client: IpcClient): BrokerGateway {
@@ -61,6 +69,16 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     };
   }
 
+  /**
+   * Reconnect hardening (post-slice-2 micro-slice): a dropped subscription
+   * connection retries with bounded exponential backoff instead of dying
+   * after one attempt — broker churn (idle exit + respawn, restarts) must
+   * not kill a fused wait. Identity and cursor are preserved across
+   * reconnects: same clientId (connector-owned), afterDeliverySeq = last
+   * ACKED cursor, so open/unacked-beats-cursor redelivers anything in
+   * flight. close() cancels an in-progress reconnect; attempts exhausted
+   * fails the delivery stream.
+   */
   async subscribe(as: AgentId, afterDeliverySeq: number): Promise<DeliverySubscription> {
     const queue = new AsyncQueue<Delivery>();
     let client = await this.getClient(true);
@@ -70,13 +88,30 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     const sequences = new Map<string, number>();
     let offDelivery = () => {};
     let offClose = () => {};
+    const reconnect = async (): Promise<void> => {
+      let delay = this.reconnectPolicy.baseDelayMs;
+      for (let attempt = 1; active; attempt++) {
+        try {
+          const next = await this.connector.rediscover();
+          if (!active) { next.close(); return; }
+          await attach(next);
+          return;
+        } catch (error) {
+          if (!active) return;
+          if (attempt >= this.reconnectPolicy.maxAttempts) { queue.fail(error); return; }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.min(delay * 2, this.reconnectPolicy.maxDelayMs);
+        }
+      }
+    };
     const attach = async (next: IpcClient) => {
       client = next;
       this.client = next;
       offDelivery = client.onDelivery((frame) => { sequences.set(frame.deliveryId, frame.deliverySeq); queue.push(toDelivery(frame)); });
       offClose = client.onClose(() => {
         if (!active || reconnecting) return;
-        reconnecting = this.connector.rediscover().then(attach).catch((error) => queue.fail(error)).finally(() => { reconnecting = undefined; });
+        offDelivery(); offClose();
+        reconnecting = reconnect().finally(() => { reconnecting = undefined; });
       });
       expectOk(await client.subscribe(as, cursor));
     };

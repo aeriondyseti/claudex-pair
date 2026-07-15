@@ -96,7 +96,7 @@ describe('watch event loop host', () => {
       seen.push(event);
       return reduceWatch(state, event);
     };
-    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 25 });
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 25, write: () => undefined });
     await until(() => seen.some((e) => e.kind === 'connection' && e.state === 'reattaching'));
     await until(() => spawnArgs.length >= 2); // at least one RETRY happened
     const started = Date.now();
@@ -129,7 +129,7 @@ describe('watch event loop host', () => {
       seen.push(event);
       return reduceWatch(state, event);
     };
-    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 10 });
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 10, write: () => undefined });
     await until(() => seen.some((e) => e.kind === 'attach' && e.snapshot.seq === 10));
     // Force a reattach via stream gap.
     first.emit({ kind: 'activity', seq: 16, at: 't', principal: 'p', events: [], session: sessionState, ackedDeliveryIds: [], voidedDeliveryIds: [] });
@@ -156,7 +156,7 @@ describe('watch event loop host', () => {
       seen.push(event);
       return reduceWatch(state, event);
     };
-    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 10 });
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2 }, spy, { gateway, terminal: term.factory, reattachDelayMs: 10, write: () => undefined });
     await until(() => seen.some((e) => e.kind === 'attach' && e.snapshot.seq === 10));
     // Stream gap: seq jumps far beyond head → reducer orders a reattach;
     // closing the first session fails its pump stream (like a socket).
@@ -199,7 +199,7 @@ describe('watch event loop host', () => {
       seen.push(event);
       return reduceWatch(state, event);
     };
-    const loop = runFsEventLoop('unused-root', { tail: 5, refreshSec: 0.02 }, spy, { fsDeps, terminal: term.factory });
+    const loop = runFsEventLoop('unused-root', { tail: 5, refreshSec: 0.02 }, spy, { fsDeps, terminal: term.factory, write: () => undefined });
     await until(() => seen.filter((e) => e.kind === 'replace-model').length >= 3);
     expect(maxInFlight).toBe(1); // serialized by construction
     const models = seen.filter((e): e is Extract<WatchEvent, { kind: 'replace-model' }> => e.kind === 'replace-model');

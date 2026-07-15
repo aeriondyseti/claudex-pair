@@ -50,12 +50,16 @@ export function frameWidth(): number {
 
 /** Clear-and-redraw with a frame-equality gate — the FINAL render coalescer
  * (seam amendment 4); the reducer's render effect is only semantic
- * eligibility. */
+ * eligibility. Writer injectable so tests keep their output clean. */
 export class Screen {
   #last = '';
+  readonly #write: (chunk: string) => void;
+  constructor(write: (chunk: string) => void = (chunk) => void process.stdout.write(chunk)) {
+    this.#write = write;
+  }
   draw(frame: string): void {
     if (frame === this.#last) return;
-    process.stdout.write(`\x1b[2J\x1b[H${frame}`);
+    this.#write(`\x1b[2J\x1b[H${frame}`);
     this.#last = frame;
   }
 }

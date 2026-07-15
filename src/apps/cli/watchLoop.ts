@@ -37,20 +37,24 @@ export type WatchLoopHooks = {
   reattachDelayMs?: number;
   /** fs-diagnostic mode: injected deps for deterministic poller tests. */
   fsDeps?: ReturnType<typeof bindFsDeps>;
+  /** Frame/banner writer (default stdout) — tests inject a sink. */
+  write?: (chunk: string) => void;
 };
 
 const REATTACH_DELAY_MS = 1_000;
 const AGE_TICK_MS = 1_000;
 
 /** diffWatchFrame is the final coalescer; this sink just writes its output. */
-function frameSink(): (state: WatchTuiState) => void {
+function frameSink(write: (chunk: string) => void): (state: WatchTuiState) => void {
   let last = '';
   return (state) => {
     const diff = diffWatchFrame(state, last);
     last = diff.current;
-    if (diff.frame !== undefined) process.stdout.write(`\x1b[2J\x1b[H${diff.frame}`);
+    if (diff.frame !== undefined) write(`\x1b[2J\x1b[H${diff.frame}`);
   };
 }
+
+const stdoutWrite = (chunk: string): void => void process.stdout.write(chunk);
 
 type EffectHost = {
   render: (state: WatchTuiState) => void;
@@ -77,7 +81,8 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   const gateway = hooks.gateway ?? BrokerGateway.forRoot(root);
   const reattachDelayMs = hooks.reattachDelayMs ?? REATTACH_DELAY_MS;
   const queue = new WatchEventQueue();
-  const banner = new Screen();
+  const write = hooks.write ?? stdoutWrite;
+  const banner = new Screen(write);
   const openTerm = hooks.terminal ?? openTerminal;
   const term = openTerm({
     onQuit: () => queue.push({ kind: 'key', key: 'quit' }),
@@ -149,7 +154,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   try {
     startAttach();
     return await consumeEvents(queue, reduce, state, {
-      render: frameSink(),
+      render: frameSink(write),
       reattach: async () => {
         // Invalidate BEFORE the intentional close: the dying pump's error
         // callback must never enqueue a stale 'lost' that would tear down
@@ -201,7 +206,7 @@ export async function runFsEventLoop(root: string, options: WatchLoopOptions, re
   void pollLoop();
   const ticker = setInterval(() => queue.push({ kind: 'tick', now: deps.clock.now() }), AGE_TICK_MS);
   try {
-    return await consumeEvents(queue, reduce, state, { render: frameSink() });
+    return await consumeEvents(queue, reduce, state, { render: frameSink(hooks.write ?? stdoutWrite) });
   } finally {
     stopped = true;
     if (pollTimer) clearTimeout(pollTimer);

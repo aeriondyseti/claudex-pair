@@ -56,10 +56,11 @@ describe('openTerminal cleanup', () => {
   });
 
   test('setup failure rolls back: alt screen left, no dangling signal handlers, and the error propagates', () => {
-    const { io, writes } = fakeIo({ rawThrows: true });
+    const { io, writes, raw } = fakeIo({ rawThrows: true });
     const before = { int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM') };
     expect(() => openTerminal({ onQuit: () => undefined, onResize: () => undefined }, { io })).toThrow('setRawMode failed');
     expect(writes).toEqual([ENTER_ALT, LEAVE_ALT]); // engaged, then rolled back
+    expect(raw).toEqual([false]); // rollback actively restored cooked mode
     expect(process.listenerCount('SIGINT')).toBe(before.int);
     expect(process.listenerCount('SIGTERM')).toBe(before.term);
   });
