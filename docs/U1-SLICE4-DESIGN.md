@@ -1,8 +1,9 @@
-# U1 slice 4 — privileged user actions (design, pre-code)
+# U1 slice 4 — privileged user actions (DELIVERED)
 
 Status: REV 6 — APPROVED (codex hash-specific verdict `20260720-115032-857`
-at commit d449c0c). Both critique rounds and all tails are incorporated;
-all five open questions ruled. 4a implementation in progress, tests-first.
+at commit d449c0c) and DELIVERED: 4a approved through 3b05eb7
+(`20260720-125356-764`), 4b implemented through e899cb7 with the full
+F-A1..A12 matrix pinned. This document is the as-built record.
 Builds on slice 3 (advisory user channel: TOFU
 credential, connection-bound auth, `user-message`, watch composer).
 Upstream requirements: ENHANCEMENTS.md U1 ("state changes go through

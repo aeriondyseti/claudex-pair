@@ -132,8 +132,9 @@ user's provenance. Agent obligations:
 - If your wait terminates with **`YOU WERE REMOVED FROM THE SESSION`**:
   stop all work immediately, do not re-arm the wait, do not send — report
   to your human.
-- (Slice 4b, forthcoming) `session-paused` rejections mean the user froze
-  the session: stand by for resume; do not re-send, do not end.
+- A `session-paused` rejection means the user froze the session (`/pause`):
+  stand by for resume — mutations are accepted again after `/resume`; retry
+  only if still appropriate. Do not re-send meanwhile, do not end.
 
 ## Session lifecycle
 
