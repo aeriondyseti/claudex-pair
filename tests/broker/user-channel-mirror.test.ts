@@ -20,7 +20,7 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 
 const base: SessionState = {
   task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude',
-  status: 'active', started: 's', grants: {},
+  status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} },
 };
 const registered: SessionState = { ...base, userChannelTokenHash: 'a'.repeat(64) };
 

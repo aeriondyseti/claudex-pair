@@ -11,7 +11,7 @@ export type CommandMeta = {
 };
 
 export type Command =
-  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId }
+  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; displays?: Readonly<Record<AgentId, string>> }
   // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
   // message answers. Advisory metadata in the core; the broker derives the
   // awaiting-set from it. Never affects turn semantics.

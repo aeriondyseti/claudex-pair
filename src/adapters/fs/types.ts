@@ -1,4 +1,4 @@
-import type { AgentId, Grant, GrantScope, GrantState, MessageId, MessageType, Timestamp, TurnMode } from '@core/types.ts';
+import type { AgentId, Grant, GrantScope, GrantState, MessageId, MessageType, Registry, Timestamp, TurnMode } from '@core/types.ts';
 
 export type DiskSession = {
   task: string;
@@ -8,6 +8,9 @@ export type DiskSession = {
   turn: AgentId;
   status: 'active' | 'paused' | 'completed';
   started: Timestamp;
+  /** M1: mirrored lifecycle registry. Optional — legacy sessions lack it
+   * and consumers synthesize v0 from agents[]. */
+  registry?: Registry;
 };
 
 export type DiskGrant = {

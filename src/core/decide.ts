@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { MAX_AGENTS, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -223,7 +223,10 @@ function decideUserKick(
     );
   }
   const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
-  const events: Event[] = [{ kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at }];
+  const events: Event[] = [
+    { kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at },
+    { kind: 'registry-updated', version: s.registry.version + 1, change: 'kicked', agent: command.agent, at: envelope.meta.at },
+  ];
   for (const g of Object.values(s.grants)) {
     if (g.assignee === command.agent && (g.state === 'offered' || g.state === 'active')) {
       events.push({ kind: 'grant-cancelled', grantId: g.id, reason: `assignee kicked by the user${reasonSuffix}`, at: envelope.meta.at });
@@ -377,6 +380,7 @@ function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   }
   const events: Event[] = [
     { kind: 'agent-left', agent, at: envelope.meta.at },
+    { kind: 'registry-updated', version: s.registry.version + 1, change: 'left', agent, at: envelope.meta.at },
     messageEvent(envelope, agent, s.driver, 'leave', `${agent} left the session.`),
   ];
   if (s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
@@ -407,8 +411,12 @@ function decideJoin(
   if (!AGENT_NAME_PATTERN.test(command.agent)) {
     return err(new ProtocolError('invalid-agents', `invalid agent name '${command.agent}' (lowercase letter first, then letters/digits/dash/underscore, max 16 chars)`));
   }
+  if (s.agents.length >= MAX_AGENTS) {
+    return err(new ProtocolError('registry-full', `The roster is at the M1 bound (${MAX_AGENTS} live agents) — someone must leave before '${command.agent}' can join.`));
+  }
   return ok([
     { kind: 'agent-joined', agent: command.agent, at: envelope.meta.at },
+    { kind: 'registry-updated', version: s.registry.version + 1, change: 'joined', agent: command.agent, at: envelope.meta.at },
     messageEvent(
       envelope,
       by,
@@ -442,7 +450,10 @@ function decideKick(
     return err(new ProtocolError('kick-driver', 'The driver cannot be kicked — hand off first.'));
   }
   const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
-  const events: Event[] = [{ kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at }];
+  const events: Event[] = [
+    { kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at },
+    { kind: 'registry-updated', version: s.registry.version + 1, change: 'kicked', agent: command.agent, at: envelope.meta.at },
+  ];
   for (const g of Object.values(s.grants)) {
     if (g.assignee === command.agent && (g.state === 'offered' || g.state === 'active')) {
       events.push({ kind: 'grant-cancelled', grantId: g.id, reason: `assignee kicked${reasonSuffix}`, at: envelope.meta.at });
@@ -541,6 +552,9 @@ function decideInit(
       );
     }
   }
+  if (agents.length > MAX_AGENTS) {
+    return err(new ProtocolError('invalid-agents', `at most ${MAX_AGENTS} agents per session (M1 registry bound); got ${agents.length}`));
+  }
   if (!agents.includes(command.driver)) {
     return err(new ProtocolError('driver-not-agent', `driver '${command.driver}' must be one of the agents: ${agents.join(', ')}`));
   }
@@ -556,7 +570,10 @@ function decideInit(
       ),
     );
   }
-  return ok([{ kind: 'session-initialized', task: command.task, agents, driver: command.driver, at }]);
+  return ok([
+    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.displays === undefined ? {} : { displays: command.displays }) },
+    { kind: 'registry-updated', version: 1, change: 'init', at },
+  ]);
 }
 
 function messageEvent(

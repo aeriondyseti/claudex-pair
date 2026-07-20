@@ -47,6 +47,7 @@ function buildState(given: Row['given']): SessionState | undefined {
   for (const [id, g] of Object.entries(grantsIn)) grants[id] = buildGrant(id, g);
   return {
     task: (given['task'] as string | undefined) ?? 'work',
+    registry: { version: 1, agents: Object.fromEntries(agents.map((a) => [a, { id: a, display: a, status: 'active' as const, joinedAt: 's' }])) },
     agents,
     driver,
     turn: (given['turn'] as string | undefined) ?? driver,

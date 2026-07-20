@@ -62,6 +62,7 @@ export class FsSessionStore {
       task: session.task, agents: [...session.agents], driver: session.driver,
       navigators: [...session.navigators], turn: session.turn,
       status: session.status, started: session.started,
+      ...(session.registry === undefined ? {} : { registry: session.registry }),
     };
     await writeFile(temp, JSON.stringify(disk, null, 2), 'utf8');
     await rename(temp, target);

@@ -16,7 +16,7 @@ const base: SessionState = {
   turn: 'codex',
   status: 'active',
   started: 't0',
-  grants: {},
+  grants: {}, registry: { version: 1, agents: {} },
 };
 
 const env = (principal: string, command: unknown): CommandEnvelope =>
@@ -46,7 +46,7 @@ describe('F17 leave returns the turn in the same txn', () => {
     const r = decide(base, env('codex', { kind: 'leave-session' }));
     expect(r.ok).toBeTrue();
     if (!r.ok) return;
-    expect(r.value.map((e) => e.kind)).toEqual(['agent-left', 'message-sent', 'turn-passed']);
+    expect(r.value.map((e) => e.kind)).toEqual(['agent-left', 'registry-updated', 'message-sent', 'turn-passed']); // M1: membership changes carry provenance
     const turn = r.value.find((e) => e.kind === 'turn-passed');
     expect(turn && turn.kind === 'turn-passed' ? turn.to : undefined).toBe('claude');
     const post = replay([
@@ -79,7 +79,7 @@ describe('F21 kick cancels open grants in the same txn', () => {
     expect(r.ok).toBeTrue();
     if (!r.ok) return;
     const kinds = r.value.map((e) => e.kind);
-    expect(kinds).toEqual(['agent-kicked', 'grant-cancelled', 'message-sent', 'turn-passed']);
+    expect(kinds).toEqual(['agent-kicked', 'registry-updated', 'grant-cancelled', 'message-sent', 'turn-passed']); // M1
     // Only the OPEN grant is cancelled; the done one is untouched.
     const cancelled = r.value.filter((e) => e.kind === 'grant-cancelled');
     expect(cancelled.map((e) => (e.kind === 'grant-cancelled' ? e.grantId : ''))).toEqual(['g1']);
@@ -101,7 +101,7 @@ describe('join is driver-admitted and produces a welcome delivery', () => {
     const r = decide(base, env('claude', { kind: 'join-session', agent: 'agy' }));
     expect(r.ok).toBeTrue();
     if (!r.ok) return;
-    expect(r.value.map((e) => e.kind)).toEqual(['agent-joined', 'message-sent']);
+    expect(r.value.map((e) => e.kind)).toEqual(['agent-joined', 'registry-updated', 'message-sent']); // M1
     const msg = r.value.find((e) => e.kind === 'message-sent');
     expect(msg && msg.kind === 'message-sent' ? { to: msg.to, type: msg.type } : undefined).toEqual({ to: 'agy', type: 'join' });
     const post = replay([

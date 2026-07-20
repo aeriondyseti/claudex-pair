@@ -25,7 +25,12 @@ export type JournalRecord = {
   readonly event: Event;
 };
 export type Event =
-  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp }
+  /** M1: registry-change notification (provenance for subscribers; the
+   * membership event itself mutates the registry in evolve, so replaying
+   * pre-M1 journals still builds a correct registry). version is the
+   * POST-change registry version. */
+  | { kind: 'registry-updated'; version: number; change: 'init' | 'joined' | 'left' | 'kicked'; agent?: AgentId; at: Timestamp }
+  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; displays?: Readonly<Record<AgentId, string>> }
   | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }

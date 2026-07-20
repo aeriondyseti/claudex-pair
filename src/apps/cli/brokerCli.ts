@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { Command, GrantScopeInput } from '@core/commands.ts';
 import { resolveRecipient } from '@core/queries.ts';
-import type { AgentId, MessageType, TurnMode } from '@core/types.ts';
+import { MAX_AGENTS, type AgentId, type MessageType, type TurnMode } from '@core/types.ts';
 import type { ExecuteOutcome, StatusDto } from '@app/ports/gateway.ts';
 import { systemClock, systemIds } from '@adapters/clock/index.ts';
 import { BrokerGateway, BrokerWireError } from './brokerGateway.ts';
@@ -44,9 +44,13 @@ export async function runBrokerCli(
     }
     if (command === 'init') {
       const task = required(flags, 'task', "init requires -Task '<what the agents are building>'");
-      const agents = (str(flags, 'agents') ?? 'claude,codex').split(',').map((a) => a.trim().toLowerCase()).filter(Boolean);
+      // M1 ids-vs-display: each -Agents token is `id[=Display Name]`; the id
+      // stays filesystem-safe, the display is presentation-only.
+      const tokens = (str(flags, 'agents') ?? 'claude,codex').split(',').map((t) => t.trim()).filter(Boolean);
+      const agents = tokens.map((t) => t.split('=')[0]!.trim().toLowerCase());
+      const displays = Object.fromEntries(tokens.flatMap((t) => { const eq = t.indexOf('='); return eq > 0 ? [[t.slice(0, eq).trim().toLowerCase(), t.slice(eq + 1).trim()]] : []; }));
       const driver = (str(flags, 'driver') ?? 'claude').toLowerCase();
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver });
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, ...(Object.keys(displays).length ? { displays } : {}) });
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);
@@ -183,7 +187,10 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
   }
 }
 
-function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
+  const reg = s.session.registry;
+  const left = Object.values(reg.agents).filter((a) => a.status === 'left').map((a) => a.id);
+  out(`Registry:  v${reg.version} (${s.session.agents.length} live, cap ${MAX_AGENTS}${left.length ? `; left: ${left.join(', ')}` : ''})`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));

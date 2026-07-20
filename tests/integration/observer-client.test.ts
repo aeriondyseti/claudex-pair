@@ -13,7 +13,7 @@ import { BrokerGateway } from '../../src/apps/cli/brokerGateway.ts';
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-const session = { task: 'observed', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: '2026-07-14 18:00:00', grants: {} } as const;
+const session = { task: 'observed', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: '2026-07-14 18:00:00', grants: {}, registry: { version: 1, agents: {} } } as const;
 
 const snapshot: ObserverSnapshotDto = {
   seq: 7,

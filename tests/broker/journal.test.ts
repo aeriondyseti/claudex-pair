@@ -222,3 +222,22 @@ describe('journal item-7 untagged compatibility rule (round 2)', () => {
     expect(journal.awaiting().map((a) => a.messageId)).toEqual(['b1']);
   });
 });
+
+
+describe('M1: legacy snapshot registry synthesis', () => {
+  test('a pre-M1 snapshot (state without registry) recovers with a synthesized v0 registry', async () => {
+    const { journal, pairDir } = await freshJournal();
+    await commitInit(journal);
+    await journal.snapshot();
+    const snapPath = join(pairDir, 'journal', 'snapshot.json');
+    const snap = JSON.parse(await readFile(snapPath, 'utf8')) as { state?: { registry?: unknown; agents?: string[] } };
+    delete snap.state!.registry; // simulate a pre-M1 snapshot
+    await Bun.write(snapPath, JSON.stringify(snap));
+
+    const reopened = new Journal(pairDir);
+    await reopened.recover();
+    expect(reopened.sessionState?.registry.version).toBe(0);
+    expect(Object.keys(reopened.sessionState?.registry.agents ?? {})).toEqual(['claude', 'codex', 'agy']);
+    expect(reopened.sessionState?.registry.agents['claude']).toMatchObject({ status: 'active', display: 'claude' });
+  });
+});

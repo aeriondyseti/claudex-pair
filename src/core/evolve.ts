@@ -1,5 +1,5 @@
 import type { Event } from './events.ts';
-import type { SessionState } from './types.ts';
+import type { AgentRecord, SessionState } from './types.ts';
 
 /**
  * Pure fold: state = events.reduce(evolve, undefined). Total over every
@@ -17,6 +17,10 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         status: 'active',
         started: event.at,
         grants: {},
+        registry: {
+          version: 1,
+          agents: Object.fromEntries(event.agents.map((a) => [a, liveRecord(a, event.at, event.displays?.[a])])),
+        },
       };
     case 'turn-passed':
       return state && { ...state, turn: event.to };
@@ -69,9 +73,43 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state;
     case 'agent-left':
     case 'agent-kicked':
-      return state && { ...state, agents: state.agents.filter((a) => a !== event.agent) };
+      return (
+        state && {
+          ...state,
+          agents: state.agents.filter((a) => a !== event.agent),
+          registry: {
+            version: state.registry.version + 1,
+            agents: {
+              ...state.registry.agents,
+              [event.agent]: {
+                ...(state.registry.agents[event.agent] ?? liveRecord(event.agent, event.at)),
+                status: 'left',
+                leftAt: event.at,
+              },
+            },
+          },
+        }
+      );
     case 'agent-joined':
-      return state && { ...state, agents: [...state.agents, event.agent] };
+      return (
+        state && {
+          ...state,
+          agents: [...state.agents, event.agent],
+          registry: {
+            version: state.registry.version + 1,
+            agents: {
+              ...state.registry.agents,
+              // Rejoin is a NEW admission: fresh joinedAt, leftAt cleared;
+              // the display survives from the previous record.
+              [event.agent]: liveRecord(event.agent, event.at, state.registry.agents[event.agent]?.display),
+            },
+          },
+        }
+      );
+    case 'registry-updated':
+      // Notification/provenance only — the membership event carries the
+      // registry mutation, so pre-M1 journals replay correctly.
+      return state;
     case 'message-sent':
       return state; // delivery is the Mailbox port's concern, not session state
     case 'user-channel-registered':
@@ -83,6 +121,10 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
 
 export function replay(events: readonly Event[]): SessionState | undefined {
   return events.reduce<SessionState | undefined>(evolve, undefined);
+}
+
+function liveRecord(id: string, at: string, display?: string): AgentRecord {
+  return { id, display: display ?? id, status: 'active', joinedAt: at };
 }
 
 function updateGrant(

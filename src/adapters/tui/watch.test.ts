@@ -13,7 +13,7 @@ const session: SessionState = {
   turn: 'codex',
   status: 'active',
   started: '2026-07-14 18:00:00',
-  grants: {},
+  grants: {}, registry: { version: 1, agents: {} },
 };
 
 const message = (overrides: Partial<StoredMessage['header']> = {}): StoredMessage => ({

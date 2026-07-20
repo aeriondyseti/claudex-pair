@@ -168,6 +168,22 @@ user's provenance. Agent obligations:
   stand by for resume — mutations are accepted again after `/resume`; retry
   only if still appropriate. Do not re-send meanwhile, do not end.
 
+## Agent registry (M1)
+
+The session carries a lifecycle **registry**: one record per participant —
+filesystem-safe `id` (the protocol identity), presentation-only `display`
+(`pair init -Agents 'codex=Codex CLI'`), optional `cliType`/`role`, and a
+lifecycle status (`active`/`left` with joined/left timestamps). `agents`
+remains the live-member projection. Every membership change (init, join,
+leave, kick — driver or user) bumps a **monotonic registry version** and
+emits a `registry_updated` event to subscribers; `pair status` prints the
+version. The roster is bounded at **8 live agents** (fail-closed at init
+and join; a departure frees the slot). Rejoin is a new admission: fresh
+`joinedAt`, display preserved. Pre-M1 sessions synthesize a v0 registry
+from `agents[]`. Peer-model electorate snapshots key on the registry
+version; admission *authorization* (beyond driver admittance) arrives with
+the peer-model slices.
+
 ## Session lifecycle
 
 1. **Init** — whichever agent is asked first runs

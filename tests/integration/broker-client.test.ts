@@ -11,7 +11,7 @@ import { printDeliveryThenAck } from '../../src/apps/cli/brokerWait.ts';
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-const session = { task: 'broker client', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: '2026-07-14 17:00:00', grants: {} } as const;
+const session = { task: 'broker client', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: '2026-07-14 17:00:00', grants: {}, registry: { version: 1, agents: {} } } as const;
 const status: StatusDto = { session, navigators: ['codex'], openGrants: [], pending: { claude: [], codex: [] }, recent: [] };
 const message = { name: 'm-codex.md', header: { id: 'm', from: 'claude', to: 'codex', type: 'ask', turn: 'pass', sent: '2026-07-14 17:00:00' }, body: 'review', raw: '---\nid: m\n---\n\nreview' };
 

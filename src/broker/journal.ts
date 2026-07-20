@@ -125,6 +125,22 @@ const segmentName = (n: number) => `segment-${String(n).padStart(6, '0')}.jsonl`
 /** Legacy-snapshot fallback only: replay the shared rule over the bounded
  * transcript. Honest gap — an ask already trimmed from a LEGACY snapshot's
  * ring is unrecoverable; every new snapshot persists awaiting first-class. */
+/** M1 legacy tolerance: a pre-M1 snapshot's state has no registry —
+ * synthesize v0 from the live roster (joinedAt = session start; correct
+ * versioning begins with the next membership change). */
+function normalizeRegistry(state: SessionState | undefined): SessionState | undefined {
+  if (!state) return state;
+  const legacy = state as SessionState & { registry?: SessionState['registry'] };
+  if (legacy.registry) return state;
+  return {
+    ...legacy,
+    registry: {
+      version: 0,
+      agents: Object.fromEntries(legacy.agents.map((a) => [a, { id: a, display: a, status: 'active' as const, joinedAt: legacy.started }])),
+    },
+  };
+}
+
 function legacyAwaitingFrom(transcript: readonly TranscriptRecord[]): AwaitingEntry[] {
   const map = new Map<string, AwaitingEntry>();
   for (const t of transcript) {
@@ -188,7 +204,7 @@ export class Journal {
     await mkdir(this.dir, { recursive: true });
     const snapshot = await this.loadSnapshot();
     if (snapshot) {
-      this.state = snapshot.state;
+      this.state = normalizeRegistry(snapshot.state);
       this.lastSeq = snapshot.lastSeq;
       this.lastDeliverySeq = snapshot.lastDeliverySeq;
       this.dedup = new Map(Object.entries(snapshot.dedup).map(([c, m]) => [c, new Map(Object.entries(m))]));

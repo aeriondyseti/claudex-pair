@@ -58,6 +58,33 @@ export type Grant = {
   readonly updated: Timestamp;
 };
 
+/** M1 registry: lifecycle record per participant, ids-vs-display split.
+ * The id is the filesystem-safe protocol identity (AGENT_NAME_PATTERN);
+ * display is presentation-only and never appears in paths or headers. */
+export type AgentLifecycle = 'active' | 'left';
+export type AgentRecord = {
+  readonly id: AgentId;
+  readonly display: string;
+  /** Optional adapter hint (claude/codex/agy/...); empty in v1 unless declared. */
+  readonly cliType?: string;
+  readonly role?: string;
+  readonly status: AgentLifecycle;
+  readonly joinedAt: Timestamp;
+  readonly leftAt?: Timestamp;
+};
+
+/** M1: bounded practical roster limit — registry-defined, fail-closed at
+ * init AND join. Raising it is a deliberate registry change, not implied
+ * unbounded scaling (ENHANCEMENTS M1). */
+export const MAX_AGENTS = 8;
+
+export type Registry = {
+  /** Monotonic; bumps on every membership change. Electorate snapshots and
+   * observer catch-up (PEER-MODEL prereq 3) key on this. */
+  readonly version: number;
+  readonly agents: Readonly<Record<AgentId, AgentRecord>>;
+};
+
 /** Statuses partition into LIVE (active, paused) and TERMINAL (completed).
  * Surfaces must branch on the partition, never on !== 'active' (U1 slice 4b,
  * design REV 6 R2). */
@@ -72,6 +99,10 @@ export type SessionState = {
   readonly status: SessionStatus;
   readonly started: Timestamp;
   readonly grants: Readonly<Record<GrantId, Grant>>;
+  /** M1: full lifecycle registry. `agents` above remains the LIVE-member
+   * projection (evolve keeps both consistent) — existing validation and
+   * turn logic read the projection unchanged. */
+  readonly registry: Registry;
   /** U1: sha256 of the bound user-channel token. Journal-authoritative via
    * the user-channel-registered event — a hash is safe in agent-readable
    * mirrors (auth needs the preimage); slice 3 has no reset path. */

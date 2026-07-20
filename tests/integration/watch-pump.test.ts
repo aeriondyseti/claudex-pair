@@ -4,7 +4,7 @@ import { decodePush, WatchEventQueue } from '../../src/apps/cli/watchPump.ts';
 
 /** Host-lane pump decode: wire pushes → frozen WatchEvent shapes (slice 2). */
 
-const session = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: 's', grants: {} } as const;
+const session = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} } } as const;
 
 describe('watch pump decode', () => {
   test('activity push decodes message-sent events to stored entries keyed by deliveryId', () => {
@@ -69,7 +69,7 @@ describe('push → reducer pending reconciliation (close-out #1)', () => {
   test('a committed user activity decoded from the wire clears the composer pending with the matching reqId', async () => {
     const { reduceWatch } = await import('@adapters/tui/reducer.ts');
     const { initialWatchState } = await import('@adapters/tui/events.ts');
-    const session = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude', status: 'active', started: 's', grants: {} } as const;
+    const session = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude', status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} } } as const;
     const snapshot = {
       seq: 4, session, transcript: [],
       liveness: { broker: { pid: 1, epoch: 1, heartbeatAt: 'h' }, agents: {} },

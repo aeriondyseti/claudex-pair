@@ -35,6 +35,11 @@ export function bindFsDeps(root: string): Deps {
       status: disk.status,
       started: disk.started,
       grants: grantMap,
+      // M1 legacy tolerance: fs sessions without a registry synthesize v0.
+      registry: disk.registry ?? {
+        version: 0,
+        agents: Object.fromEntries(disk.agents.map((a) => [a, { id: a, display: a, status: 'active' as const, joinedAt: disk.started }])),
+      },
     };
   };
 

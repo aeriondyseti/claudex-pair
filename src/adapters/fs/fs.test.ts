@@ -64,3 +64,23 @@ describe('item 7: reply_to codec round-trip (codex blocker 2)', () => {
     expect('replyTo' in parsed).toBeFalse();
   });
 });
+
+
+describe('M1: session.json registry round-trip', () => {
+  test('save/load preserves the registry; a legacy session without one loads with it absent', async () => {
+    const dir = await root();
+    const store = new FsSessionStore(dir);
+    const withRegistry: DiskSession = {
+      ...session,
+      registry: { version: 3, agents: { claude: { id: 'claude', display: 'Claude Code', status: 'active', joinedAt: '2026-07-12 12:00:00' } } },
+    };
+    await store.initialize(withRegistry);
+    await store.save(withRegistry);
+    expect((await store.load()).registry).toEqual(withRegistry.registry);
+
+    const legacyDir = await root();
+    const legacy = new FsSessionStore(legacyDir);
+    await legacy.initialize(session); // no registry field
+    expect((await legacy.load()).registry).toBeUndefined();
+  });
+});

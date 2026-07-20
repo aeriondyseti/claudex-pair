@@ -303,5 +303,6 @@ function toDiskSession(state: SessionState): DiskSession {
     turn: state.turn,
     status: state.status,
     started: state.started,
+    registry: state.registry,
   };
 }

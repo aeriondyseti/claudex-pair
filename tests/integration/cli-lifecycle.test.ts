@@ -29,7 +29,7 @@ function makeFakeGateway(log: Log) {
 
   const session = {
     task: 't', status: 'active', started: 's',
-    agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', grants: {},
+    agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', grants: {}, registry: { version: 1, agents: {} },
   };
   const status: StatusDto = {
     session: session as StatusDto['session'],
