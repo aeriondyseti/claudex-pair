@@ -105,7 +105,9 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
       : '';
     lines.push('');
     const to = logicalEntry.userGroup ? logicalEntry.entries.map((entry) => entry.message.header.to).join(',') : header.to;
-    lines.push(`${color.get(header.from) ?? ''}${BOLD}${header.from}${RESET} ${DIM}-> ${to} | ${header.type} | turn:${header.turn} | ${header.sent}${RESET}${pendingFlag}${voidedFlag}${deliveryBadges}`);
+    const actionKind = (header as typeof header & { actionKind?: string }).actionKind;
+    const actionMarker = actionKind ? ` ${WARN}⚡ user action: ${actionKind}${RESET}` : '';
+    lines.push(`${color.get(header.from) ?? ''}${BOLD}${header.from}${RESET} ${DIM}-> ${to} | ${header.type} | turn:${header.turn} | ${header.sent}${RESET}${actionMarker}${pendingFlag}${voidedFlag}${deliveryBadges}`);
     for (let line of message.body.split(/\r?\n/)) {
       while (line.length > bodyWidth) {
         lines.push(`   ${line.slice(0, bodyWidth)}`);
@@ -115,14 +117,22 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
     }
   }
   if (composer?.pending) {
+    const kind = composer.pending.action ? 'action' : 'send';
     const status = composer.pending.state === 'sending'
-      ? `${WARN}sending…${RESET}`
-      : `${ERROR}send failed: ${composer.pending.error ?? 'unknown error'} (Enter retries; Esc discards)${RESET}`;
-    lines.push('', ` ${status} ${DIM}to:${composer.pending.target} | ${composer.pending.body}${RESET}`);
+      ? `${WARN}${kind === 'action' ? '⚡ executing…' : 'sending…'}${RESET}`
+      : `${ERROR}${kind} failed: ${composer.pending.error ?? 'unknown error'} (Enter retries; Esc discards)${RESET}`;
+    const detail = composer.pending.action ? composer.pending.body : `to:${composer.pending.target} | ${composer.pending.body}`;
+    lines.push('', ` ${status} ${DIM}${detail}${RESET}`);
   }
   lines.push('');
   lines.push(DIM + '─'.repeat(frameWidth) + RESET);
   if (composer?.channel === 'registered') {
+    if (composer.confirming && composer.pending?.state !== 'sending') {
+      // Freeze-then-mint (design REV 6): the SECOND Enter executes exactly
+      // the frozen action — never the buffer.
+      lines.push(` ${WARN}${BOLD}CONFIRM ${composer.confirming.display} — Enter to execute, Esc to abort${RESET}`);
+    }
+    if (composer.actionHint) lines.push(` ${WARN}${composer.actionHint}${RESET}`);
     lines.push(` ${BOLD}to:${composer.target}${RESET} ${composer.buffer}`);
   } else if (composer?.channel === 'unregistered') {
     lines.push(` ${WARN}! user channel is not registered; waiting for secure registration${RESET}`);

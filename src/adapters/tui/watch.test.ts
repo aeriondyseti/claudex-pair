@@ -217,3 +217,40 @@ describe('watch renderer', () => {
     expect(foreignBinding).not.toContain('to:*');
   });
 });
+
+describe('slice-4 action rendering', () => {
+  test('CONFIRM banner, action hint, executing pending, and the ⚡ actionKind marker (keyed on the durable field, never provenance)', () => {
+    const confirm = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({ confirming: { verb: 'kick', agent: 'codex', reason: 'wedged', display: '/kick codex' } }),
+    });
+    expect(confirm).toContain('CONFIRM /kick codex — Enter to execute, Esc to abort');
+
+    const hint = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({ actionHint: 'usage: /kick <agent> [reason]' }),
+    });
+    expect(hint).toContain('usage: /kick <agent> [reason]');
+
+    const executing = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({ pending: { reqId: 'r', target: '*', body: '/end ship it', state: 'sending', action: true } }),
+    });
+    expect(executing).toContain('⚡ executing…');
+    expect(executing).toContain('/end ship it');
+
+    // ⚡ marker: an ADVISORY user message (same provenance+groupId shape)
+    // must NOT get the marker; an actionKind-tagged notice must.
+    const advisory = userMessage('adv-1', 'claude', false, 'g-adv');
+    const notice = {
+      ...userMessage('act-1', 'claude', false, 'g-act'),
+      message: {
+        ...userMessage('act-1', 'claude', false, 'g-act').message,
+        header: { ...userMessage('act-1', 'claude', false, 'g-act').message.header, actionKind: 'end' },
+      },
+    };
+    const frame = renderWatchFrame({ model: model({ transcript: [advisory, notice] }), width: 100, tail: 10, composer: composer({}) });
+    expect(frame).toContain('⚡ user action: end');
+    expect(frame.match(/⚡ user action/g)?.length).toBe(1); // advisory carries NO marker
+  });
+});
