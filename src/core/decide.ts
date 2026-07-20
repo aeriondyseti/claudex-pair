@@ -239,6 +239,10 @@ function decideUserRuleAbsentee(
     return err(new ProtocolError('not-an-absentee', "ruling 'wait' requires a new absolute deadline (-NewDeadlineAt)."));
   }
   const events: Event[] = [{ kind: 'absentee-ruled', agent: command.agent, ruling: command.ruling, ...(command.newDeadlineAt === undefined ? {} : { newDeadlineAt: command.newDeadlineAt }), at: envelope.meta.at }];
+  if (command.ruling === 'wait') {
+    // Peer slice 2: a new deadline resolves whatever a prior expiry paged.
+    events.push(...clearDeadlineExpiredAttention(peer, envelope.meta.at));
+  }
   if (command.ruling === 'abstain') {
     // The CLOSING ruling opens the barrier atomically (rev 3), emitting
     // the durable barrier-open fact with the FROZEN electorate (round 2 #4).
@@ -247,6 +251,8 @@ function decideUserRuleAbsentee(
     if (remaining.every((a) => admitted.includes(a))) {
       events.push({ kind: 'admission-completed', at: envelope.meta.at });
       events.push({ kind: 'barrier-opened', members: [...admitted], registryVersion: peer.registry.version, at: envelope.meta.at });
+      // Peer slice 2: the closing ruling resolves any pending expiry too.
+      events.push(...clearDeadlineExpiredAttention(peer, envelope.meta.at));
     }
   }
   peer.agents.forEach((agent, i) => {
@@ -585,7 +591,12 @@ function decideYield(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   }
   const outcome = advanceRotation(planning.rotation, peer.registry, undefined);
   if (outcome.kind === 'passed') {
-    return ok([{ kind: 'convergence-turn-passed', from: principal, to: outcome.holder, round: outcome.round, at: envelope.meta.at }]);
+    return ok([
+      { kind: 'convergence-turn-passed', from: principal, to: outcome.holder, round: outcome.round, at: envelope.meta.at },
+      // Peer slice 2: a derived convenience nudge to the new holder ONLY —
+      // never load-bearing, the WAL event above is authoritative.
+      { kind: 'message-sent', id: `${envelope.meta.id}-n0`, from: BROKER_SENDER, to: outcome.holder, type: 'info', turn: 'keep', body: `the convergence turn is yours (round ${outcome.round}) — amend the draft, respond to findings, or yield`, at: envelope.meta.at, provenance: 'broker' },
+    ]);
   }
   return ok([{ kind: 'convergence-halted', at: envelope.meta.at }]);
 }
@@ -637,7 +648,7 @@ function decideCallQuestion(s: SessionState, envelope: CommandEnvelope): Result<
   if (!validated.ok) {
     return err(new ProtocolError('invalid-task-block', validated.error));
   }
-  return ok([{
+  const events: Event[] = [{
     kind: 'question-called',
     revision: planning.draft.revision,
     revisionHash: planning.draft.hash,
@@ -645,7 +656,15 @@ function decideCallQuestion(s: SessionState, envelope: CommandEnvelope): Result<
     taskBlock: validated.value,
     calledBy: principal,
     at: envelope.meta.at,
-  }]);
+  }];
+  // Peer slice 2: a derived convenience nudge to every ballot-electorate
+  // member — never load-bearing, the question-called event above is
+  // authoritative.
+  const prefix = planning.draft.hash.slice(0, 12);
+  planning.rotation.electorate.forEach((agent, i) => {
+    events.push({ kind: 'message-sent', id: `${envelope.meta.id}-n${i}`, from: BROKER_SENDER, to: agent, type: 'info', turn: 'keep', body: `a ballot is open on revision ${prefix} — vote approve/reject`, at: envelope.meta.at, provenance: 'broker' });
+  });
+  return ok(events);
 }
 
 /** 1C (§1c): each vote-cast additionally PROJECTS one @broker archive notice
@@ -760,6 +779,8 @@ function decideCollectingRuling(
     if (!command.newDeadlineAt) return err(new ProtocolError('not-an-absentee', "ruling 'wait' requires a new absolute deadline (-NewDeadlineAt)."));
     return ok([
       { kind: 'absentee-ruled', agent: command.agent, ruling: 'wait', newDeadlineAt: command.newDeadlineAt, at: envelope.meta.at },
+      // Peer slice 2: a new deadline resolves whatever a prior expiry paged.
+      ...clearDeadlineExpiredAttention(peer, envelope.meta.at),
       ...noticeFanout(peer, command, `USER RULED barrier absentee '${command.agent}': wait (new deadline ${command.newDeadlineAt}).`, envelope.meta.at),
     ]);
   }
@@ -767,10 +788,28 @@ function decideCollectingRuling(
   if (effective.length === 0) {
     return err(new ProtocolError('empty-electorate', `Abstaining '${command.agent}' would leave nobody in the electorate — wait, admit someone, or force the phase.`));
   }
+  // Peer slice 2: does THIS abstain complete the barrier (every opened
+  // member now submitted-or-abstained)? The actual reveal is computed by
+  // the broker (#revealExtension, sealed-body verification); this mirrors
+  // ONLY the completeness predicate, which needs no broker-private data.
+  const submitted = new Set(Object.keys(planning.submitted));
+  const abstainedAfter = new Set([...planning.abstained, command.agent]);
+  const completing = planning.barrier.openedMembers.every((m) => submitted.has(m) || abstainedAfter.has(m));
   return ok([
     { kind: 'absentee-ruled', agent: command.agent, ruling: 'abstain', at: envelope.meta.at },
+    ...(completing ? clearDeadlineExpiredAttention(peer, envelope.meta.at) : []),
     ...noticeFanout(peer, command, `USER RULED barrier absentee '${command.agent}': abstain — the barrier reveals without them; they remain an authorized observer.`, envelope.meta.at),
   ]);
+}
+
+/** Peer slice 2: a wait ruling that sets a NEW deadline, or an abstain
+ * ruling that closes the barrier, clears any existing 'deadline-expired'
+ * attention item in the SAME txn — the situation the watcher paged is
+ * resolved. Pure: reads state.attention only (never touches the watcher). */
+function clearDeadlineExpiredAttention(peer: SessionState & { topology: 'peer' }, at: string): Event[] {
+  return peer.attention
+    .filter((item) => item.category === 'deadline-expired')
+    .map((item) => ({ kind: 'attention-cleared' as const, id: item.id, at }));
 }
 
 function noticeFanout(
@@ -1346,6 +1385,12 @@ function decideInit(
   if (command.topology !== undefined && command.topology !== 'pair' && command.topology !== 'peer') {
     return err(new ProtocolError('invalid-agents', `unknown topology '${String(command.topology)}' (pair | peer)`));
   }
+  // Peer slice 2: -DeadlineAt seeds admitting.deadlineAt. Format-validated
+  // only here (no automatic default — a deadline exists ONLY when someone
+  // explicitly asked for one, at init or via a later 'wait' ruling).
+  if (command.deadlineAt !== undefined && !DEADLINE_PATTERN.test(command.deadlineAt)) {
+    return err(new ProtocolError('invalid-agents', `-DeadlineAt must match 'YYYY-MM-DD HH:mm:ss' (got '${command.deadlineAt}')`));
+  }
   // M1 round 2 (codex): session identity is an INVARIANT of every NEW
   // session — only genuinely legacy state (replayed events, old mirrors)
   // may lack it. Every ingress must mint or supply one.
@@ -1376,10 +1421,14 @@ function decideInit(
     );
   }
   return ok([
-    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), ...(command.meta === undefined ? {} : { meta: command.meta }), ...(command.topology === undefined ? {} : { topology: command.topology }) },
+    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), ...(command.meta === undefined ? {} : { meta: command.meta }), ...(command.topology === undefined ? {} : { topology: command.topology }), ...(command.deadlineAt === undefined ? {} : { deadlineAt: command.deadlineAt }) },
     { kind: 'registry-updated', version: 1, change: 'init', at },
   ]);
 }
+
+/** Peer slice 2: the -DeadlineAt / -NewDeadlineAt wire format — an absolute
+ * local timestamp, same shape as Clock.now(). */
+const DEADLINE_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
 /** M1: bounded, control-safe per-agent config validation (fail-closed). */
 function validateAgentMeta(meta: import('./types.ts').AgentMeta | undefined, agent: string): ProtocolError | undefined {

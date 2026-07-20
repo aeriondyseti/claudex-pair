@@ -255,6 +255,10 @@ describe('1B-c yield + must-respond gate', () => {
     expect(y.ok).toBeTrue();
     if (!y.ok) return;
     expect(y.value[0]).toMatchObject({ kind: 'convergence-turn-passed', from: 'claude', to: 'codex', round: 0 });
+    // Peer slice 2: a derived @broker nudge to the NEW holder only.
+    expect(y.value).toHaveLength(2);
+    expect(y.value[1]).toMatchObject({ kind: 'message-sent', from: '@broker', to: 'codex', provenance: 'broker', turn: 'keep' });
+    expect((y.value[1] as { body?: string }).body).toContain('round 0');
   });
 });
 

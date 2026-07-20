@@ -100,8 +100,10 @@ export type AttentionItem = {
    * while a ballot was open — unanimity cannot complete without a rejoin,
    * a vote, or a user force) and 'round-cap' (a ballot closed rejected at
    * or beyond ROUND_CAP — the convergence is livelocked; the human must
-   * arbitrate, re-scope, or force the phase). */
-  readonly category: 'tofu-bind' | 'findings-blocked' | 'ballot-stalled' | 'round-cap';
+   * arbitrate, re-scope, or force the phase). Peer slice 2 adds
+   * 'deadline-expired' (an admitting/collecting deadlineAt is in the past —
+   * the broker's deadline watcher pages the human; it NEVER auto-acts). */
+  readonly category: 'tofu-bind' | 'findings-blocked' | 'ballot-stalled' | 'round-cap' | 'deadline-expired';
   readonly detail: string;
   readonly at: Timestamp;
 };

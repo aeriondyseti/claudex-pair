@@ -174,11 +174,15 @@ describe('1C call-question gates in order', () => {
     const r = cq(s, 'claude', 'e7');
     expect(r.ok).toBeTrue();
     if (!r.ok) return;
-    expect(r.value).toHaveLength(1);
+    // Peer slice 2: question-called + one @broker nudge per electorate member.
+    expect(r.value).toHaveLength(4);
     const called = r.value[0]!;
     expect(called).toMatchObject({ kind: 'question-called', revision: 1, revisionHash: DRAFT_HASH, electorate: ['claude', 'codex', 'agy'], calledBy: 'claude' });
     if (called.kind !== 'question-called') return;
     expect(called.taskBlock.tasks.map((t) => t.id)).toEqual(['t1', 't2']);
+    const nudges = r.value.slice(1);
+    expect(nudges.every((e) => e.kind === 'message-sent' && e.from === '@broker' && e.provenance === 'broker')).toBeTrue();
+    expect(nudges.map((e) => (e.kind === 'message-sent' ? e.to : undefined))).toEqual(['claude', 'codex', 'agy']);
     const after = apply(s, r.value);
     const b = ballotOf(after)!;
     expect(b.revisionHash).toBe(DRAFT_HASH);

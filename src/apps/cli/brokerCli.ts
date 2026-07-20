@@ -67,9 +67,12 @@ export async function runBrokerCli(
         if (cred.kind === 'error') throw new Error(`initiator credential: ${cred.detail}`);
         credential = cred.token;
       }
+      // Peer slice 2: -DeadlineAt seeds admitting.deadlineAt (peer only —
+      // there is no automatic default; decide format-validates it).
+      const deadlineAt = topology === 'peer' ? str(flags, 'deadlineat') : undefined;
       // Pair inits OMIT topology entirely — the pre-peer event shape is a
       // byte-identity contract (codex 1A round 2 #7).
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, ...(topology === 'peer' ? { topology } : {}), ...(Object.keys(meta).length ? { meta } : {}) }, credential);
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, ...(topology === 'peer' ? { topology } : {}), ...(deadlineAt ? { deadlineAt } : {}), ...(Object.keys(meta).length ? { meta } : {}) }, credential);
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);

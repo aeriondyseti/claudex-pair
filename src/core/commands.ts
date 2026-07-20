@@ -21,7 +21,11 @@ export type CommandMeta = {
 };
 
 export type Command =
-  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
+  /** Peer slice 2: -DeadlineAt seeds admitting.deadlineAt at init (peer
+   * topology only; format-validated by decide — /^\d{4}-\d{2}-\d{2}
+   * \d{2}:\d{2}:\d{2}$/). No automatic default exists — omit to leave the
+   * barrier undeadlined until a human 'wait' ruling sets one. */
+  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology; deadlineAt?: Timestamp }
   // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
   // message answers. Advisory metadata in the core; the broker derives the
   // awaiting-set from it. Never affects turn semantics.

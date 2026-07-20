@@ -110,6 +110,9 @@ export class BrokerCore {
   #inFlight = 0;
   #idleTimer: ReturnType<typeof setInterval> | undefined;
   #sweepTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Peer slice 2: the deadline watcher's own timer (#scheduleLeaseSweep
+   * idiom — setTimeout(1s).unref(), reschedule while relevant). */
+  #deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(pairDir: string, deps: { clock: Clock; ids: Ids; mirrors: MirrorStore; codec: MessageCodec }, config: BrokerConfig, host: BrokerHost) {
     this.#journal = new Journal(pairDir);
@@ -134,7 +137,11 @@ export class BrokerCore {
   async recover(): Promise<'clean' | 'rebuilt' | 'conflict'> {
     await this.#journal.recover();
     try {
-      return await this.#mirrors.reconcile(this.#journal.sessionState, this.#journal.openDeliveries(), this.#journal.headSeq, this.#journal.planningArtifacts());
+      const result = await this.#mirrors.reconcile(this.#journal.sessionState, this.#journal.openDeliveries(), this.#journal.headSeq, this.#journal.planningArtifacts());
+      // Peer slice 2: re-arm the deadline watcher from WAL/state timestamps —
+      // a restart re-derives the schedule, never trusting an in-memory one.
+      this.#scheduleDeadlineWatch();
+      return result;
     } catch (error) {
       if (error instanceof MirrorConflictError) {
         this.#conflict = error;
@@ -165,6 +172,7 @@ export class BrokerCore {
   stopIdleMonitor(): void {
     if (this.#idleTimer) clearInterval(this.#idleTimer);
     if (this.#sweepTimer) clearTimeout(this.#sweepTimer);
+    if (this.#deadlineTimer) clearTimeout(this.#deadlineTimer);
   }
 
   onConnection(id: string, event: 'open' | 'close'): void {
@@ -570,6 +578,85 @@ export class BrokerCore {
       if (this.#leases.size) this.#scheduleLeaseSweep();
     }, 1_000);
     this.#sweepTimer.unref();
+  }
+
+  /**
+   * Peer slice 2: the deadline watcher. Deadlines are ABSOLUTE timestamps
+   * stored in state (admitting.deadlineAt / collecting.deadlineAt) — this
+   * timer is DERIVED from them (never an in-memory-only schedule), so a
+   * restart re-arms correctly (recover() calls this). Self-noops when no
+   * peer session has a pending admitting/collecting deadlineAt; reschedules
+   * every 1s while one exists (cleared once the barrier progresses or a
+   * later ruling drops the deadline out of scope). #commitDecided calls
+   * this after EVERY commit — cheap, since the noop check is a few reads.
+   */
+  #scheduleDeadlineWatch(): void {
+    if (this.#deadlineTimer || !this.#deadlinePending()) return;
+    this.#deadlineTimer = setTimeout(() => {
+      this.#deadlineTimer = undefined;
+      void this.#chain(() => this.#runDeadlineSweepOnce());
+    }, 1_000);
+    this.#deadlineTimer.unref();
+  }
+
+  #deadlinePending(): boolean {
+    const state = this.#journal.sessionState;
+    if (state?.topology !== 'peer' || !state.planning) return false;
+    return (state.planning.substate === 'admitting' || state.planning.substate === 'collecting') && state.planning.deadlineAt !== undefined;
+  }
+
+  /** One watcher tick: EXPIRY NEVER AUTO-ACTS. Past its deadline and no
+   * un-cleared 'deadline-expired' attention item yet → page the human
+   * (durable attention + @broker notices) and stop — no transition, no
+   * auto-abstain, no reveal. Dedup guard makes ticks idempotent; clearing
+   * the attention without resolving the deadline lets the NEXT tick re-page
+   * (honest — it is still expired). Always inside #chain (single-writer).
+   */
+  async #runDeadlineSweepOnce(): Promise<void> {
+    const state = this.#journal.sessionState;
+    if (
+      state?.topology === 'peer'
+      && (state.planning?.substate === 'admitting' || state.planning?.substate === 'collecting')
+      && state.planning.deadlineAt !== undefined
+    ) {
+      const deadlineAt = state.planning.deadlineAt;
+      const now = this.#clock.now();
+      if (isDeadlinePast(now, deadlineAt) && !state.attention.some((a) => a.category === 'deadline-expired')) {
+        await this.#raiseDeadlineExpired(state, state.planning, deadlineAt, now);
+      }
+    }
+    this.#scheduleDeadlineWatch(); // keep polling every 1s while a deadline remains pending
+  }
+
+  /** Broker-authored deadline-expired txn (pattern: agentAttach's bind-agent
+   * pseudo-command) — a pseudo-command kind NOT in COMMAND_KINDS, so the
+   * wire can never forge it. */
+  async #raiseDeadlineExpired(
+    state: SessionState & { topology: 'peer' },
+    planning:
+      | Extract<NonNullable<SessionState['planning']>, { substate: 'admitting' }>
+      | Extract<NonNullable<SessionState['planning']>, { substate: 'collecting' }>,
+    deadlineAt: string,
+    at: string,
+  ): Promise<void> {
+    const absentees = planning.substate === 'admitting'
+      ? planning.authorizedExpected.filter((a) => !planning.admitted.includes(a))
+      : planning.barrier.openedMembers.filter((a) => planning.submitted[a] === undefined && !planning.abstained.includes(a));
+    const attentionId = `deadline-${this.#ids.messageId()}`;
+    const detail = `${planning.substate} deadline ${deadlineAt} expired — absentees: ${absentees.join(', ') || 'none'}; rule each with /rule-absentee (abstain|wait) or /force-phase`;
+    const events: Event[] = [{ kind: 'attention-raised', id: attentionId, category: 'deadline-expired', detail, at }];
+    const envelope: CommandEnvelope = {
+      command: { kind: 'deadline-expired' } as unknown as CommandEnvelope['command'],
+      meta: { id: this.#ids.messageId(), at, principal: BROKER_SENDER },
+    };
+    state.agents.forEach((agent, i) => {
+      events.push({
+        kind: 'message-sent', id: `${envelope.meta.id}-d${i}`, from: BROKER_SENDER, to: agent,
+        type: 'info', turn: 'keep', body: `${planning.substate} deadline expired (${deadlineAt}) — the user has been paged; no auto-action was taken. Wait for a human ruling.`,
+        at, provenance: 'broker', ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
+    });
+    await this.#commitDecided(`deadline-sweep-${attentionId}`, 'broker-deadline-watch', envelope, state, events);
   }
 
   subscribe(reqId: string, sink: DeliverySink, as: string, afterDeliverySeq: number): Promise<BrokerResponse> {
@@ -1033,7 +1120,18 @@ export class BrokerCore {
         }
       }
     }
+    // Peer slice 2: every commit can set/clear a deadline (init, a wait
+    // ruling, a closing abstain, the watcher's own paging txn) — cheap,
+    // self-noops via #deadlinePending() when nothing is relevant.
+    this.#scheduleDeadlineWatch();
     return response;
+  }
+
+  /** Test-only: run one deadline-watch tick synchronously (through the
+   * single-writer chain), bypassing the 1s timer — the preferred
+   * alternative to sleeping past it in broker tests. */
+  async runDeadlineSweepOnceForTest(): Promise<void> {
+    await this.#chain(() => this.#runDeadlineSweepOnce());
   }
 
   #observerTranscript(): { message: StoredMessage; pending: boolean; voided?: boolean }[] {
@@ -1111,6 +1209,32 @@ function userChannelKindFrom(payload: unknown): string | undefined {
   // slice-3 kinds. Never a hand-maintained enum a future verb can escape.
   if (kind.startsWith('user-') || USER_CHANNEL_KINDS.has(kind)) return kind;
   return undefined;
+}
+
+/**
+ * Peer slice 2: the ONE timestamp-parsing helper for the deadline watcher —
+ * every past/future comparison goes through this (never re-parsed ad hoc).
+ * Mirrors tui/derive.ts's ageSeconds parsing exactly: the protocol's
+ * timezone-less 'YYYY-MM-DD HH:mm:ss' is interpreted as UTC purely for a
+ * stable numeric ordering — this.#clock.now() and every deadlineAt go
+ * through the SAME interpretation, so the relative (past/future) comparison
+ * is correct regardless of the server's real timezone.
+ */
+function timestampMs(value: string): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return undefined;
+  const parts = match.slice(1).map(Number);
+  if (parts.some((part) => !Number.isFinite(part))) return undefined;
+  const [year, month, day, hour, minute, second] = parts as [number, number, number, number, number, number];
+  return Date.UTC(year, month - 1, day, hour, minute, second);
+}
+
+/** True iff `deadlineAt` is strictly before `now` under the shared parse. */
+function isDeadlinePast(now: string, deadlineAt: string): boolean {
+  const nowMs = timestampMs(now);
+  const deadlineMs = timestampMs(deadlineAt);
+  if (nowMs === undefined || deadlineMs === undefined) return false;
+  return nowMs > deadlineMs;
 }
 
 const err = (reqId: string, code: string, message: string): BrokerResponse => ({ ...(reqId ? { reqId } : {}), ok: false, error: { code, message } });

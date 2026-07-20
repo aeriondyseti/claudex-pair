@@ -35,6 +35,25 @@ describe('peer init: admitting bootstrap', () => {
     expect(s.topology).toBe('pair');
     if (s.topology === 'pair') { expect(s.driver).toBe('claude'); expect(s.turn).toBe('claude'); }
   });
+
+  // Peer slice 2: -DeadlineAt seeds admitting.deadlineAt at init; no
+  // automatic default exists otherwise.
+  test('-DeadlineAt seeds admitting.deadlineAt; malformed values are rejected format-first', () => {
+    const withDeadline = decide(undefined, env({ kind: 'init-session', task: 'peer work', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-p-0003', topology: 'peer', deadlineAt: '2026-07-21 09:00:00' }, 'claude', 'i2'));
+    expect(withDeadline.ok).toBeTrue();
+    if (!withDeadline.ok) return;
+    const s = replay(withDeadline.value)!;
+    if (s.topology !== 'peer' || s.planning?.substate !== 'admitting') throw new Error('shape');
+    expect(s.planning.deadlineAt).toBe('2026-07-21 09:00:00');
+
+    const noDeadline = peerState(); // no -DeadlineAt: no automatic default.
+    if (noDeadline.topology !== 'peer' || noDeadline.planning?.substate !== 'admitting') throw new Error('shape');
+    expect(noDeadline.planning.deadlineAt).toBeUndefined();
+
+    const malformed = decide(undefined, env({ kind: 'init-session', task: 'peer work', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-p-0004', topology: 'peer', deadlineAt: 'not-a-timestamp' }, 'claude', 'i3'));
+    expect(malformed.ok).toBeFalse();
+    expect(malformed.ok ? '' : (malformed.error as { code?: string }).code).toBe('invalid-agents');
+  });
 });
 
 describe('peer command matrix: no driver authority', () => {
@@ -112,6 +131,36 @@ describe('peer 1A privileged user verbs', () => {
 
     const notAbsent = decide(s2, userEnv({ kind: 'user-rule-absentee', agent: 'claude', ruling: 'abstain', ...base }, 'ur4'));
     expect(notAbsent.ok ? '' : (notAbsent.error as { code?: string }).code).toBe('not-an-absentee');
+  });
+
+  // Peer slice 2: a wait ruling (new deadline) or a closing abstain both
+  // resolve whatever a prior expiry paged — the SAME ruling txn clears it.
+  test('admitting: wait clears a pending deadline-expired attention item; a non-closing abstain does NOT', () => {
+    let s = userReady(['claude', 'codex', 'agy']);
+    s = evolve(s, { kind: 'attention-raised', id: 'deadline-x1', category: 'deadline-expired', detail: 'admitting deadline expired', at: AT })!;
+    if (s.topology !== 'peer') throw new Error('shape');
+    expect(s.attention.some((a) => a.category === 'deadline-expired')).toBeTrue();
+
+    const waited = decide(s, userEnv({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', newDeadlineAt: '2026-07-21 09:00:00', ...base }, 'wc1'));
+    expect(waited.ok).toBeTrue();
+    if (!waited.ok) return;
+    expect(waited.value.some((e) => e.kind === 'attention-cleared' && e.id === 'deadline-x1')).toBeTrue();
+    const afterWait = waited.value.reduce<SessionState | undefined>((acc, e) => (acc === undefined ? acc : (evolve(acc, e) ?? acc)), s)!;
+    expect(afterWait.topology === 'peer' && afterWait.attention.some((a) => a.category === 'deadline-expired')).toBeFalse();
+
+    // A non-closing abstain (agy still outstanding) does not resolve it.
+    const partial = decide(s, userEnv({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'wc2'));
+    expect(partial.ok).toBeTrue();
+    if (!partial.ok) return;
+    expect(partial.value.some((e) => e.kind === 'attention-cleared')).toBeFalse();
+
+    // The CLOSING abstain (agy, the last outstanding) clears it in the same txn.
+    const afterPartial = partial.value.reduce<SessionState | undefined>((acc, e) => (acc === undefined ? acc : (evolve(acc, e) ?? acc)), s)!;
+    const closing = decide(afterPartial, userEnv({ kind: 'user-rule-absentee', agent: 'agy', ruling: 'abstain', ...base }, 'wc3'));
+    expect(closing.ok).toBeTrue();
+    if (!closing.ok) return;
+    expect(closing.value.some((e) => e.kind === 'admission-completed')).toBeTrue();
+    expect(closing.value.some((e) => e.kind === 'attention-cleared' && e.id === 'deadline-x1')).toBeTrue();
   });
 
   test('user-force-phase: planning->provisioning with outcome FORCED; implementation unavailable', () => {
@@ -227,6 +276,32 @@ describe('peer 1B-a: propose matrix, collecting rulings, reveal shapes (pure cor
     expect(code(empty)).toBe('empty-electorate');
     // Ruling A: nothing mutates on the rejection.
     expect(JSON.stringify(afterOne)).toBe(JSON.stringify(afterOne));
+  });
+
+  // Peer slice 2: same rule for the collecting substate — a wait ruling or
+  // a completing (closing) abstain clears a pending deadline-expired item.
+  test('collecting: wait clears a pending deadline-expired attention item; the completing abstain also clears it', () => {
+    let withUser = evolve(collecting(), { kind: 'user-channel-registered', tokenHash: 'h'.repeat(64), at: CAT })!;
+    withUser = evolve(withUser, { kind: 'attention-raised', id: 'deadline-c1', category: 'deadline-expired', detail: 'collecting deadline expired', at: CAT })!;
+    if (withUser.topology !== 'peer') throw new Error('shape');
+    expect(withUser.attention.some((a) => a.category === 'deadline-expired')).toBeTrue();
+    const base = { groupId: 'g', noticeIdBase: 'n' };
+
+    const waited = decide(withUser, userEnvB({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', newDeadlineAt: '2026-07-21 09:00:00', ...base }, 'cw1'));
+    expect(waited.ok).toBeTrue();
+    if (!waited.ok) return;
+    expect(waited.value.some((e) => e.kind === 'attention-cleared' && e.id === 'deadline-c1')).toBeTrue();
+
+    // claude submits first; codex is then the ONLY outstanding member — its
+    // abstain completes (reveals) the barrier, clearing the attention too.
+    const submitted = decide(withUser, cenv(proposeCmd('claude plan'), 'claude', 'cw2', meta('claude plan')));
+    expect(submitted.ok).toBeTrue();
+    if (!submitted.ok) return;
+    const afterSubmit = submitted.value.reduce<SessionState | undefined>((acc, e) => (acc ? (evolve(acc, e) ?? acc) : acc), withUser)!;
+    const closing = decide(afterSubmit, userEnvB({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'cw3'));
+    expect(closing.ok).toBeTrue();
+    if (!closing.ok) return;
+    expect(closing.value.some((e) => e.kind === 'attention-cleared' && e.id === 'deadline-c1')).toBeTrue();
   });
 
   test("send -Type proposal is broker-authored in EVERY topology", () => {

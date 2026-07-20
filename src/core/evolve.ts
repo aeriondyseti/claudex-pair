@@ -42,7 +42,7 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
           phase: 'planning' as const,
           // Durable authorization (round 2 #3) lives OUTSIDE the substate.
           authorized: event.agents,
-          planning: { substate: 'admitting' as const, authorizedExpected: event.agents, admitted: [event.driver] },
+          planning: { substate: 'admitting' as const, authorizedExpected: event.agents, admitted: [event.driver], ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }) },
           attention: [],
         };
       }

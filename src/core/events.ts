@@ -1,4 +1,4 @@
-import type { AgentMeta, AgentId, GrantId, GrantScope, MessageId, MessageType, Timestamp, TurnMode, Topology } from './types.ts';
+import type { AgentMeta, AgentId, AttentionItem, GrantId, GrantScope, MessageId, MessageType, Timestamp, TurnMode, Topology } from './types.ts';
 
 /**
  * Events are the WAL vocabulary (ENHANCEMENTS.md rev 7): the future broker's
@@ -51,7 +51,7 @@ export type Event =
   /** Peer 1A: outcome provenance is permanent — 'forced' can never read
    * as 'ballot-passed' (codex rev 3). */
   | { kind: 'phase-transition'; from: import('./types.ts').SessionPhase; to: import('./types.ts').SessionPhase; outcome: 'forced' | 'ballot-passed'; reason?: string; at: Timestamp }
-  | { kind: 'attention-raised'; id: string; category: 'tofu-bind' | 'findings-blocked' | 'ballot-stalled' | 'round-cap'; detail: string; at: Timestamp }
+  | { kind: 'attention-raised'; id: string; category: AttentionItem['category']; detail: string; at: Timestamp }
   /** 1B-c: a finding is filed against a draft revision or a rival proposal
    * (converging only). text is PUBLIC post-reveal — the durable carrier the
    * artifacts findingTexts entry derives from; bytes/textHash are broker-
@@ -95,7 +95,11 @@ export type Event =
   /** 1C: an agenda item is marked addressed (optionally linking a finding). */
   | { kind: 'agenda-addressed'; agendaId: string; findingId?: string; note?: string; at: Timestamp }
   | { kind: 'attention-cleared'; id: string; at: Timestamp }
-  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
+  /** Peer slice 2: -DeadlineAt seeds the peer admitting substate's initial
+   * deadlineAt (format-validated by decideInit); absent for pair inits and
+   * peer inits without the flag (NO automatic default — deadlines only ever
+   * exist by explicit user/CLI intent). */
+  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology; deadlineAt?: Timestamp }
   | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client' | 'broker'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
