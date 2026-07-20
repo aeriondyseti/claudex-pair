@@ -112,6 +112,7 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     let client = await this.getClient(true);
     let cursor = afterDeliverySeq;
     let active = true;
+    let terminalError: Error | undefined; // set when reconnect attempts exhaust
     let reconnecting: Promise<void> | undefined;
     const sequences = new Map<string, number>();
     let offDelivery = () => {};
@@ -161,7 +162,11 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
           return;
         } catch (error) {
           if (!active) return;
-          if (attempt >= this.reconnectPolicy.maxAttempts) { queue.fail(error); return; }
+          if (attempt >= this.reconnectPolicy.maxAttempts) {
+            terminalError = error instanceof Error ? error : new Error(String(error));
+            queue.fail(error);
+            return;
+          }
           await backoffSleep(delay);
           delay = Math.min(delay * 2, this.reconnectPolicy.maxDelayMs);
         }
@@ -185,8 +190,15 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       try { expectOk(await op(client)); return; }
       catch (error) {
         if (error instanceof BrokerWireError) throw error;
+        // Post-close there is nothing to reconnect to — surface the failure.
+        if (!active) throw error;
         scheduleReconnect();
         await reconnecting;
+        // Exhausted reconnects resolve `reconnecting` after queue.fail — a
+        // retry would redial the stale client (the exact D2 symptom).
+        // Surface the terminal reconnect error instead (codex review #2).
+        if (terminalError) throw terminalError;
+        if (!active) throw error;
         expectOk(await op(client));
       }
     };

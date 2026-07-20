@@ -14,6 +14,13 @@ import { runBrokerCli, type CliGateway } from '../../src/apps/cli/brokerCli.ts';
 
 type Log = string[];
 
+/** Bounded poll — slow scheduling must delay, never flake (codex review #3). */
+async function until(cond: () => boolean, ms = 3_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await Bun.sleep(5);
+  expect(cond()).toBeTrue();
+}
+
 function makeFakeGateway(log: Log) {
   let pushDelivery: ((d: Delivery) => void) | undefined;
   let closeCount = 0;
@@ -85,9 +92,8 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     const flags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['type', 'ask'], ['message', 'x']]);
 
     const result = runBrokerCli('send', flags, [], 'unused-root', () => gateway);
-    // Let the send commit and the fused wait arm.
-    await Bun.sleep(20);
-    expect(log).toContain('subscribe (closeCount=0)'); // wait armed with the gateway still open
+    // Wait (bounded) for the send to commit and the fused wait to arm.
+    await until(() => log.includes('subscribe (closeCount=0)')); // wait armed with the gateway still open
     expect(closes()).toBe(0); // the old bug: close() had already run here
 
     deliver('m2:claude');
@@ -103,8 +109,7 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30']]);
 
     const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
-    await Bun.sleep(20);
-    expect(log).toContain('subscribe (closeCount=0)');
+    await until(() => log.includes('subscribe (closeCount=0)'));
     expect(closes()).toBe(0);
 
     deliver('m3:claude');
@@ -120,8 +125,7 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     const flags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['message', 'x']]);
 
     const result = runBrokerCli('ask', flags, [], 'unused-root', () => { factoryCalls += 1; return gateway; });
-    await Bun.sleep(20);
-    expect(factoryCalls).toBe(2); // outer dispatch + recursive 'send'
+    await until(() => factoryCalls === 2 && log.includes('subscribe (closeCount=0)')); // outer dispatch + recursive 'send', wait armed
     expect(closes()).toBe(0); // NEITHER gateway closed while the wait is armed
 
     deliver('m4:claude');

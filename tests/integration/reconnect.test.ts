@@ -274,11 +274,22 @@ describe('subscription reconnect', () => {
     });
     cleanups.push(() => serverB.close().catch(() => undefined));
 
+    // Deterministic ordering (codex review #1): rediscovery is GATED, so the
+    // onClose reconnect cannot swap `client` to B before the ack runs — the
+    // ack's first attempt is GUARANTEED to hit the dead A client, and only
+    // its failure path (await reconnecting) can proceed once we release the
+    // gate. Without withReconnectRetry this test fails: the first attempt's
+    // redial error escapes instead of riding the reconnect.
+    let rediscoverReached = false;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
     const gateway = new BrokerGateway(
       {
         clientId: 'ack-client',
         connect: async () => new IpcClient({ endpoint: endpointA, token: 'token', epoch: 11, clientId: 'ack-client' }),
         rediscover: async () => {
+          rediscoverReached = true;
+          await gate; // held until the ack has begun (and failed) on A
           await serverB.listen().catch(() => undefined); // respawned at the new epoch
           return new IpcClient({ endpoint: endpointB, token: 'token', epoch: 12, clientId: 'ack-client' });
         },
@@ -292,12 +303,82 @@ describe('subscription reconnect', () => {
     expect(first.deliveryId).toBe('m7:codex');
 
     await serverA.close(); // broker dies between print and ack (the bekf8jfk7 shape)
-    // Pre-fix: IpcClient redialed fixed endpointA -> connect ENOENT -> CLI
-    // crash after printing, delivery orphaned for redelivery. Post-fix: the
-    // ack reconnects through rediscovery and closes the delivery on B.
-    await subscription.ack('m7:codex');
+    const deadline = Date.now() + 2_000;
+    while (!rediscoverReached && Date.now() < deadline) await Bun.sleep(5);
+    expect(rediscoverReached).toBeTrue(); // reconnect is parked at the gate; `client` is still the dead A client
+
+    const acking = subscription.ack('m7:codex'); // first attempt hits dead A, must ride the reconnect
+    await Bun.sleep(25); // give the doomed first attempt time to fail while the gate holds
+    expect(acksB).toEqual([]); // nothing can have landed yet — B is not even listening
+    releaseGate();
+    await acking;
     expect(acksB).toEqual(['m7:codex']);
     await subscription.close();
+  }, 15_000);
+
+  test('D2: reconnect exhaustion surfaces the terminal error — the ack retry never redials a stale client', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-ack-exhaust-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 13);
+    const serverA = server(endpoint, 13, async (_frame, send) => {
+      await send({ kind: 'delivery', deliverySeq: 8, deliveryId: 'm8:codex', message: message('m8') });
+    });
+    await serverA.listen();
+
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'exhaust-client',
+        connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 13, clientId: 'exhaust-client' }),
+        rediscover: async () => { throw new Error('broker gone for good'); },
+      },
+      { maxAttempts: 2, baseDelayMs: 5, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    const first = (await subscription.deliveries[Symbol.asyncIterator]().next()).value!;
+    expect(first.deliveryId).toBe('m8:codex');
+    await serverA.close();
+
+    let caught: Error | undefined;
+    try { await subscription.ack('m8:codex'); } catch (error) { caught = error as Error; }
+    // Pre-review-fix this surfaced a raw redial failure from the stale
+    // client; the terminal reconnect error is the honest outcome.
+    expect(caught?.message).toBe('broker gone for good');
+    await subscription.close();
+  }, 15_000);
+
+  test('D2: ack after close() fails fast — no reconnect, no rediscovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-ack-closed-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 14);
+    const serverA = server(endpoint, 14, async (_frame, send) => {
+      await send({ kind: 'delivery', deliverySeq: 9, deliveryId: 'm9:codex', message: message('m9') });
+    });
+    await serverA.listen();
+
+    let rediscoveries = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'closed-client',
+        connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 14, clientId: 'closed-client' }),
+        rediscover: async () => { rediscoveries += 1; throw new Error('must not be called'); },
+      },
+      { maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    const first = (await subscription.deliveries[Symbol.asyncIterator]().next()).value!;
+    expect(first.deliveryId).toBe('m9:codex');
+
+    await subscription.close();
+    await serverA.close(); // transport now dead AND subscription closed
+    let failed = false;
+    try { await subscription.ack('m9:codex'); } catch { failed = true; }
+    expect(failed).toBeTrue();
+    await Bun.sleep(50);
+    expect(rediscoveries).toBe(0); // post-close: surface the failure, never reconnect
   }, 15_000);
 
   test('close() during a reconnect handshake: nothing is published and the replacement socket is closed', async () => {
