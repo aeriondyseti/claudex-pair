@@ -32,7 +32,16 @@ export type Command =
   // rejects this kind unconditionally. Advisory: never a turn mutation.
   | { kind: 'user-message'; groupId: string; recipients: readonly { to: AgentId; messageId: MessageId }[]; body: string }
   // U1 slice 3: journal-authoritative user-channel binding (TOFU, loud).
-  | { kind: 'register-user-channel'; tokenHash: string };
+  | { kind: 'register-user-channel'; tokenHash: string }
+  // U1 slice 4 (U1-SLICE4-DESIGN.md REV 6, approved): PRIVILEGED user
+  // actions — INTERNAL shapes reachable only through the authenticated
+  // user-action handler; the generic execute path fail-closes the entire
+  // user-* namespace. The handler supplies groupId (=== reqId) and a
+  // collision-proof noticeIdBase (`${id}-s${seq}`); decide computes the
+  // per-verb recipients itself and derives notice ids `${base}-r${i}`.
+  | { kind: 'user-end-session'; summary: string; groupId: string; noticeIdBase: string }
+  | { kind: 'user-cancel-grant'; grantId: GrantId; reason: string; groupId: string; noticeIdBase: string }
+  | { kind: 'user-kick-agent'; agent: AgentId; reason: string; groupId: string; noticeIdBase: string };
 
 export type GrantScopeInput =
   | { mode: 'worktree'; worktree: string }

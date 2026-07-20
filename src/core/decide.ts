@@ -1,5 +1,5 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
-import type { Event } from './events.ts';
+import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
 import { AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
@@ -57,7 +57,147 @@ export function decide(
       return withActive(state, (s) => decideUserMessage(s, command, envelope));
     case 'register-user-channel':
       return withActive(state, (s) => decideRegisterUserChannel(s, command, envelope));
+    case 'user-end-session':
+      return withActive(state, (s) => decideUserEnd(s, command, envelope));
+    case 'user-cancel-grant':
+      return withActive(state, (s) => decideUserCancelGrant(s, command, envelope), GRANT_INACTIVE);
+    case 'user-kick-agent':
+      return withActive(state, (s) => decideUserKick(s, command, envelope));
   }
+}
+
+/**
+ * U1 slice 4 (design REV 6): privileged user actions. Human authority
+ * bypasses ROLE authorization (driver-only, issuer-only), never STRUCTURAL
+ * validity. Each action's txn also carries durable ACTION NOTICES — from
+ * `user`, groupId === reqId, provenance trusted_user_client, actionKind
+ * discriminator — which are the composer's pending-clear correlation and
+ * the ⚡ marker source. Notice ids derive `${noticeIdBase}-r${i}` (base is
+ * handler-allocated, collision-proof); recipients are computed HERE, in
+ * the core, because per-verb recipient rules are protocol.
+ */
+function requireUserPrincipal(envelope: CommandEnvelope, kind: string): ProtocolError | undefined {
+  if (envelope.meta.principal !== USER_IDENTITY) {
+    return new ProtocolError('user-channel-required', `${kind} may only originate from the authenticated user channel.`);
+  }
+  return undefined;
+}
+
+function userActionNotice(
+  command: { groupId: string; noticeIdBase: string },
+  to: string,
+  index: number,
+  actionKind: UserActionKind,
+  type: Extract<Event, { kind: 'message-sent' }>['type'],
+  body: string,
+  at: string,
+): Extract<Event, { kind: 'message-sent' }> {
+  return {
+    kind: 'message-sent',
+    id: `${command.noticeIdBase}-r${index}`,
+    from: USER_IDENTITY,
+    to,
+    type,
+    turn: 'keep',
+    body,
+    at,
+    groupId: command.groupId,
+    provenance: 'trusted_user_client',
+    actionKind,
+  };
+}
+
+/** Non-vetoable immediate end; done notices to EVERY agent (design REV 6). */
+function decideUserEnd(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-end-session' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-end-session');
+  if (bad) return err(bad);
+  const summary = command.summary || 'Session ended by user.'; // ruling Q2
+  const events: Event[] = [{ kind: 'session-ended', by: USER_IDENTITY, summary, at: envelope.meta.at }];
+  s.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'end', 'done', summary, envelope.meta.at));
+  });
+  return ok(events);
+}
+
+/** Cancel ANY open grant; notices to issuer+assignee, DEDUPLICATED. */
+function decideUserCancelGrant(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-cancel-grant' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-cancel-grant');
+  if (bad) return err(bad);
+  const g = s.grants[command.grantId];
+  if (!g) return err(new ProtocolError('grant-not-found', `No grant '${command.grantId}' (see: pair grants)`));
+  if (g.state !== 'offered' && g.state !== 'active') {
+    return err(
+      new ProtocolError(
+        'grant-stale-transition',
+        `Grant '${command.grantId}' is '${g.state}' (expected: offered|active) — stale transition rejected`,
+      ),
+    );
+  }
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  const events: Event[] = [{ kind: 'grant-cancelled', grantId: command.grantId, reason: command.reason, at: envelope.meta.at }];
+  // Deduplicated for a future issuer==assignee grant shape (round-2 C).
+  [...new Set([g.issuer, g.assignee])].forEach((agent, i) => {
+    events.push(
+      userActionNotice(command, agent, i, 'cancel-grant', 'grant-cancel', `GRANT ${command.grantId} CANCELLED by the user.${reasonSuffix} Stop editing its scope immediately.`, envelope.meta.at),
+    );
+  });
+  return ok(events);
+}
+
+/**
+ * Forced removal by the user. STRUCTURAL invariants hold (critique R1):
+ * the driver cannot be kicked in pair topology — /end is the drain verb —
+ * so a survivor (the driver) always exists; the kicked agent's open grants
+ * cancel in the same txn; a held turn returns to the DRIVER in the same
+ * txn. Notices: stop-notice to the kicked agent (voided by the ledger with
+ * the rest of its mail, journal-recorded) + action notices to survivors.
+ */
+function decideUserKick(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-kick-agent' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-kick-agent');
+  if (bad) return err(bad);
+  if (command.agent === USER_IDENTITY) {
+    return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity — it is never on the roster and cannot be kicked.`));
+  }
+  const notMember = assertParticipant(s, command.agent, '-Agent');
+  if (notMember) return err(notMember);
+  if (command.agent === s.driver) {
+    return err(
+      new ProtocolError(
+        'kick-driver',
+        `The driver cannot be kicked — evolve must never leave the driver outside the roster. To stop everything, end the session: /end (immediate and non-vetoable).`,
+      ),
+    );
+  }
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  const events: Event[] = [{ kind: 'agent-kicked', agent: command.agent, reason: command.reason, at: envelope.meta.at }];
+  for (const g of Object.values(s.grants)) {
+    if (g.assignee === command.agent && (g.state === 'offered' || g.state === 'active')) {
+      events.push({ kind: 'grant-cancelled', grantId: g.id, reason: `assignee kicked by the user${reasonSuffix}`, at: envelope.meta.at });
+    }
+  }
+  const survivors = s.agents.filter((a) => a !== command.agent);
+  events.push(
+    userActionNotice(command, command.agent, survivors.length, 'kick', 'kick', `You were removed from the session by the user.${reasonSuffix} Stop all work immediately.`, envelope.meta.at),
+  );
+  survivors.forEach((agent, i) => {
+    events.push(
+      userActionNotice(command, agent, i, 'kick', 'info', `${command.agent} was removed from the session by the user.${reasonSuffix}`, envelope.meta.at),
+    );
+  });
+  if (s.turn === command.agent) events.push({ kind: 'turn-passed', to: s.driver });
+  return ok(events);
 }
 
 /**

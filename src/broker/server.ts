@@ -697,7 +697,12 @@ function userChannelKindFrom(payload: unknown): string | undefined {
   const command = (payload as { command?: unknown }).command;
   if (!command || typeof command !== 'object') return undefined;
   const kind = (command as { kind?: unknown }).kind;
-  return typeof kind === 'string' && USER_CHANNEL_KINDS.has(kind) ? kind : undefined;
+  if (typeof kind !== 'string') return undefined;
+  // Fail closed by NAMESPACE (slice-4 design REV 6, tail C): every reserved
+  // user-* kind — including ones that do not exist yet — plus the explicit
+  // slice-3 kinds. Never a hand-maintained enum a future verb can escape.
+  if (kind.startsWith('user-') || USER_CHANNEL_KINDS.has(kind)) return kind;
+  return undefined;
 }
 
 const err = (reqId: string, code: string, message: string): BrokerResponse => ({ ...(reqId ? { reqId } : {}), ok: false, error: { code, message } });
