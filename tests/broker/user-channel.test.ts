@@ -448,3 +448,37 @@ describe('slice 4b: pause/resume through the broker (F-A10)', () => {
     expect(unbraked.ok).toBeTrue();
   });
 });
+
+
+describe('item 7 threading: the awaiting-set', () => {
+  test('an ask registers; a replyTo answer resolves; status surfaces who owes whom; recovery rebuilds from the ring', async () => {
+    const root = await tempRoot();
+    const core = await seeded(root);
+    const ask = await core.execute('t-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'review?' } });
+    expect(ask.ok).toBeTrue();
+    const askId = (ask.ok ? (ask.events ?? []) : []).find((e) => (e as { kind?: string }).kind === 'message-sent') as { id: string };
+
+    let status = await core.query('st1', 'status');
+    expect(status.ok).toBeTrue();
+    let awaiting: readonly { messageId: string; from?: string; to?: string }[] = (status.ok ? (status.data as { awaiting?: { messageId: string; from: string; to: string }[] }).awaiting : []) ?? [];
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0]).toMatchObject({ messageId: askId.id, from: 'claude', to: 'codex' });
+
+    // Recovery rebuilds the set from the transcript ring.
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    status = await reopened.query('st2', 'status');
+    awaiting = (status.ok ? (status.data as { awaiting?: { messageId: string }[] }).awaiting : []) ?? [];
+    expect(awaiting).toHaveLength(1);
+
+    // The reply resolves it.
+    const reply = await reopened.execute('t-ans', 'client-b', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'answer', turn: 'pass', body: 'lgtm', replyTo: askId.id } });
+    expect(reply.ok).toBeTrue();
+    status = await reopened.query('st3', 'status');
+    awaiting = (status.ok ? (status.data as { awaiting?: { messageId: string }[] }).awaiting : []) ?? [];
+    expect(awaiting).toHaveLength(0);
+    // And the stored header carries replyTo end-to-end.
+    const sent = (reply.ok ? (reply.events ?? []) : []).find((e) => (e as { kind?: string }).kind === 'message-sent') as { replyTo?: string };
+    expect(sent.replyTo).toBe(askId.id);
+  });
+});

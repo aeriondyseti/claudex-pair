@@ -40,6 +40,7 @@ export function toStored(event: Extract<Event, { kind: 'message-sent' }>): Store
       ...(event.groupId === undefined ? {} : { groupId: event.groupId }),
       ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
       ...(event.actionKind === undefined ? {} : { actionKind: event.actionKind }),
+      ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }),
     },
     body: event.body,
     raw: fsMessageCodec.raw(pair),

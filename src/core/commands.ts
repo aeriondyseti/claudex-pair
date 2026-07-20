@@ -12,7 +12,10 @@ export type CommandMeta = {
 
 export type Command =
   | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId }
-  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string }
+  // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
+  // message answers. Advisory metadata in the core; the broker derives the
+  // awaiting-set from it. Never affects turn semantics.
+  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId }
   | { kind: 'end-session'; summary: string }
   | { kind: 'issue-grant'; grantId: GrantId; to: AgentId; task: string; scope: GrantScopeInput; agreedIn: MessageId | '' }
   | { kind: 'accept-grant'; grantId: GrantId }

@@ -608,7 +608,8 @@ function decideSend(
     );
   }
   const events: Event[] = [
-    { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at },
+    { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at,
+      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }) },
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });

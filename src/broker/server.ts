@@ -95,6 +95,9 @@ export class BrokerCore {
    * auth, U1): only these may user-send; the tag dies with the socket. */
   #userConnections = new Set<string>();
   #leases = new Map<string, Lease>(); // deliveryId → lease
+  /** Item 7: asks awaiting a reply (messageId → meta). Rebuilt from the
+   * bounded transcript ring at recover; live-updated at commit. */
+  #awaiting = new Map<string, { messageId: string; from: string; to: string; sentAt: string }>();
   #connections = new Set<string>();
   #stopping = false;
   #conflict: MirrorConflictError | undefined;
@@ -125,6 +128,7 @@ export class BrokerCore {
   /** Recovery: journal replay, then mirror reconcile (F8). Conflict → read-only. */
   async recover(): Promise<'clean' | 'rebuilt' | 'conflict'> {
     await this.#journal.recover();
+    this.#rebuildAwaiting();
     try {
       return await this.#mirrors.reconcile(this.#journal.sessionState, this.#journal.openDeliveries(), this.#journal.headSeq);
     } catch (error) {
@@ -619,6 +623,7 @@ export class BrokerCore {
       },
     };
     const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
+    this.#trackAwaiting(record.events); // item 7: asks register, replies resolve
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
       // Voided-in-same-txn deliveries are already closed — never pushed.
@@ -661,6 +666,32 @@ export class BrokerCore {
     return response;
   }
 
+  /** Item 7: derive the awaiting-set from the transcript ring — every ask
+   * with no message carrying replyTo === its id. Bounded by the ring. */
+  #rebuildAwaiting(): void {
+    this.#awaiting.clear();
+    const transcript = this.#observerTranscript();
+    const answered = new Set<string>();
+    for (const t of transcript) {
+      const replyTo = (t.message.header as { replyTo?: string }).replyTo;
+      if (replyTo) answered.add(replyTo);
+    }
+    for (const t of transcript) {
+      const h = t.message.header;
+      if (h.type === 'ask' && !answered.has(h.id)) {
+        this.#awaiting.set(h.id, { messageId: h.id, from: h.from, to: h.to, sentAt: h.sent });
+      }
+    }
+  }
+
+  #trackAwaiting(events: readonly Event[]): void {
+    for (const e of events) {
+      if (e.kind !== 'message-sent') continue;
+      if (e.replyTo) this.#awaiting.delete(e.replyTo);
+      if (e.type === 'ask') this.#awaiting.set(e.id, { messageId: e.id, from: e.from, to: e.to, sentAt: e.at });
+    }
+  }
+
   #observerTranscript(): { message: StoredMessage; pending: boolean; voided?: boolean }[] {
     return this.#journal.transcript().map((t) => ({
       message: this.#toStored({ deliveryId: t.deliveryId, deliverySeq: 0, message: t.message }),
@@ -679,6 +710,7 @@ export class BrokerCore {
       pending,
       recent: await this.#mirrors.archived(3),
       liveness: this.#liveness(),
+      awaiting: [...this.#awaiting.values()],
     };
   }
 
@@ -706,6 +738,7 @@ export class BrokerCore {
         ...(m.groupId === undefined ? {} : { groupId: m.groupId }),
         ...(m.provenance === undefined ? {} : { provenance: m.provenance }),
         ...(m.actionKind === undefined ? {} : { actionKind: m.actionKind }),
+        ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
       },
       body: m.body,
       raw: this.#codec.raw(pair),

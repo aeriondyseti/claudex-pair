@@ -241,3 +241,20 @@ describe('slice 4b: the paused-status matrix (F-A5/A6/A9)', () => {
     if (!r.ok) expect(r.error.code).toBe('session-exists');
   });
 });
+
+
+describe('item 7 threading: replyTo carry-through', () => {
+  test('send-message carries replyTo into the event; omitted stays absent', () => {
+    const s = session();
+    const ask = decide(s, env({ kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' }, 'claude', 'ask1'));
+    if (!ask.ok) throw ask.error;
+    const after = ask.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    const reply = decide(after, env({ kind: 'send-message', to: 'claude', type: 'answer', turn: 'pass', body: 'a', replyTo: 'ask1' }, 'codex', 'ans1'));
+    expect(reply.ok).toBeTrue();
+    if (!reply.ok) return;
+    const sent = reply.value.find((e) => e.kind === 'message-sent');
+    expect(sent).toMatchObject({ replyTo: 'ask1' });
+    const askSent = ask.value.find((e) => e.kind === 'message-sent');
+    expect((askSent as { replyTo?: string }).replyTo).toBeUndefined();
+  });
+});

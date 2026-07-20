@@ -77,9 +77,9 @@ function makeFakeGateway(log: Log) {
 
   return {
     gateway,
-    deliver: (id: string) => {
+    deliver: (id: string, replyTo?: string) => {
       if (!pushDelivery) throw new Error('subscribe was never called');
-      pushDelivery({ deliverySeq: 1, deliveryId: id, message: { name: `${id}.md`, header: { id, from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: 's' }, body: 'b', raw: 'raw-body' } as Delivery['message'] });
+      pushDelivery({ deliverySeq: 1, deliveryId: id, message: { name: `${id}.md`, header: { id, from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: 's', ...(replyTo ? { replyTo } : {}) }, body: 'b', raw: 'raw-body' } as Delivery['message'] });
     },
     closes: () => closeCount,
   };
@@ -132,4 +132,24 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     expect(await result).toBe(0);
     expect(closes()).toBe(2); // both levels closed, both after settle
   }, 10_000);
+});
+
+
+describe('item 7: thread-scoped wait (fake gateway)', () => {
+  test('wait -Thread prints and acks unrelated deliveries but exits only on the reply to the named message', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes } = makeFakeGateway(log);
+    const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'ask-7']]);
+    const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
+    await until(() => log.includes('subscribe (closeCount=0)'));
+
+    deliver('m-unrelated:claude'); // no replyTo — printed + acked, wait continues
+    await until(() => log.includes('ack m-unrelated:claude (closeCount=0)'));
+    expect(closes()).toBe(0); // still waiting on the thread
+
+    deliver('m-answer:claude', 'ask-7');
+    expect(await result).toBe(0);
+    expect(log).toContain('ack m-answer:claude (closeCount=0)');
+    expect(closes()).toBe(1);
+  });
 });

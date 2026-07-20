@@ -26,6 +26,8 @@ export type StoredMessage = {
     /** U1 slice 4: durable discriminator on ACTION notices — the renderer's
      * lightning marker keys on this, never on provenance (design REV 6). */
     readonly actionKind?: import('@core/events.ts').UserActionKind;
+    /** Item 7 threading: the MessageId this message answers. */
+    readonly replyTo?: MessageId;
   };
   readonly body: string;
   readonly raw: string;

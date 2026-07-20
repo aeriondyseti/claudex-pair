@@ -26,7 +26,7 @@ export type JournalRecord = {
 };
 export type Event =
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp }
-  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind }
+  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
   | { kind: 'session-ended'; by: AgentId; summary: string; at: Timestamp }

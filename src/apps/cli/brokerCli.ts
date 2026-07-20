@@ -59,7 +59,8 @@ export async function runBrokerCli(
       const turn = (str(flags, 'turn') ?? 'pass').toLowerCase() as TurnMode;
       let to = str(flags, 'to')?.toLowerCase();
       if (!to) { const status = await gateway.status(); to = resolveRecipient(status.session, from); if (!to) throw new Error(`Ambiguous recipient: specify -To explicitly`); }
-      const r = await execute(gateway, from, { kind: 'send-message', to, type, turn, body: await bodyFrom(flags) });
+      const replyTo = str(flags, 'replyto');
+      const r = await execute(gateway, from, { kind: 'send-message', to, type, turn, body: await bodyFrom(flags), ...(replyTo ? { replyTo } : {}) });
       const sent = r.events.find((e) => e.kind === 'message-sent' && e.from === from);
       const sentTo = sent?.kind === 'message-sent' ? sent.to : to;
       out(`Sent ${type} -> ${sentTo} (${r.receipt.messageFiles[0] ?? ''}). Turn: ${r.session.turn}. Driver: ${r.session.driver}. Status: ${r.session.status}.`);
@@ -68,7 +69,7 @@ export async function runBrokerCli(
       out('You handed over the turn. Waiting for the reply (-NoWait skips the fused wait).');
       return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true);
     }
-    if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false);
+    if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') { const messages = await gateway.log(num(flags, 'tail', 10)); if (!messages.length) out('No archived messages yet.'); for (const m of messages) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`); return 0; }
     if (command === 'grants') { const grants = [...await gateway.grants()].sort((a, b) => a.id.localeCompare(b.id)); if (has(flags, 'json')) out(JSON.stringify(grants, null, 2)); else if (!grants.length) out('No grants in this session.'); else for (const g of grants) { out(`${g.id}  [${g.state}]  ${g.issuer} -> ${g.assignee}  ${g.scope.mode === 'worktree' ? `worktree ${g.scope.worktree}` : `files: ${g.scope.files.join(', ')}`}`); out(`    task: ${g.task}${g.result ? `\n    result: ${g.result}` : ''}`); } return 0; }
@@ -110,12 +111,12 @@ export async function runBrokerCli(
 
 async function execute(gateway: CliGateway, as: AgentId, command: Command): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() } }); }
 
-async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, fused: boolean): Promise<number> {
+async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
   const status = await gateway.status();
   if (!status.session.agents.includes(as)) throw new Error(`'${as}' is not a participant in this session`);
   const subscription = await gateway.subscribe(as, 0);
   try {
-    return await waitOnSubscription(gateway, subscription, as, timeoutSec, fused);
+    return await waitOnSubscription(gateway, subscription, as, timeoutSec, fused, threadId);
   } catch (error) {
     // Slice 4 (design REV 6): a user kick terminates this wait — terminal
     // wording, exit 0, NO re-arm hint, never reconnect churn.
@@ -128,16 +129,24 @@ async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, 
   } finally { await subscription.close(); }
 }
 
-async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, as: AgentId, timeoutSec: number, fused: boolean): Promise<number> {
-  {
+async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
+  // Item 7: -Thread <messageId> — every delivery still prints and acks
+  // normally (at-least-once consumption is unchanged); the wait simply
+  // EXITS only when the reply to that specific message arrives.
+  for (;;) {
     const delivery = await nextDelivery(subscription, timeoutSec);
     if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); return 2; }
     await printDeliveryThenAck(delivery, subscription);
+    if (threadId && (delivery.message.header as { replyTo?: string }).replyTo !== threadId) {
+      out(`(waiting on thread ${threadId} — the above was a different delivery; still listening)`);
+      continue;
+    }
     renderTurn((await gateway.status()), as); return 0;
   }
 }
 
-function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); } }
+function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+  for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));
   // Membership re-check (slice 4, defense in depth behind the preemptive

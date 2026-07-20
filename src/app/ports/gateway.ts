@@ -72,6 +72,10 @@ export type StatusDto = {
   readonly recent: readonly StoredMessage[];
   /** Absent in file mode — file mode has no listener signal to report. */
   readonly liveness?: LivenessDto;
+  /** Item 7 threading: asks not yet answered (broker mode; derived from the
+   * bounded transcript ring at recovery, live-updated at commit — an ask
+   * older than the ring bound ages out of this view, honestly). */
+  readonly awaiting?: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
 };
 
 export type Delivery = {
