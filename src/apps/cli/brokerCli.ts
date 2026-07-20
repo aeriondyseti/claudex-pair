@@ -104,7 +104,7 @@ export async function runBrokerCli(
       const cred = await loadOrCreateAgentCredential(root, as, { regenerate: has(flags, 'regenerate') });
       if (cred.kind === 'error') throw new Error(`agent credential: ${cred.detail}`);
       const bound = await gateway.agentAttach(as, cred.token);
-      out(`${bound.agent} attached (credential v${bound.credentialVersion})${bound.admitted ? ' and is ADMITTED' : ''}. This tag lives with the connection — long-running waits re-attach automatically on reconnect.`);
+      out(`${bound.agent} attached (credential v${bound.credentialVersion})${bound.admitted ? ' and is ADMITTED' : ''}. The credential is provisioned in your store; every pair command auto-attaches on its own connection from now on.`);
       return 0;
     }
     if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));

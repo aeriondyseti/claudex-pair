@@ -480,7 +480,10 @@ export class BrokerCore {
       const subState = this.#journal.sessionState;
       if (subState?.topology === 'peer') {
         const tag = this.#agentConnections.get(sink.id);
-        if (!tag || tag.agent !== as) return err(reqId, 'identity-mismatch', `subscribe as '${as}' requires an agent-attach for that agent on this connection.`);
+        // Untagged is REPAIRABLE (the gateway auto-attaches and retries);
+        // a tag for a different agent is terminal.
+        if (!tag) return err(reqId, 'agent-not-attached', `subscribe as '${as}' requires an agent-attach on this connection.`);
+        if (tag.agent !== as) return err(reqId, 'identity-mismatch', `This connection is attached as '${tag.agent}', not '${as}'.`);
       }
       this.#subscriptions.set(sink.id, { sink, as, connectedSince: this.#clock.now(), lastActivity: this.#clock.now() });
       this.#notifyPresence(); // item 8: listener appeared
@@ -537,7 +540,8 @@ export class BrokerCore {
       const ackState = this.#journal.sessionState;
       if (ackState?.topology === 'peer') {
         const tag = connectionId === undefined ? undefined : this.#agentConnections.get(connectionId);
-        if (!tag || tag.agent !== open.message.to) return err(reqId, 'identity-mismatch', `ack of ${deliveryId} requires an agent-attach as its recipient ('${open.message.to}').`);
+        if (!tag) return err(reqId, 'agent-not-attached', `ack of ${deliveryId} requires an agent-attach on this connection.`);
+        if (tag.agent !== open.message.to) return err(reqId, 'identity-mismatch', `ack of ${deliveryId} requires the recipient tag ('${open.message.to}').`);
       }
       const at = this.#clock.now();
       await this.#journal.ackDelivery(deliveryId, clientId, at);
@@ -568,7 +572,8 @@ export class BrokerCore {
     if (extState?.topology === 'peer') {
       const open = this.#journal.openDeliveries().find((d) => d.deliveryId === deliveryId);
       const tag = connectionId === undefined ? undefined : this.#agentConnections.get(connectionId);
-      if (open && (!tag || tag.agent !== open.message.to)) return err(reqId, 'identity-mismatch', `extend of ${deliveryId} requires an agent-attach as its recipient.`);
+      if (open && !tag) return err(reqId, 'agent-not-attached', `extend of ${deliveryId} requires an agent-attach on this connection.`);
+      if (open && tag && tag.agent !== open.message.to) return err(reqId, 'identity-mismatch', `extend of ${deliveryId} requires the recipient tag.`);
     }
     const lease = this.#leases.get(deliveryId);
     if (lease) lease.expiresAt = Date.now() + this.#config.deliveryLeaseMs;

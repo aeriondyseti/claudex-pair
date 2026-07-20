@@ -8,6 +8,7 @@ import type { StoredMessage } from '@app/ports/index.ts';
 import { IpcClient } from '@adapters/ipc/client.ts';
 import type { DeliveryFrame, ResponseFrame } from '@adapters/ipc/types.ts';
 import { BrokerDiscovery } from './brokerDiscovery.ts';
+import { loadOrCreateAgentCredential } from './credentialStore.ts';
 
 export class BrokerWireError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = 'BrokerWireError'; }
@@ -24,17 +25,49 @@ type Connector = { readonly clientId: string; connect(spawnIfAbsent?: boolean): 
 export class BrokerGateway implements ProtocolGateway, BrokerControl {
   private client: IpcClient | undefined;
   readonly clientId: string;
-  constructor(private readonly connector: Connector, private readonly reconnectPolicy: ReconnectPolicy = DEFAULT_RECONNECT) {
+  constructor(
+    private readonly connector: Connector,
+    private readonly reconnectPolicy: ReconnectPolicy = DEFAULT_RECONNECT,
+    /** Peer 1A blocker fix: the per-agent credential source. Every agent
+     * operation auto-attaches on ITS live connection (reactive on
+     * agent-not-attached, and on every reconnect via the shared attach
+     * path) — a tag never outlives its socket, so the GATEWAY must carry
+     * the proof, not a one-shot `pair attach` process. */
+    private readonly credentials?: (agent: string) => Promise<string>,
+  ) {
     this.clientId = connector.clientId;
   }
 
-  static forRoot(root: string): BrokerGateway { return new BrokerGateway(new BrokerDiscovery({ root })); }
-  static forClient(client: IpcClient): BrokerGateway {
-    return new BrokerGateway({ clientId: client.clientId, connect: async () => client, rediscover: async () => client });
+  static forRoot(root: string): BrokerGateway {
+    return new BrokerGateway(new BrokerDiscovery({ root }), DEFAULT_RECONNECT, async (agent) => {
+      const cred = await loadOrCreateAgentCredential(root, agent);
+      if (cred.kind === 'error') throw new BrokerWireError('credential-error', cred.detail);
+      return cred.token;
+    });
+  }
+  static forClient(client: IpcClient, credentials?: (agent: string) => Promise<string>): BrokerGateway {
+    return new BrokerGateway({ clientId: client.clientId, connect: async () => client, rediscover: async () => client }, DEFAULT_RECONNECT, credentials);
+  }
+
+  /** Attach `agent` on this exact client (its OWN credential, transport
+   * edge only). Throws typed errors; TOFU is idempotent by credential. */
+  private async attachOn(client: IpcClient, agent: string): Promise<void> {
+    if (!this.credentials) throw new BrokerWireError('agent-not-attached', 'This gateway has no agent-credential source for peer sessions.');
+    const token = await this.credentials(agent);
+    const res = await client.agentAttach(agent, token);
+    if (!res.ok) throw new BrokerWireError(res.error.code, res.error.message);
   }
 
   async execute(request: ExecuteRequest): Promise<ExecuteOutcome> {
-    const response = await this.response((client) => client.execute(request.as, { command: request.command, ...(request.credential === undefined ? {} : { credential: request.credential }) }, request.identity.reqId), true);
+    const send = (client: IpcClient) => client.execute(request.as, { command: request.command, ...(request.credential === undefined ? {} : { credential: request.credential }) }, request.identity.reqId);
+    let response: Extract<ResponseFrame, { ok: true }>;
+    try { response = await this.response(send, true); }
+    catch (error) {
+      // Peer 1A: reactive auto-attach — the broker names the exact gap.
+      if (!(error instanceof BrokerWireError) || error.code !== 'agent-not-attached') throw error;
+      await this.attachOn(await this.getClient(true), request.as);
+      response = await this.response(send, true);
+    }
     const data = response.data as Omit<ExecuteOutcome, 'seq' | 'events'>;
     return { ...data, ...(response.seq === undefined ? {} : { seq: response.seq }), events: (response.events ?? []) as ExecuteOutcome['events'] };
   }
@@ -158,7 +191,15 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
         queue.preempt(removed);
       });
       try { expectOk(await next.subscribe(as, cursor)); }
-      catch (error) { offD(); offErr(); next.close(); throw error; }
+      catch (error) {
+        // Peer 1A: this path serves the INITIAL subscribe AND every
+        // reconnect — auto-attaching here means broker restarts re-prove
+        // the credential before the cursor resumes.
+        if (error instanceof BrokerWireError && error.code === 'agent-not-attached') {
+          try { await this.attachOn(next, as); expectOk(await next.subscribe(as, cursor)); }
+          catch (inner) { offD(); offErr(); next.close(); throw inner; }
+        } else { offD(); offErr(); next.close(); throw error; }
+      }
       if (!active) { offD(); offErr(); next.close(); return; } // cancelled mid-handshake
       offDelivery = () => { offD(); offErr(); };
       offClose = next.onClose(() => scheduleReconnect());
@@ -212,6 +253,13 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       const attempted = client; // pin the generation this attempt ran against
       try { expectOk(await op(attempted)); return; }
       catch (error) {
+        // Peer 1A: an untagged client (post-restart, post-rebind re-attach)
+        // is repaired in place — every other protocol rejection is final.
+        if (error instanceof BrokerWireError && error.code === 'agent-not-attached') {
+          await this.attachOn(client, as);
+          expectOk(await op(client));
+          return;
+        }
         if (error instanceof BrokerWireError) throw error;
         // A reconnect cycle already died — never start another (codex round 3).
         if (terminalError) throw terminalError;
