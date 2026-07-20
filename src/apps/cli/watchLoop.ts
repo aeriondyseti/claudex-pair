@@ -175,9 +175,13 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           // the reducer applies it as deferred state at attach — pushing
           // registered/unregistered here would overwrite that loud guidance
           // (close-out #2).
-        } else if (session!.snapshot.userChannel) {
+        } else if (options.userToken && session!.snapshot.userChannel) {
           queue.push({ kind: 'user-channel', state: session!.snapshot.userChannel.registered ? 'registered' : 'unregistered' });
-        } else if (!options.userToken) {
+        } else {
+          // No token on this host (non-TTY exclusion, or no credential): the
+          // channel is unavailable HERE regardless of any broker-side
+          // binding — a composer affordance on a host that cannot input or
+          // send would be a lie (close-out #7 proof surface).
           queue.push({ kind: 'user-channel', state: 'unavailable' });
         }
         // Pump generation guards a torn-down session's late callbacks: only

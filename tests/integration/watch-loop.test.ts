@@ -212,4 +212,49 @@ describe('watch event loop host', () => {
     term.quit();
     expect(await loop).toBe(0);
   }, 10_000);
+
+  test('non-TTY exclusion proof (close-out #7): zero credential activity, zero user-attach, no send path — even with a registered broker binding', async () => {
+    const { mkdtemp, mkdir, rm } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { runWatch } = await import('../../src/apps/cli/watch.ts');
+    const root = await mkdtemp(join(tmpdir(), 'claudex-nontty-'));
+    await mkdir(join(root, '.pair', 'journal'), { recursive: true }); // broker-mode routing
+    try {
+      // Strongest configuration: the session HAS a registered user channel;
+      // the non-interactive host must still touch nothing.
+      const bound = fakeSession(1);
+      (bound.session.snapshot as { userChannel?: { registered: boolean } }).userChannel = { registered: true };
+      let credentialCalls = 0;
+      let userAttachCalls = 0;
+      const gateway: ObserverGatewayLike = {
+        observe: async () => bound.session,
+        userAttach: async () => { userAttachCalls += 1; throw new Error('must never be called'); },
+        close: async () => undefined,
+      };
+      const term = fakeTerminal();
+      // The reducer spy seam is on the loop, not runWatch — assert via the
+      // rendered frames (the loop's observable output) instead.
+      const frames: string[] = [];
+      const loop = runWatch(root, { tail: 5, refreshSec: 2 }, {
+        interactive: false, // the exclusion under test
+        loadCredential: async () => { credentialCalls += 1; return { kind: 'created', token: 'x'.repeat(64) }; },
+        gateway,
+        terminal: term.factory,
+        write: (chunk) => void frames.push(chunk),
+        reattachDelayMs: 25,
+      });
+      await until(() => frames.length >= 1);
+      term.quit();
+      expect(await loop).toBe(0);
+
+      expect(credentialCalls).toBe(0); // store never loaded, never created
+      expect(userAttachCalls).toBe(0); // never authenticated
+      const rendered = frames.join('');
+      expect(rendered).not.toContain('to:*'); // no composer input affordance
+      expect(rendered).not.toContain('USER CREDENTIAL ERROR'); // and no phantom error either
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
 });

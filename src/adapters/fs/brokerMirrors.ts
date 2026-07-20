@@ -77,6 +77,9 @@ export class FsMirrors implements MirrorStore {
         case 'grant-cancelled':
           await this.#writeGrantAbsolute(event.grantId, state);
           break;
+        case 'user-channel-registered':
+          await this.#writeUserChannel(state);
+          break;
         case 'turn-passed':
         case 'driver-changed':
         case 'session-ended':
@@ -91,6 +94,28 @@ export class FsMirrors implements MirrorStore {
       await this.#sessions.save(toDiskSession(state));
     }
     await this.writeManifest(seq);
+  }
+
+  /**
+   * Close-out #7: informational user-channel mirror. Human-readable state of
+   * the session's user-channel binding — REGISTRATION ONLY, never the token
+   * or its hash. Broker-written like every mirror, covered by the manifest
+   * (hashMirrorFiles) so an external edit is tamper, and removed on rebuild
+   * when the recovered state carries no binding.
+   */
+  async #writeUserChannel(state: SessionState): Promise<void> {
+    const path = join(this.pairDir, 'user-channel.json');
+    if (!state.userChannelTokenHash) {
+      await rm(path, { force: true });
+      return;
+    }
+    const content = {
+      registered: true,
+      note: 'Informational mirror; the broker journal is authoritative. The user credential is never stored in .pair.',
+    };
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(content, null, 2)}\n`, 'utf8');
+    await rename(tmp, path);
   }
 
   /** Broker is the single writer: mirror grants reflect post-commit state verbatim. */
@@ -158,6 +183,7 @@ export class FsMirrors implements MirrorStore {
       for (const grant of Object.values(state.grants)) {
         await this.#writeGrantAbsolute(grant.id, state);
       }
+      await this.#writeUserChannel(state); // recreate or REMOVE per recovered state
     }
     for (const agent of state?.agents ?? []) {
       const dir = join(this.pairDir, 'inbox', agent);
@@ -201,6 +227,7 @@ export class FsMirrors implements MirrorStore {
       }
     };
     await addFile('session.json');
+    await addFile('user-channel.json'); // close-out #7: covered = tamper-detectable
     for (const sub of ['inbox', 'grants']) {
       let entries: import('node:fs').Dirent[] = [];
       try {
