@@ -132,6 +132,77 @@ export async function runBrokerCli(
         : 'Draft amended.');
       return 0;
     }
+    if (command === 'critique') {
+      // 1B-c: file a finding against a draft revision or a rival proposal
+      // (converging, electorate member only). The addressee is DERIVED from
+      // the anchor — never claimed.
+      const as = required(flags, 'as', 'critique requires -As <your own agent name>').toLowerCase();
+      const draftRev = str(flags, 'draft');
+      const proposal = str(flags, 'proposal');
+      if ((draftRev === undefined) === (proposal === undefined)) throw new Error('critique requires exactly one of -Draft <revision> or -Proposal <author>');
+      let anchor: import('@core/types.ts').Finding['anchor'];
+      if (draftRev !== undefined) {
+        const revision = Number(draftRev);
+        if (!Number.isInteger(revision) || revision < 0) throw new Error('-Draft must be a non-negative integer revision');
+        anchor = { kind: 'draft', revision };
+      } else {
+        anchor = { kind: 'proposal', author: proposal!.toLowerCase() };
+      }
+      const severity = (str(flags, 'severity') ?? '').toUpperCase();
+      if (severity !== 'HIGH' && severity !== 'MED' && severity !== 'LOW') throw new Error('critique requires -Severity HIGH|MED|LOW');
+      const agreement = (str(flags, 'agreement') ?? '').toLowerCase();
+      if (agreement !== 'agreed' && agreement !== 'partial' && agreement !== 'disputed') throw new Error('critique requires -Agreement agreed|partial|disputed');
+      const r = await execute(gateway, as, { kind: 'critique', anchor, severity, agreement, text: await bodyFrom(flags) });
+      const filed = r.events.find((e) => e.kind === 'finding-filed');
+      out(filed?.kind === 'finding-filed'
+        ? `Finding ${filed.id} filed against ${filed.addressedTo} (${filed.severity}/${filed.agreement}).`
+        : 'Finding filed.');
+      return 0;
+    }
+    if (command === 'respond') {
+      const as = required(flags, 'as', 'respond requires -As <your own agent name>').toLowerCase();
+      const findingId = required(flags, 'id', 'respond requires -Id <findingId>');
+      const disposition = (str(flags, 'disposition') ?? '').toLowerCase();
+      if (disposition !== 'resolve' && disposition !== 'concede' && disposition !== 'dispute') throw new Error('respond requires -Disposition resolve|concede|dispute');
+      const r = await execute(gateway, as, { kind: 'respond-critique', findingId, disposition, text: await bodyFrom(flags) });
+      const ev = r.events.find((e) => e.kind === 'finding-responded');
+      out(ev?.kind === 'finding-responded' ? `Responded to ${findingId} (${ev.disposition}).` : 'Responded.');
+      return 0;
+    }
+    if (command === 'confirm') {
+      const as = required(flags, 'as', 'confirm requires -As <your own agent name>').toLowerCase();
+      const findingId = required(flags, 'id', 'confirm requires -Id <findingId>');
+      const verdict = (str(flags, 'verdict') ?? '').toLowerCase();
+      if (verdict !== 'accept' && verdict !== 'contest') throw new Error('confirm requires -Verdict accept|contest');
+      const setDisputed = has(flags, 'setdisputed');
+      const r = await execute(gateway, as, { kind: 'confirm-critique', findingId, verdict, text: await bodyFrom(flags), ...(setDisputed ? { setDisputed: true } : {}) });
+      const ev = r.events.find((e) => e.kind === 'finding-confirmed');
+      out(ev?.kind === 'finding-confirmed' ? `Confirmed ${findingId} (${ev.verdict}).` : 'Confirmed.');
+      return 0;
+    }
+    if (command === 'withdraw') {
+      // amend-critique withdraw — text is optional (a bare withdraw).
+      const as = required(flags, 'as', 'withdraw requires -As <your own agent name>').toLowerCase();
+      const findingId = required(flags, 'id', 'withdraw requires -Id <findingId>');
+      const text = (str(flags, 'file') || str(flags, 'message')) ? await bodyFrom(flags) : undefined;
+      const r = await execute(gateway, as, { kind: 'amend-critique', findingId, action: 'withdraw', ...(text ? { text } : {}) });
+      const ev = r.events.find((e) => e.kind === 'finding-amended');
+      out(ev?.kind === 'finding-amended' ? `Withdrew ${findingId}.` : 'Withdrawn.');
+      return 0;
+    }
+    if (command === 'yield') {
+      // 1B-c: the convergence holder passes the turn (must-respond gate first).
+      const as = required(flags, 'as', 'yield requires -As <your own agent name>').toLowerCase();
+      const r = await execute(gateway, as, { kind: 'yield-turn' });
+      const passed = r.events.find((e) => e.kind === 'convergence-turn-passed');
+      const halted = r.events.some((e) => e.kind === 'convergence-halted');
+      out(passed?.kind === 'convergence-turn-passed'
+        ? `Turn passed to ${passed.to} (round ${passed.round}).`
+        : halted
+          ? 'Convergence HALTED — no live successor; a member must rejoin or the user forces the phase.'
+          : 'Turn yielded.');
+      return 0;
+    }
     if (command === 'artifacts') {
       if (gateway.planningArtifacts === undefined) throw new Error('artifacts requires the broker gateway.');
       renderArtifacts(await gateway.planningArtifacts());
@@ -273,10 +344,18 @@ function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
   if (s.session.topology === 'peer') {
     const planning = s.session.planning;
     if (planning?.substate === 'admitting') out(`Admitting: ${planning.admitted.length}/${planning.authorizedExpected.length} attached (${planning.authorizedExpected.filter((a) => !planning.admitted.includes(a)).join(', ') || 'none'} outstanding)${planning.deadlineAt ? `; deadline ${planning.deadlineAt}` : ''}`);
+    else if (planning?.substate === 'converging') { out(`Phase:     ${s.session.phase} (converging)   Turn: ${planning.rotation.holder} (round ${planning.rotation.round})`); out(`Findings:  ${renderFindingsSummary(planning.findings)}`); }
+    else if (planning?.substate === 'convergence-blocked') { out(`Phase:     ${s.session.phase}   CONVERGENCE BLOCKED (no live member in the rotation — a member must rejoin, or the user forces the phase)`); out(`Findings:  ${renderFindingsSummary(planning.findings)}`); }
     else out(`Phase:     ${s.session.phase}${planning ? ` (${planning.substate})` : ''}`);
     for (const item of s.session.attention) out(`ATTENTION [${item.id}] (${item.category}) ${item.detail} — clear with /clear-attention ${item.id} (${item.at})`);
   } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); if (s.session.topology !== 'peer') out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
+/** 1B-c: one-line finding tally for the converging/blocked status panes. */
+function renderFindingsSummary(findings: Readonly<Record<string, import('@core/types.ts').Finding>>): string {
+  const all = Object.values(findings);
+  const openAnswered = all.filter((f) => f.lifecycle === 'open' || f.lifecycle === 'answered').length;
+  return `${all.length} total, ${openAnswered} open/answered`;
+}
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));
   // Membership re-check (slice 4, defense in depth behind the preemptive

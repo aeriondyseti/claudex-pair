@@ -1,7 +1,8 @@
-import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
+import type { CommandEnvelope, Command, CommandMeta, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { advanceRotation } from './rotation.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -110,6 +111,16 @@ function decideInner(
       return withActive(state, (s) => decidePropose(s, command, envelope));
     case 'draft-amend':
       return withActive(state, (s) => decideDraftAmend(s, command, envelope));
+    case 'critique':
+      return withActive(state, (s) => decideCritique(s, command, envelope));
+    case 'respond-critique':
+      return withActive(state, (s) => decideRespondCritique(s, command, envelope));
+    case 'confirm-critique':
+      return withActive(state, (s) => decideConfirmCritique(s, command, envelope));
+    case 'amend-critique':
+      return withActive(state, (s) => decideAmendCritique(s, command, envelope));
+    case 'yield-turn':
+      return withActive(state, (s) => decideYield(s, envelope));
   }
 }
 
@@ -328,6 +339,242 @@ function decideDraftAmend(
     return err(new ProtocolError('draft-history-exhausted', `The draft has reached ${DRAFT_REVISIONS_MAX} revisions — convergence has likely livelocked; a human should intervene.`));
   }
   return ok([{ kind: 'draft-amended', revision: command.baseRevision + 1, hash: contentHash, author: principal, content: command.content, bytes, at: envelope.meta.at }]);
+}
+
+/** 1B-c: the converging peer + electorate gate shared by every finding verb.
+ * Findings exist ONLY while converging (convergence-blocked has no live
+ * rotation and rejects with phase-unavailable, same as draft-amend). */
+function requireConverging(
+  s: SessionState,
+  verb: string,
+): { peer: SessionState & { topology: 'peer' }; planning: Extract<NonNullable<SessionState['planning']>, { substate: 'converging' }> } | ProtocolError {
+  const peer = requirePeer(s, verb);
+  if (peer instanceof ProtocolError) return peer;
+  if (peer.planning?.substate !== 'converging') {
+    return new ProtocolError('phase-unavailable', `${verb} is available only while converging.`);
+  }
+  return { peer, planning: peer.planning };
+}
+
+/** 1B-c: validate a finding text field. Grammar and byte bound mirror the
+ * proposal/draft rules; blank maps to the caller's code ('reason-required'
+ * for dispute/contest, 'blank-content' otherwise). meta is broker-stamped. */
+function validateFindingText(
+  text: string,
+  meta: CommandMeta,
+  blankCode: 'blank-content' | 'reason-required',
+): Result<{ bytes: number; textHash: string }, ProtocolError> {
+  if (!text.trim()) {
+    return err(new ProtocolError(blankCode, blankCode === 'reason-required' ? 'A reason (non-blank text) is required for this action.' : 'The finding text cannot be blank.'));
+  }
+  const ctl = findControlCharacter(text);
+  if (ctl >= 0) {
+    return err(new ProtocolError('control-characters', `Control character at offset ${ctl} — allowed: \n, \t, \r only.`));
+  }
+  const bytes = meta.contentBytes;
+  const textHash = meta.contentHash;
+  if (bytes === undefined || textHash === undefined) {
+    return err(new ProtocolError('blank-content', 'Internal: content accounting missing (the broker stamps it).'));
+  }
+  if (bytes > FINDING_TEXT_MAX) {
+    return err(new ProtocolError('finding-too-large', `Finding text is ${bytes} bytes; the bound is ${FINDING_TEXT_MAX}.`));
+  }
+  return ok({ bytes, textHash });
+}
+
+const FINDING_TERMINAL: ReadonlySet<Finding['lifecycle']> = new Set(['resolved', 'conceded', 'withdrawn']);
+
+/** 1B-c: file a finding against a draft revision or a rival proposal. The
+ * addressee is DERIVED from the anchor (the revision's or proposal's author),
+ * never claimed. Deterministic id `${envelope.meta.id}-f`. */
+function decideCritique(
+  s: SessionState,
+  command: Extract<Command, { kind: 'critique' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const gate = requireConverging(s, 'critique');
+  if (gate instanceof ProtocolError) return err(gate);
+  const { planning } = gate;
+  const principal = envelope.meta.principal;
+  if (!planning.rotation.electorate.includes(principal)) {
+    return err(new ProtocolError('not-in-electorate', `'${principal}' is not in the barrier electorate — only electorate members file findings.`));
+  }
+  const text = validateFindingText(command.text, envelope.meta, 'blank-content');
+  if (!text.ok) return text;
+  let addressedTo: AgentId;
+  if (command.anchor.kind === 'draft') {
+    const rev = command.anchor.revision;
+    if (rev === 0) {
+      return err(new ProtocolError('not-anchorable', 'Draft revision 0 is the empty reveal draft — there is nothing to critique.'));
+    }
+    if (rev < 0 || rev > planning.draft.revision) {
+      return err(new ProtocolError('unknown-finding', `Draft revision ${rev} does not exist (current revision is ${planning.draft.revision}).`));
+    }
+    const entry = planning.revisionLog.find((r) => r.revision === rev);
+    if (!entry || entry.author === null) {
+      return err(new ProtocolError('unknown-finding', `Draft revision ${rev} has no attributable author.`));
+    }
+    addressedTo = entry.author;
+  } else {
+    if (!planning.rotation.electorate.includes(command.anchor.author)) {
+      return err(new ProtocolError('unknown-finding', `'${command.anchor.author}' is not an electorate member with a proposal to anchor to.`));
+    }
+    addressedTo = command.anchor.author;
+  }
+  if (addressedTo === principal) {
+    return err(new ProtocolError('self-addressed-finding', 'A finding cannot address your own artifact.'));
+  }
+  if (Object.keys(planning.findings).length >= FINDINGS_MAX) {
+    return err(new ProtocolError('findings-exhausted', `The finding cap (${FINDINGS_MAX}) is reached — convergence has likely livelocked; a human should intervene.`));
+  }
+  const priorBytes = Object.values(planning.findings).reduce((sum, f) => sum + f.history.reduce((h, e) => h + e.bytes, 0), 0);
+  if (priorBytes + text.value.bytes > FINDINGS_TEXT_TOTAL_MAX) {
+    return err(new ProtocolError('findings-exhausted', `Cumulative finding text would reach ${priorBytes + text.value.bytes} bytes; the bound is ${FINDINGS_TEXT_TOTAL_MAX}.`));
+  }
+  return ok([{
+    kind: 'finding-filed',
+    id: `${envelope.meta.id}-f`,
+    author: principal,
+    addressedTo,
+    anchor: command.anchor,
+    severity: command.severity,
+    agreement: command.agreement,
+    text: command.text,
+    bytes: text.value.bytes,
+    textHash: text.value.textHash,
+    at: envelope.meta.at,
+  }]);
+}
+
+/** 1B-c: shared lookup + terminal guard for the transition verbs. */
+function locateFinding(
+  s: SessionState,
+  verb: string,
+  findingId: string,
+): { planning: Extract<NonNullable<SessionState['planning']>, { substate: 'converging' }>; finding: Finding } | ProtocolError {
+  const gate = requireConverging(s, verb);
+  if (gate instanceof ProtocolError) return gate;
+  const finding = gate.planning.findings[findingId];
+  if (!finding) return new ProtocolError('unknown-finding', `No finding '${findingId}'.`);
+  if (FINDING_TERMINAL.has(finding.lifecycle)) {
+    return new ProtocolError('finding-terminal', `Finding '${findingId}' is ${finding.lifecycle} (terminal) — no further transitions.`);
+  }
+  return { planning: gate.planning, finding };
+}
+
+/** 1B-c transition rows 1-3: the ADDRESSEE answers an open finding. */
+function decideRespondCritique(
+  s: SessionState,
+  command: Extract<Command, { kind: 'respond-critique' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const located = locateFinding(s, 'respond-critique', command.findingId);
+  if (located instanceof ProtocolError) return err(located);
+  const { finding } = located;
+  const principal = envelope.meta.principal;
+  if (principal !== finding.addressedTo) {
+    return err(new ProtocolError('not-the-addressee', `Only the addressee ('${finding.addressedTo}') may respond to finding '${finding.id}'.`));
+  }
+  if (finding.lifecycle !== 'open') {
+    return err(new ProtocolError('wrong-lifecycle', `respond-critique applies only to an OPEN finding ('${finding.id}' is ${finding.lifecycle}).`));
+  }
+  if (finding.history.length >= REASONS_MAX) {
+    return err(new ProtocolError('finding-history-exhausted', `Finding '${finding.id}' reached ${REASONS_MAX} history entries — a human should intervene.`));
+  }
+  const text = validateFindingText(command.text, envelope.meta, command.disposition === 'dispute' ? 'reason-required' : 'blank-content');
+  if (!text.ok) return text;
+  return ok([{ kind: 'finding-responded', id: finding.id, disposition: command.disposition, text: command.text, bytes: text.value.bytes, textHash: text.value.textHash, at: envelope.meta.at }]);
+}
+
+/** 1B-c transition rows 4-5: the AUTHOR confirms an answered finding. */
+function decideConfirmCritique(
+  s: SessionState,
+  command: Extract<Command, { kind: 'confirm-critique' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const located = locateFinding(s, 'confirm-critique', command.findingId);
+  if (located instanceof ProtocolError) return err(located);
+  const { finding } = located;
+  const principal = envelope.meta.principal;
+  if (principal !== finding.author) {
+    return err(new ProtocolError('not-your-finding', `Only the author ('${finding.author}') may confirm finding '${finding.id}'.`));
+  }
+  if (finding.lifecycle !== 'answered') {
+    return err(new ProtocolError('wrong-lifecycle', `confirm-critique applies only to an ANSWERED finding ('${finding.id}' is ${finding.lifecycle}).`));
+  }
+  if (finding.history.length >= REASONS_MAX) {
+    return err(new ProtocolError('finding-history-exhausted', `Finding '${finding.id}' reached ${REASONS_MAX} history entries — a human should intervene.`));
+  }
+  const text = validateFindingText(command.text, envelope.meta, command.verdict === 'contest' ? 'reason-required' : 'blank-content');
+  if (!text.ok) return text;
+  const setDisputed = command.verdict === 'contest' && command.setDisputed === true;
+  return ok([{ kind: 'finding-confirmed', id: finding.id, verdict: command.verdict, text: command.text, bytes: text.value.bytes, textHash: text.value.textHash, at: envelope.meta.at, ...(setDisputed ? { setDisputed: true } : {}) }]);
+}
+
+/** 1B-c transition rows 6-7: the AUTHOR withdraws or re-labels its finding.
+ * text is OPTIONAL — a bare withdraw carries none (bytes 0). */
+function decideAmendCritique(
+  s: SessionState,
+  command: Extract<Command, { kind: 'amend-critique' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const located = locateFinding(s, 'amend-critique', command.findingId);
+  if (located instanceof ProtocolError) return err(located);
+  const { finding } = located;
+  const principal = envelope.meta.principal;
+  if (principal !== finding.author) {
+    return err(new ProtocolError('not-your-finding', `Only the author ('${finding.author}') may amend finding '${finding.id}'.`));
+  }
+  if (command.action === 'set-agreement') {
+    if (finding.lifecycle !== 'open') {
+      return err(new ProtocolError('wrong-lifecycle', `set-agreement applies only to an OPEN finding ('${finding.id}' is ${finding.lifecycle}).`));
+    }
+    if (command.agreement === undefined) {
+      return err(new ProtocolError('reason-required', 'amend-critique set-agreement requires -Agreement agreed|partial|disputed.'));
+    }
+  }
+  if (finding.history.length >= REASONS_MAX) {
+    return err(new ProtocolError('finding-history-exhausted', `Finding '${finding.id}' reached ${REASONS_MAX} history entries — a human should intervene.`));
+  }
+  // Optional text: present-and-non-blank is recorded; absent/blank is bytes 0.
+  let textFields: { text: string; bytes: number; textHash: string } | undefined;
+  if (typeof command.text === 'string' && command.text.trim().length > 0) {
+    const text = validateFindingText(command.text, envelope.meta, 'blank-content');
+    if (!text.ok) return text;
+    textFields = { text: command.text, bytes: text.value.bytes, textHash: text.value.textHash };
+  }
+  return ok([{
+    kind: 'finding-amended',
+    id: finding.id,
+    action: command.action,
+    ...(command.action === 'set-agreement' && command.agreement !== undefined ? { agreement: command.agreement } : {}),
+    ...(textFields ? { text: textFields.text, bytes: textFields.bytes, textHash: textFields.textHash } : {}),
+    at: envelope.meta.at,
+  }]);
+}
+
+/** 1B-c: the convergence holder passes the turn. MUST-RESPOND gate — any
+ * OPEN finding addressed to the holder blocks the yield until answered. The
+ * advance (Ruling B) may pass to a live successor or halt. */
+function decideYield(s: SessionState, envelope: CommandEnvelope): Result<Event[], ProtocolError> {
+  const gate = requireConverging(s, 'yield-turn');
+  if (gate instanceof ProtocolError) return err(gate);
+  const { peer, planning } = gate;
+  const principal = envelope.meta.principal;
+  if (principal !== planning.rotation.holder) {
+    return err(new ProtocolError('not-convergence-holder', `Only the convergence holder ('${planning.rotation.holder}') may yield the turn.`));
+  }
+  const unanswered = Object.values(planning.findings)
+    .filter((f) => f.lifecycle === 'open' && f.addressedTo === principal)
+    .map((f) => f.id);
+  if (unanswered.length > 0) {
+    return err(new ProtocolError('unanswered-findings', `Respond to the open findings addressed to you before yielding: ${unanswered.join(', ')}.`));
+  }
+  const outcome = advanceRotation(planning.rotation, peer.registry, undefined);
+  if (outcome.kind === 'passed') {
+    return ok([{ kind: 'convergence-turn-passed', from: principal, to: outcome.holder, round: outcome.round, at: envelope.meta.at }]);
+  }
+  return ok([{ kind: 'convergence-halted', at: envelope.meta.at }]);
 }
 
 /** 1B collecting rulings (Ruling A: an empty-electorate abstain REJECTS
@@ -561,6 +808,10 @@ function decideUserKick(
   });
   if (s.turn === command.agent) events.push({ kind: 'turn-passed', to: s.driver });
   appendAdmittingCompletion(s, command.agent, events, envelope.meta.at);
+  if (s.topology === 'peer') {
+    appendFindingsDepartureAttention(s, command.agent, events, command.noticeIdBase, envelope.meta.at);
+    appendConvergenceHolderDeparture(s, command.agent, events, envelope.meta.at);
+  }
   return ok(events);
 }
 
@@ -704,7 +955,44 @@ function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   ];
   appendAdmittingCompletion(s, agent, events, envelope.meta.at);
   if (s.topology === 'pair' && s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
+  if (s.topology === 'peer') {
+    appendFindingsDepartureAttention(s, agent, events, envelope.meta.id, envelope.meta.at);
+    appendConvergenceHolderDeparture(s, agent, events, envelope.meta.at);
+  }
   return ok(events);
+}
+
+/** 1B-c: a departure while converging/blocked strands the departed agent's
+ * open|answered findings — raise ONE aggregate attention item per departure
+ * (durable; the human clears it once the block is understood). */
+function appendFindingsDepartureAttention(s: SessionState, agent: AgentId, events: Event[], idSeed: string, at: string): void {
+  if (s.topology !== 'peer') return;
+  const planning = s.planning;
+  if (!planning || (planning.substate !== 'converging' && planning.substate !== 'convergence-blocked')) return;
+  const blocked = Object.values(planning.findings)
+    .filter((f) => (f.author === agent || f.addressedTo === agent) && (f.lifecycle === 'open' || f.lifecycle === 'answered'))
+    .map((f) => f.id);
+  if (blocked.length === 0) return;
+  const shown = blocked.slice(0, 5);
+  const more = blocked.length - shown.length;
+  const detail = `${blocked.length} finding${blocked.length === 1 ? '' : 's'} blocked by ${agent}'s departure: ${shown.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
+  events.push({ kind: 'attention-raised', id: `fblock-${agent}-${idSeed}`, category: 'findings-blocked', detail, at });
+}
+
+/** 1B-c: when the departing agent HELD the convergence turn, the same txn
+ * advances the rotation (Ruling B) — passing `leaving` so decide (registry
+ * still shows the departer active) matches evolve (registry shows it left).
+ * A non-holder member's departure needs no event: it is skipped at the next
+ * advance. */
+function appendConvergenceHolderDeparture(s: SessionState, agent: AgentId, events: Event[], at: string): void {
+  if (s.topology !== 'peer' || s.planning?.substate !== 'converging') return;
+  if (s.planning.rotation.holder !== agent) return;
+  const outcome = advanceRotation(s.planning.rotation, s.registry, agent);
+  if (outcome.kind === 'passed') {
+    events.push({ kind: 'convergence-turn-passed', from: agent, to: outcome.holder, round: outcome.round, at });
+  } else {
+    events.push({ kind: 'convergence-halted', at });
+  }
 }
 
 /**

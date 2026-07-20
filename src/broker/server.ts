@@ -5,6 +5,7 @@ import { ProtocolError } from '@core/errors.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
 import { navigators, openGrants } from '@core/queries.ts';
+import { resumeHolder } from '@core/rotation.ts';
 import { AGENT_CREDENTIAL_PATTERN, BROKER_SENDER, USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
 import type { Clock, Ids, StoredMessage } from '@app/ports/index.ts';
 import type { BrokerStatusDto, StatusDto } from '@app/ports/gateway.ts';
@@ -40,6 +41,7 @@ export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 
  * (transport gate, U1-SLICE3-DESIGN.md). */
 const COMMAND_KINDS = new Set([
   'propose', 'draft-amend',
+  'critique', 'respond-critique', 'confirm-critique', 'amend-critique', 'yield-turn',
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
@@ -285,8 +287,18 @@ export class BrokerCore {
     // Peer 1B: exact UTF-8 content accounting is stamped at the transport
     // boundary (pure decide never computes crypto). 1B-b: draft-amend
     // carries content the same way propose does.
-    const contentMeta = command.kind === 'propose' || command.kind === 'draft-amend'
-      ? { contentHash: sha256Hex(command.content), contentBytes: Buffer.byteLength(command.content, 'utf8') }
+    // 1B-c: findings carry a `text` field the same way. amend-critique may
+    // omit it (a bare withdraw) — then there is nothing to stamp (decide
+    // treats missing meta as bytes 0).
+    const contentText = command.kind === 'propose' || command.kind === 'draft-amend'
+      ? command.content
+      : command.kind === 'critique' || command.kind === 'respond-critique' || command.kind === 'confirm-critique'
+        ? command.text
+        : command.kind === 'amend-critique'
+          ? command.text
+          : undefined;
+    const contentMeta = typeof contentText === 'string'
+      ? { contentHash: sha256Hex(contentText), contentBytes: Buffer.byteLength(contentText, 'utf8') }
       : {};
     const envelope: CommandEnvelope = {
       command,
@@ -402,6 +414,11 @@ export class BrokerCore {
               events.push({ kind: 'barrier-opened', members: admittedAfter, registryVersion: state.registry.version + 1, at });
             }
           }
+          // 1B-c: a rejoining electorate member resumes a blocked convergence in
+          // the SAME re-admission txn (Ruling B).
+          if (state.planning?.substate === 'convergence-blocked' && state.planning.rotation.electorate.includes(agent)) {
+            events.push({ kind: 'convergence-resumed', holder: resumeHolder(state.planning.rotation, state.registry, agent), at });
+          }
           const envelope: CommandEnvelope = {
             command: { kind: 'bind-agent', agent, readmit: true } as unknown as CommandEnvelope['command'],
             meta: { id: this.#ids.messageId(), at, principal: agent },
@@ -453,6 +470,11 @@ export class BrokerCore {
             events.push({ kind: 'barrier-opened', members: admittedAfter, registryVersion: version, at });
           }
         }
+      }
+      // 1B-c: a rebound electorate member re-attaching fresh resumes a blocked
+      // convergence in the SAME admission txn (Ruling B).
+      if (willAdmit && state.planning?.substate === 'convergence-blocked' && state.planning.rotation.electorate.includes(agent)) {
+        events.push({ kind: 'convergence-resumed', holder: resumeHolder(state.planning.rotation, state.registry, agent), at });
       }
       events.push({ kind: 'attention-raised', id: `tofu-${bindingId}`, category: 'tofu-bind', detail: `${agent} bound credential v${credentialVersion} (TOFU) — confirm this attach is yours.`, at });
       const envelope: CommandEnvelope = {

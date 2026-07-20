@@ -286,6 +286,15 @@ export class Journal {
     return this.sealed_.get(author);
   }
 
+  /** 1B-c: the state Finding for `id` while converging/blocked, else
+   * undefined — the stable author/addressedTo source for a findingTexts entry. */
+  private findingFromState(id: string): import('@core/types.ts').Finding | undefined {
+    const state = this.state;
+    if (state?.topology !== 'peer') return undefined;
+    if (state.planning?.substate !== 'converging' && state.planning?.substate !== 'convergence-blocked') return undefined;
+    return state.planning.findings[id];
+  }
+
   /** Committed-success dedup lookup (spec: rejections re-evaluate). */
   recordedOutcome(clientId: string, reqId: string): unknown | undefined {
     return this.dedup.get(clientId)?.get(reqId);
@@ -378,6 +387,25 @@ export class Journal {
     const state = this.state;
     if (state?.topology === 'peer' && (state.planning?.substate === 'converging' || state.planning?.substate === 'convergence-blocked')) {
       if (JSON.stringify(state.planning.revisionLog) !== JSON.stringify(this.artifacts_.revisionLog)) bad('revision-log-divergence');
+      // Ruling C cross-check: findingTexts and the state findings must agree.
+      // No artifacts key may exist without a matching state finding, and each
+      // finding's TEXT-BEARING history entries (bytes > 0) pair one-to-one, in
+      // order, with the stored entries — a removed/reordered/extra entry fails
+      // closed.
+      const findings = state.planning.findings;
+      for (const id of Object.keys(this.artifacts_.findingTexts)) {
+        if (!findings[id]) bad(`finding-orphan:${id}`);
+      }
+      for (const [id, finding] of Object.entries(findings)) {
+        const textBearing = finding.history.filter((e) => e.bytes > 0);
+        const stored = this.artifacts_.findingTexts[id] ?? [];
+        if (textBearing.length !== stored.length) bad(`finding-count:${id}`);
+        for (let i = 0; i < textBearing.length; i++) {
+          const h = textBearing[i]!;
+          const t = stored[i]!;
+          if (h.actor !== t.actor || h.at !== t.at || h.kind !== t.kind || h.bytes !== t.bytes || h.textHash !== t.textHash) bad(`finding-entry:${id}[${i}]`);
+        }
+      }
     }
   }
 
@@ -439,6 +467,24 @@ export class Journal {
         // hash-checks it below, and cross-checks revisionLog vs state).
         this.artifacts_.draft = { revision: event.revision, hash: event.hash, author: event.author, at: event.at, body: event.content };
         this.artifacts_.revisionLog = [...this.artifacts_.revisionLog, { revision: event.revision, hash: event.hash, author: event.author, at: event.at }];
+      } else if (event.kind === 'finding-filed' || event.kind === 'finding-responded' || event.kind === 'finding-confirmed' || event.kind === 'finding-amended') {
+        // Ruling C: the artifacts store is the self-verifying home for finding
+        // texts — each entry carries actor/at/kind/bytes/textHash + the body,
+        // so it survives even after a later phase drops the SessionState
+        // metadata. A no-text amend (bytes 0) records NO entry. Fields are
+        // derived from the STATE finding (stable author/addressedTo) so the
+        // cross-check pairs one-to-one with the state history by index.
+        const bytes = event.kind === 'finding-amended' ? (event.bytes ?? 0) : event.bytes;
+        const finding = this.findingFromState(event.id);
+        if (bytes > 0 && finding) {
+          const actor = event.kind === 'finding-responded' ? finding.addressedTo : finding.author;
+          const kind = event.kind === 'finding-filed' ? 'filed' : event.kind === 'finding-responded' ? 'responded' : event.kind === 'finding-confirmed' ? 'confirmed' : 'amended';
+          const disposition = event.kind === 'finding-responded' ? event.disposition : event.kind === 'finding-confirmed' ? event.verdict : event.kind === 'finding-amended' ? event.action : undefined;
+          const textHash = event.kind === 'finding-amended' ? (event.textHash ?? '') : event.textHash;
+          const text = event.kind === 'finding-amended' ? (event.text ?? '') : event.text;
+          const entry = { actor, at: event.at, kind, ...(disposition !== undefined ? { disposition } : {}), bytes, textHash, text };
+          (this.artifacts_.findingTexts[event.id] ??= []).push(entry);
+        }
       }
     }
     for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {

@@ -91,10 +91,12 @@ export type AgentRecord = {
 export const AGENT_CREDENTIAL_PATTERN = /^[0-9a-f]{64}$/;
 
 /** Peer 1A: durable human-attention item — loud TOFU, admission deadlines
- * and no-show paging must survive with no watch pane attached. */
+ * and no-show paging must survive with no watch pane attached. 1B-c adds
+ * 'findings-blocked' — one aggregate item per departed agent whose open/
+ * answered findings can no longer progress. */
 export type AttentionItem = {
   readonly id: string;
-  readonly category: 'tofu-bind';
+  readonly category: 'tofu-bind' | 'findings-blocked';
   readonly detail: string;
   readonly at: Timestamp;
 };
@@ -117,6 +119,15 @@ export const PROPOSALS_TOTAL_MAX_BYTES = 524_288;
  * once reached, telling the human the convergence has likely livelocked. */
 export const DRAFT_MAX_BYTES = 131_072;
 export const DRAFT_REVISIONS_MAX = 256;
+
+/** 1B-c: findings bounds. FINDING_TEXT_MAX bounds a single critique/response
+ * body; FINDINGS_MAX bounds the count of distinct findings; REASONS_MAX bounds
+ * one finding's history length (creation counts as the first entry);
+ * FINDINGS_TEXT_TOTAL_MAX bounds the artifacts store's cumulative text bytes. */
+export const FINDING_TEXT_MAX = 4_096;
+export const FINDINGS_MAX = 128;
+export const REASONS_MAX = 16;
+export const FINDINGS_TEXT_TOTAL_MAX = 2_097_152;
 
 /** 1B text grammar: NUL and C0/C1 controls are rejected EXCEPT \n \t \r
  * (CR accepted verbatim, no normalization — Windows CRLF passes; rev 4 #4).
@@ -196,11 +207,36 @@ export type Rotation = {
 };
 export type BlockedRotation = Omit<Rotation, 'holder'>;
 
+/** 1B-c: metadata-only finding record (Ruling C — the full texts live in the
+ * artifacts store; SessionState carries only per-entry accounting so a
+ * later phase can drop this without losing the self-verifying texts). Every
+ * transition appends one FindingHistoryEntry; a no-text amend still records
+ * an entry (bytes 0). Text-bearing entries (bytes > 0) pair one-to-one with
+ * the artifacts findingTexts entries. */
+export type FindingHistoryEntry = {
+  readonly actor: AgentId;
+  readonly at: Timestamp;
+  readonly kind: 'filed' | 'responded' | 'confirmed' | 'amended';
+  readonly disposition?: string;
+  readonly bytes: number;
+  readonly textHash: string;
+};
+export type Finding = {
+  readonly id: string;
+  readonly author: AgentId;
+  readonly addressedTo: AgentId;
+  readonly anchor: { readonly kind: 'draft'; readonly revision: number } | { readonly kind: 'proposal'; readonly author: AgentId };
+  readonly severity: 'HIGH' | 'MED' | 'LOW';
+  readonly agreement: 'agreed' | 'partial' | 'disputed';
+  readonly lifecycle: 'open' | 'answered' | 'resolved' | 'conceded' | 'withdrawn';
+  readonly history: readonly FindingHistoryEntry[];
+};
+
 export type ConvergenceCommon = {
   readonly barrier: BarrierFact;
   readonly draft: { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp };
   readonly revisionLog: readonly { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp }[];
-  readonly findings: Readonly<Record<string, unknown>>; // Finding lands in 1B-c; empty until then
+  readonly findings: Readonly<Record<string, Finding>>;
 };
 
 type SessionBase = {

@@ -50,6 +50,12 @@ const propose = (core: BrokerCore, agent: string, content: string, reqId: string
   core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'propose', content } }, `conn-${agent}`);
 const draftAmend = (core: BrokerCore, agent: string, content: string, baseRevision: number, reqId: string) =>
   core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'draft-amend', content, baseRevision } }, `conn-${agent}`);
+const critique = (core: BrokerCore, agent: string, anchor: unknown, severity: string, agreement: string, text: string, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'critique', anchor, severity, agreement, text } }, `conn-${agent}`);
+const respondCritique = (core: BrokerCore, agent: string, findingId: string, disposition: string, text: string, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'respond-critique', findingId, disposition, text } }, `conn-${agent}`);
+const confirmCritique = (core: BrokerCore, agent: string, findingId: string, verdict: string, text: string, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'confirm-critique', findingId, verdict, text } }, `conn-${agent}`);
 /** Bring both members through collecting to converging via both proposals. */
 async function convergingCore(root: string) {
   const core = await collectingCore(root);
@@ -264,5 +270,103 @@ describe('peer 1B-b: draft through the broker', () => {
     const reopened = makeCore(root);
     expect(await reopened.recover()).toBe('rebuilt');
     expect(await readFile(draftPath, 'utf8')).toBe(DRAFT_BODY); // restored byte-exact
+  });
+});
+
+describe('peer 1B-c: findings + yield + departure through the broker', () => {
+  const findingId = (r: unknown): string => {
+    const events = (r as { events?: { kind: string; id?: string }[] }).events ?? [];
+    const filed = events.find((e) => e.kind === 'finding-filed');
+    if (!filed?.id) throw new Error('no finding-filed event');
+    return filed.id;
+  };
+
+  test('critique/respond/confirm accumulate self-verifying findingTexts; restart preserves metadata + texts', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    const filed = await critique(core, 'claude', { kind: 'proposal', author: 'codex' }, 'HIGH', 'disputed', 'the codex plan races on shutdown', 'ct-1');
+    expect(filed.ok).toBeTrue();
+    const fid = findingId(filed);
+    // the text is PUBLIC post-reveal — it rides the event.
+    expect(JSON.stringify((filed as { events?: unknown }).events)).toContain('races on shutdown');
+    expect((await respondCritique(core, 'codex', fid, 'resolve', 'guarded the shutdown path', 'rs-1')).ok).toBeTrue();
+    expect((await confirmCritique(core, 'claude', fid, 'accept', 'confirmed fixed', 'cf-1')).ok).toBeTrue();
+
+    const q = await core.query('qf-1', 'planning-artifacts');
+    const ft = (q as { data?: { findingTexts?: Record<string, { actor: string; kind: string; text: string }[]> } }).data?.findingTexts?.[fid];
+    expect(ft).toHaveLength(3);
+    expect(ft?.[0]).toMatchObject({ kind: 'filed', actor: 'claude', text: 'the codex plan races on shutdown' });
+    expect(ft?.[1]).toMatchObject({ kind: 'responded', actor: 'codex', text: 'guarded the shutdown path' });
+    expect(ft?.[2]).toMatchObject({ kind: 'confirmed', actor: 'claude', text: 'confirmed fixed' });
+
+    // restart: metadata (state) and texts (artifacts) survive.
+    await core.quiesce();
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    const s = await session(reopened);
+    if (s.planning?.substate !== 'converging') throw new Error('expected converging');
+    expect(s.planning.findings[fid]).toMatchObject({ author: 'claude', addressedTo: 'codex', lifecycle: 'resolved' });
+    const q2 = await reopened.query('qf-2', 'planning-artifacts');
+    expect((q2 as { data?: { findingTexts?: Record<string, unknown[]> } }).data?.findingTexts?.[fid]).toHaveLength(3);
+  });
+
+  test('TAMPER: a removed findingTexts entry in the snapshot fails recovery closed (Ruling C)', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    const fid = findingId(await critique(core, 'claude', { kind: 'proposal', author: 'codex' }, 'MED', 'partial', 'first finding text', 'ct-1'));
+    expect((await respondCritique(core, 'codex', fid, 'dispute', 'I disagree', 'rs-1')).ok).toBeTrue();
+    await core.quiesce();
+    await core.journal.snapshot();
+
+    const snapshotPath = join(root, '.pair', 'journal', 'snapshot.json');
+    const snapshot = JSON.parse(await readFile(snapshotPath, 'utf8')) as { planningArtifacts?: { findingTexts?: Record<string, unknown[]> } };
+    const entries = snapshot.planningArtifacts?.findingTexts?.[fid];
+    expect(entries?.length).toBe(2);
+    snapshot.planningArtifacts!.findingTexts![fid] = entries!.slice(0, -1); // drop one -> count mismatch vs state history
+    await writeFile(snapshotPath, JSON.stringify(snapshot));
+
+    const reopened = makeCore(root);
+    await expect(reopened.recover()).rejects.toThrow(CorruptJournalError);
+  });
+
+  test('yield through execute passes the turn; the now-non-holder draft-amend is rejected', async () => {
+    const core = await convergingCore(await tempRoot());
+    const s0 = await session(core);
+    if (s0.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s0.planning.rotation.holder).toBe('claude');
+
+    const y = await core.execute('yl-1', 'client-claude', 'claude', { command: { kind: 'yield-turn' } }, 'conn-claude');
+    expect(y.ok).toBeTrue();
+    const passed = ((y as { events?: { kind: string; to?: string }[] }).events ?? []).find((e) => e.kind === 'convergence-turn-passed');
+    expect(passed).toMatchObject({ to: 'codex' });
+    const s1 = await session(core);
+    if (s1.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s1.planning.rotation.holder).toBe('codex');
+
+    const rejected = await draftAmend(core, 'claude', 'not mine to amend now', 0, 'da-1');
+    expect((rejected as { error?: { code?: string } }).error?.code).toBe('not-convergence-holder');
+  });
+
+  test('holder departure via leave-session passes the turn in the SAME txn', async () => {
+    const core = await convergingCore(await tempRoot());
+    const d = await core.execute('lv-1', 'client-claude', 'claude', { command: { kind: 'leave-session' } }, 'conn-claude');
+    expect(d.ok).toBeTrue();
+    const kinds = ((d as { events?: { kind: string }[] }).events ?? []).map((e) => e.kind);
+    expect(kinds).toContain('agent-left');
+    expect(kinds).toContain('convergence-turn-passed');
+    const s = await session(core);
+    if (s.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s.planning.rotation.holder).toBe('codex');
+  });
+
+  test('a departing member with open findings raises a findings-blocked attention item', async () => {
+    const core = await convergingCore(await tempRoot());
+    // claude files a finding addressed to codex (stays open).
+    expect((await critique(core, 'claude', { kind: 'proposal', author: 'codex' }, 'MED', 'partial', 'open concern', 'ct-1')).ok).toBeTrue();
+    const d = await core.execute('lv-2', 'client-codex', 'codex', { command: { kind: 'leave-session' } }, 'conn-codex');
+    expect(d.ok).toBeTrue();
+    expect(((d as { events?: { kind: string; category?: string }[] }).events ?? []).some((e) => e.kind === 'attention-raised' && e.category === 'findings-blocked')).toBeTrue();
+    const s = await session(core);
+    expect(s.attention.some((a) => a.category === 'findings-blocked')).toBeTrue();
   });
 });

@@ -1,5 +1,6 @@
 import type { Event } from './events.ts';
-import { EMPTY_DRAFT_HASH, type AgentMeta, type AgentRecord, type Registry, type SessionState } from './types.ts';
+import { advanceRotation, rotateFrom } from './rotation.ts';
+import { EMPTY_DRAFT_HASH, type AgentMeta, type AgentRecord, type Finding, type Registry, type SessionState } from './types.ts';
 
 /**
  * Pure fold: state = events.reduce(evolve, undefined). Total over every
@@ -229,7 +230,93 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       // U1: journal-authoritative binding — replay restores it; mirrors can
       // never rebind (they are views of this, not sources).
       return state && { ...state, userChannelTokenHash: event.tokenHash };
+    case 'finding-filed': {
+      // 1B-c: converging only (total): a finding is born 'open' with its
+      // creation as history entry #1 (counts toward REASONS_MAX).
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      const finding: Finding = {
+        id: event.id, author: event.author, addressedTo: event.addressedTo, anchor: event.anchor,
+        severity: event.severity, agreement: event.agreement, lifecycle: 'open',
+        history: [{ actor: event.author, at: event.at, kind: 'filed', bytes: event.bytes, textHash: event.textHash }],
+      };
+      return { ...state, planning: { ...state.planning, findings: { ...state.planning.findings, [event.id]: finding } } };
+    }
+    case 'finding-responded':
+      // Rows 1-3: resolve/dispute -> answered; concede -> conceded (terminal),
+      // agreement FORCED to 'agreed'. The responder is the finding's addressee.
+      return updateFinding(state, event.id, (f) => ({
+        ...f,
+        lifecycle: event.disposition === 'concede' ? 'conceded' : 'answered',
+        agreement: event.disposition === 'concede' ? 'agreed' : f.agreement,
+        history: [...f.history, { actor: f.addressedTo, at: event.at, kind: 'responded', disposition: event.disposition, bytes: event.bytes, textHash: event.textHash }],
+      }));
+    case 'finding-confirmed':
+      // Rows 4-5: accept -> resolved (terminal, agreement unchanged); contest
+      // -> open, flipping agreement to 'disputed' when setDisputed.
+      return updateFinding(state, event.id, (f) => ({
+        ...f,
+        lifecycle: event.verdict === 'accept' ? 'resolved' : 'open',
+        agreement: event.verdict === 'contest' && event.setDisputed ? 'disputed' : f.agreement,
+        history: [...f.history, { actor: f.author, at: event.at, kind: 'confirmed', disposition: event.verdict, bytes: event.bytes, textHash: event.textHash }],
+      }));
+    case 'finding-amended':
+      // Rows 6-7: withdraw -> withdrawn (terminal); set-agreement rewrites the
+      // agreement while open. A no-text amend records a bytes-0 history entry.
+      return updateFinding(state, event.id, (f) => ({
+        ...f,
+        lifecycle: event.action === 'withdraw' ? 'withdrawn' : f.lifecycle,
+        agreement: event.action === 'set-agreement' && event.agreement !== undefined ? event.agreement : f.agreement,
+        history: [...f.history, { actor: f.author, at: event.at, kind: 'amended', disposition: event.action, bytes: event.bytes ?? 0, textHash: event.textHash ?? '' }],
+      }));
+    case 'convergence-turn-passed': {
+      // 1B-c (Ruling B): recompute remaining/round/starterIndex deterministically
+      // via the SAME advance (registry already reflects any departure at apply
+      // time), then seat the event's authoritative holder.
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      const outcome = advanceRotation(state.planning.rotation, state.registry);
+      return { ...state, planning: { ...state.planning, rotation: { electorate: state.planning.rotation.electorate, starterIndex: outcome.starterIndex, round: outcome.round, remaining: outcome.remaining, holder: event.to } } };
+    }
+    case 'convergence-halted': {
+      // converging -> convergence-blocked: recompute the blocked order (case 2
+      // retains the unserved suffix; all-departed rollover advances the frozen
+      // starter). ConvergenceCommon carries over unchanged.
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      const { substate: _s, rotation, ...common } = state.planning;
+      const outcome = advanceRotation(rotation, state.registry);
+      return { ...state, planning: { substate: 'convergence-blocked', rotation: { electorate: rotation.electorate, starterIndex: outcome.starterIndex, round: outcome.round, remaining: outcome.remaining }, ...common } };
+    }
+    case 'convergence-resumed': {
+      // convergence-blocked -> converging. holder ∈ stored order resumes the
+      // interrupted round; holder ∉ it constructs the next round with holder as
+      // the new (frozen) starter. Derived from event.holder — evolve is total.
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'convergence-blocked') return state;
+      const { substate: _s, rotation, ...common } = state.planning;
+      const idx = rotation.remaining.indexOf(event.holder);
+      let rot;
+      if (idx >= 0) {
+        rot = { electorate: rotation.electorate, starterIndex: rotation.starterIndex, round: rotation.round, remaining: rotation.remaining.slice(idx + 1), holder: event.holder };
+      } else {
+        const nsi = rotation.electorate.indexOf(event.holder);
+        rot = nsi < 0
+          ? { electorate: rotation.electorate, starterIndex: rotation.starterIndex, round: rotation.round + 1, remaining: [], holder: event.holder }
+          : { electorate: rotation.electorate, starterIndex: nsi, round: rotation.round + 1, remaining: rotateFrom(rotation.electorate, nsi).slice(1), holder: event.holder };
+      }
+      return { ...state, planning: { substate: 'converging', rotation: rot, ...common } };
+    }
   }
+}
+
+/** 1B-c: apply a finding transition while converging (total no-op otherwise —
+ * transitions are only decided in the converging substate). */
+function updateFinding(
+  state: SessionState | undefined,
+  id: string,
+  fn: (f: Finding) => Finding,
+): SessionState | undefined {
+  if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+  const finding = state.planning.findings[id];
+  if (!finding) return state;
+  return { ...state, planning: { ...state.planning, findings: { ...state.planning.findings, [id]: fn(finding) } } };
 }
 
 export function replay(events: readonly Event[]): SessionState | undefined {

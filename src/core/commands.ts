@@ -71,6 +71,18 @@ export type Command =
    * content is validated in decide (grammar/bounds); meta.contentHash/
    * contentBytes are broker-stamped, same as propose. */
   | { kind: 'draft-amend'; content: string; baseRevision: number }
+  /** 1B-c: file a finding against a draft revision or a rival proposal
+   * (converging, electorate member only). text validated in decide (grammar/
+   * bounds); meta.contentHash/contentBytes are broker-stamped like propose. */
+  | { kind: 'critique'; anchor: import('./types.ts').Finding['anchor']; severity: import('./types.ts').Finding['severity']; agreement: import('./types.ts').Finding['agreement']; text: string }
+  /** 1B-c: the addressee answers an open finding. */
+  | { kind: 'respond-critique'; findingId: string; disposition: 'resolve' | 'concede' | 'dispute'; text: string }
+  /** 1B-c: the author confirms an answered finding. */
+  | { kind: 'confirm-critique'; findingId: string; verdict: 'accept' | 'contest'; text: string; setDisputed?: boolean }
+  /** 1B-c: the author withdraws or re-labels its own finding. */
+  | { kind: 'amend-critique'; findingId: string; action: 'withdraw' | 'set-agreement'; agreement?: import('./types.ts').Finding['agreement']; text?: string }
+  /** 1B-c: the convergence holder passes the turn (must-respond gate first). */
+  | { kind: 'yield-turn' }
   /** Round 2 #8: complete a durable attention item (loud TOFU etc.) —
    * without this the instruction can never be satisfied. */
   | { kind: 'user-clear-attention'; id: string; groupId: string; noticeIdBase: string }
