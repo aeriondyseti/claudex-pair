@@ -189,3 +189,86 @@ describe('peer gateway: auto-attach across process boundaries', () => {
     await subscription.ack(resumed.deliveryId); // ack ownership across the re-attach
   }, 20_000);
 });
+
+
+describe('round 3 #2: a blocked wait survives a user rebind by rotating and resubscribing', () => {
+  test('rebind wakes the subscription; rotation binds v2; the wait resumes with exactly-once delivery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-peergw4-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    await mkdir(join(root, '.pair'), { recursive: true });
+    const { endpoint } = await makeBroker(root, 35);
+
+    // Bootstrap: claude inits; codex auto-admits.
+    const initGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-claude' }), creds({ claude: CRED.claude }));
+    await initGw.execute({
+      as: 'claude',
+      command: { kind: 'init-session', task: 'peer wire', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-wire-4', topology: 'peer' },
+      identity: { clientId: 'cli-claude', reqId: 'init-1' },
+      credential: CRED.claude,
+    });
+    await initGw.close();
+
+    // codex holds a ROTATING credential source: mints a fresh secret when
+    // the broker reports the old one revoked.
+    const minted: string[] = [CRED.codex];
+    const rotating = async (agent: string, options?: { rotate?: boolean }) => {
+      if (agent !== 'codex') throw new Error('wrong agent');
+      if (options?.rotate) minted.push(`${minted.length}${'c'.repeat(63)}`.slice(0, 64));
+      return minted[minted.length - 1]!;
+    };
+    const codexGw = new BrokerGateway(
+      {
+        clientId: 'cli-codex',
+        connect: async () => new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex' }),
+        rediscover: async () => new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex' }),
+      },
+      { maxAttempts: 8, baseDelayMs: 25, maxDelayMs: 100 },
+      rotating,
+    );
+    cleanups.push(() => codexGw.close());
+
+    // codex admits itself (auto-attach) and BLOCKS on a wait.
+    await send(codexGw, 'codex', 'claude', 'bootstrap', 'b-1');
+    const subscription = await codexGw.subscribe('codex', 0);
+    cleanups.push(() => subscription.close());
+    const iterator = subscription.deliveries[Symbol.asyncIterator]();
+    const pending = iterator.next(); // blocked wait, nothing queued
+
+    // The USER rebinds codex over the real wire while the wait is blocked.
+    const userGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-user' }));
+    cleanups.push(() => userGw.close());
+    const userSession = await userGw.userAttach('f'.repeat(64));
+    cleanups.push(() => userSession.close());
+    await userSession.action('ract-1', { verb: 'rebind', agent: 'codex' });
+
+    // claude (fresh process) sends AFTER the rebind: the blocked wait must
+    // rotate (v2), resubscribe at the same cursor, and receive EXACTLY once.
+    const claudeGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-claude-2' }), creds({ claude: CRED.claude }));
+    cleanups.push(() => claudeGw.close());
+    await send(claudeGw, 'claude', 'codex', 'after the rebind', 'a-1');
+
+    // Drain EVERYTHING with acks until the stream is quiet: system
+    // broadcasts (user-channel TOFU notice) may legitimately redeliver
+    // across the generation swap (at-least-once, unacked mail); the
+    // post-rebind message itself must appear EXACTLY once, and afterwards
+    // exactly one live subscription remains (quiet stream, no double-feed
+    // from the deleted server-side generation).
+    const seen = new Map<string, string>(); // deliveryId -> body
+    let step = await pending;
+    for (;;) {
+      const delivery = step.value!;
+      seen.set(delivery.deliveryId, delivery.message.body as string);
+      await subscription.ack(delivery.deliveryId); // ack owned across the re-attach
+      const next = await Promise.race([iterator.next().then((r) => ({ r })), new Promise<'quiet'>((res) => setTimeout(() => res('quiet'), 400))]);
+      if (next === 'quiet') break;
+      step = next.r;
+    }
+    // Exactly-once BY DELIVERY IDENTITY, and the stream converges to quiet
+    // after acks (the loop's exit) — a true double-feed (second live
+    // server-side subscription) would never converge. Same-id redelivery
+    // bursts during the generation swap are at-least-once semantics the
+    // consumer already acks through.
+    expect([...seen.values()].filter((b) => b.includes('after the rebind'))).toHaveLength(1);
+    expect(minted.length).toBe(2); // exactly one rotation happened
+  }, 20_000);
+});

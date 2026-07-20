@@ -276,11 +276,11 @@ describe('peer 1A round 2 #5: pending-rebind bindings survive snapshots', () => 
     await commitInit(journal);
     await journal.commit(env({ kind: 'bind-agent' }, 'codex', 'b1'), [] as never[], { ok: true }, { clientId: 'c', reqId: 'r-b1' }, [], { codex: { hash: 'h'.repeat(64), credentialVersion: 1 } });
     await journal.commit(env({ kind: 'user-rebind-agent' }, 'user', 'b2'), [] as never[], { ok: true }, { clientId: 'c', reqId: 'r-b2' }, [], { codex: null });
-    expect(journal.binding('codex')).toEqual({ credentialVersion: 1 }); // hash gone, version kept
+    expect(journal.binding('codex')).toEqual({ credentialVersion: 1, revokedHash: 'h'.repeat(64) }); // hash moved to the denylist
 
     await journal.snapshot();
     const reopened = new Journal(pairDir);
     await reopened.recover();
-    expect(reopened.binding('codex')).toEqual({ credentialVersion: 1 }); // NOT dropped by the snapshot
+    expect(reopened.binding('codex')).toEqual({ credentialVersion: 1, revokedHash: 'h'.repeat(64) }); // denylist survives the snapshot
   });
 });

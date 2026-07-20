@@ -69,8 +69,9 @@ export type Snapshot = {
   transcript?: TranscriptRecord[];
   /** Peer 1A: private verifier map persisted across snapshots. Entries
    * WITHOUT a hash are pending-rebind (revoked): the version must survive
-   * restart so the next TOFU binds at version+1 (codex 1A round 2 #5). */
-  bindings?: Record<string, { hash?: string; credentialVersion: number }>;
+   * restart so the next TOFU binds at version+1, and the REVOKED hash is
+   * kept as a denylist so the old secret can never re-bind (round 3 #1). */
+  bindings?: Record<string, { hash?: string; credentialVersion: number; revokedHash?: string }>;
   /** Item 7: first-class awaiting-set (asks not yet validly answered).
    * Persisted so cap pressure on the transcript ring can never lose an
    * unresolved ask across restart. Optional: a legacy snapshot lacks it —
@@ -200,9 +201,10 @@ export class Journal {
    * persisted in snapshots, NEVER derived from the bounded ring. */
   private awaiting_ = new Map<string, AwaitingEntry>();
   /** Peer 1A: broker-private credential verifiers (agent → hash+version).
-   * A revoked binding keeps its version (hash cleared) so the next TOFU
-   * binds at version+1. */
-  private bindings_ = new Map<string, { hash?: string; credentialVersion: number }>();
+   * A revoked binding keeps its version (hash cleared, moved to
+   * revokedHash) so the next TOFU binds at version+1 AND the old secret
+   * is rejected forever (round 3 #1). */
+  private bindings_ = new Map<string, { hash?: string; credentialVersion: number; revokedHash?: string }>();
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -235,7 +237,7 @@ export class Journal {
     return [...this.awaiting_.values()];
   }
   /** Peer 1A: the PRIVATE verifier for an agent (never projected). */
-  binding(agent: string): { hash?: string; credentialVersion: number } | undefined {
+  binding(agent: string): { hash?: string; credentialVersion: number; revokedHash?: string } | undefined {
     return this.bindings_.get(agent);
   }
 
@@ -341,8 +343,16 @@ export class Journal {
     }
     for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {
       if (verifier === null) {
+        // Revocation DERIVES the denylist from the prior verifier — the
+        // record itself stores null (no re-written hash material), and
+        // both segment replay and snapshot restore reproduce it.
         const prev = this.bindings_.get(agent);
-        if (prev) this.bindings_.set(agent, { credentialVersion: prev.credentialVersion });
+        if (prev) {
+          this.bindings_.set(agent, {
+            credentialVersion: prev.credentialVersion,
+            ...(prev.hash !== undefined ? { revokedHash: prev.hash } : prev.revokedHash !== undefined ? { revokedHash: prev.revokedHash } : {}),
+          });
+        }
       } else this.bindings_.set(agent, verifier);
     }
     this.lastSeq = record.seq;

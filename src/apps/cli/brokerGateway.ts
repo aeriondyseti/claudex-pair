@@ -32,30 +32,39 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
      * operation auto-attaches on ITS live connection (reactive on
      * agent-not-attached, and on every reconnect via the shared attach
      * path) — a tag never outlives its socket, so the GATEWAY must carry
-     * the proof, not a one-shot `pair attach` process. */
-    private readonly credentials?: (agent: string) => Promise<string>,
+     * the proof, not a one-shot `pair attach` process. `rotate` mints an
+     * agent-generated REPLACEMENT when the broker reports the old secret
+     * revoked (round 3 #1). */
+    private readonly credentials?: (agent: string, options?: { rotate?: boolean }) => Promise<string>,
   ) {
     this.clientId = connector.clientId;
   }
 
   static forRoot(root: string): BrokerGateway {
-    return new BrokerGateway(new BrokerDiscovery({ root }), DEFAULT_RECONNECT, async (agent) => {
-      const cred = await loadOrCreateAgentCredential(root, agent);
+    return new BrokerGateway(new BrokerDiscovery({ root }), DEFAULT_RECONNECT, async (agent, options) => {
+      const cred = await loadOrCreateAgentCredential(root, agent, { regenerate: options?.rotate === true });
       if (cred.kind === 'error') throw new BrokerWireError('credential-error', cred.detail);
       return cred.token;
     });
   }
-  static forClient(client: IpcClient, credentials?: (agent: string) => Promise<string>): BrokerGateway {
+  static forClient(client: IpcClient, credentials?: (agent: string, options?: { rotate?: boolean }) => Promise<string>): BrokerGateway {
     return new BrokerGateway({ clientId: client.clientId, connect: async () => client, rediscover: async () => client }, DEFAULT_RECONNECT, credentials);
   }
 
   /** Attach `agent` on this exact client (its OWN credential, transport
-   * edge only). Throws typed errors; TOFU is idempotent by credential. */
+   * edge only). Throws typed errors; TOFU is idempotent by credential.
+   * Round 3 #1: a credential-revoked rejection ROTATES — the source mints
+   * an agent-generated replacement and re-attaches once (new TOFU at
+   * version+1); the revoked secret itself is denylisted broker-side. */
   private async attachOn(client: IpcClient, agent: string): Promise<void> {
     if (!this.credentials) throw new BrokerWireError('agent-not-attached', 'This gateway has no agent-credential source for peer sessions.');
     const token = await this.credentials(agent);
     const res = await client.agentAttach(agent, token);
-    if (!res.ok) throw new BrokerWireError(res.error.code, res.error.message);
+    if (res.ok) return;
+    if (res.error.code !== 'credential-revoked') throw new BrokerWireError(res.error.code, res.error.message);
+    const fresh = await this.credentials(agent, { rotate: true });
+    const retry = await client.agentAttach(agent, fresh);
+    if (!retry.ok) throw new BrokerWireError(retry.error.code, retry.error.message);
   }
 
   async execute(request: ExecuteRequest): Promise<ExecuteOutcome> {
@@ -183,6 +192,16 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       // removed-from-session is a TYPED TERMINAL failure — latched before
       // any close callback can replace it, and reconnect is suppressed.
       const offErr = next.onServerError((e) => {
+        if (e.code === 'credential-revoked') {
+          // Round 3 #2: a rebind deregisters this subscription server-side
+          // WITHOUT closing the socket — treat it as a reconnect trigger.
+          // The reconnect's attach path hits the denylist, ROTATES the
+          // credential, re-attaches, and resubscribes at the same acked
+          // cursor (no duplicate consumption: server state was dropped).
+          scheduleReconnect();
+          next.close(); // listeners already unhooked by scheduleReconnect
+          return;
+        }
         if (e.code !== 'removed-from-session') return;
         removed = new BrokerWireError(e.code, e.message);
         // PREEMPTIVE: discard buffered deliveries — a removed agent must see

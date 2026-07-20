@@ -226,11 +226,42 @@ describe('user-rebind-agent: pending-new-binding, revoked tags, TOFU at version+
     const stale = await core.execute('x1', 'client-codex', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'info', turn: 'keep', body: 'x' } }, 'conn-codex');
     expect((stale as { error?: { code?: string } }).error?.code).toBe('agent-not-attached');
 
+    // Round 3 #1: the REVOKED secret is denylisted — an offline process
+    // still holding it can never TOFU it back in.
+    core.onConnection('conn-codex-old', 'open');
+    const oldSecret = await core.agentAttach('at-old', 'conn-codex-old', 'client-codex', 'codex', CRED.codex);
+    expect((oldSecret as { error?: { code?: string } }).error?.code).toBe('credential-revoked');
+
     // Next attach TOFUs at version+1 with a FRESH credential.
     core.onConnection('conn-codex-2', 'open');
     const again = await core.agentAttach('at-2', 'conn-codex-2', 'client-codex', 'codex', 'd'.repeat(64));
     expect(again.ok).toBeTrue();
     expect((again as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(2);
+
+  });
+
+  test('round 3 #1: revocation state survives RESTART — old secret rejected, rotated secret reconnects at v2', async () => {
+    const root = await tempRoot();
+    const core = await peerCore(root);
+    core.onConnection('conn-codex', 'open');
+    expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
+    core.onConnection('conn-user', 'open');
+    expect((await core.userAttach('uat-1', { id: 'conn-user', sendObserver: async () => undefined }, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
+    expect((await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'rebind', agent: 'codex' })).ok).toBeTrue();
+    core.onConnection('conn-x', 'open');
+    expect((await core.agentAttach('at-2', 'conn-x', 'client-codex', 'codex', 'd'.repeat(64))).ok).toBeTrue(); // rotated v2
+
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    reopened.onConnection('conn-y', 'open');
+    const oldAfterRestart = await reopened.agentAttach('at-3', 'conn-y', 'client-codex', 'codex', CRED.codex);
+    // Once a ROTATED binding exists, the old secret is simply a wrong
+    // credential (auth-failed); during the pending window it is the typed
+    // credential-revoked (pinned in the rebind test above). Rejected either way.
+    expect((oldAfterRestart as { error?: { code?: string } }).error?.code).toBe('agent-auth-failed');
+    const rotated = await reopened.agentAttach('at-4', 'conn-y', 'client-codex', 'codex', 'd'.repeat(64));
+    expect(rotated.ok).toBeTrue();
+    expect((rotated as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(2);
   });
 });
 

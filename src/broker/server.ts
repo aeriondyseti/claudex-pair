@@ -341,6 +341,12 @@ export class BrokerCore {
         this.#agentConnections.set(connectionId, { agent, credentialVersion: existing.credentialVersion });
         return { reqId, ok: true, data: { agent, credentialVersion: existing.credentialVersion, admitted: true } };
       }
+      // Round 3 #1: a user revocation is FINAL for that secret — the old
+      // hash is a private denylist; presenting the revoked credential can
+      // never TOFU it back in at a new version.
+      if (existing?.revokedHash !== undefined && constantTimeEqualHex(sha256Hex(credential), existing.revokedHash)) {
+        return err(reqId, 'credential-revoked', 'This credential was revoked by the user — generate a NEW one (pair attach -Regenerate) and re-attach.');
+      }
       // TOFU: no dedup shortcut (mirrors user-attach — an unrelated recorded
       // outcome must never stand in for a bind); a retry lands in the
       // reconnect branch above and re-proves its own credential.
