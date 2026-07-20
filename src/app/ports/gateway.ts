@@ -37,6 +37,8 @@ export type ExecuteRequest = {
   readonly as: AgentId;
   readonly command: Command;
   readonly identity: RequestIdentity;
+  /** Peer 1A: transport-edge credential (peer init only) — never journaled. */
+  readonly credential?: string;
 };
 
 /**
@@ -106,6 +108,9 @@ export interface ProtocolGateway {
    * successes replay their recorded outcome under the same RequestIdentity.
    */
   execute(request: ExecuteRequest): Promise<ExecuteOutcome>;
+  /** Peer 1A: bind + tag this connection as `agent` (optional: pair-mode
+   * gateways and test fakes may omit it). */
+  agentAttach?(agent: AgentId, credential: string): Promise<{ readonly agent: AgentId; readonly credentialVersion: number; readonly admitted: boolean }>;
   status(): Promise<StatusDto>;
   log(tail?: number): Promise<readonly StoredMessage[]>;
   /** All grants regardless of state (the CLI `grants` listing). */

@@ -8,6 +8,7 @@ import { systemClock, systemIds } from '@adapters/clock/index.ts';
 import { BrokerGateway, BrokerWireError } from './brokerGateway.ts';
 import { nextDelivery, printDeliveryThenAck } from './brokerWait.ts';
 import { has, num, str } from './args.ts';
+import { loadOrCreateAgentCredential } from './credentialStore.ts';
 
 type Flags = Map<string, string | true>;
 const out = (text: string) => process.stdout.write(`${text}\n`);
@@ -57,9 +58,16 @@ export async function runBrokerCli(
       const driver = (str(flags, 'driver') ?? 'claude').toLowerCase();
       // M1: session identity is minted HERE, once, at init (deferred from item 7).
       const sessionId = randomUUID();
-      // Peer 1A: -Topology peer opens the admitting bootstrap.
+      // Peer 1A: -Topology peer opens the admitting bootstrap; the INIT
+      // carries the initiator's own credential at the transport edge.
       const topology = (str(flags, 'topology') ?? 'pair').toLowerCase() as 'pair' | 'peer';
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, topology, ...(Object.keys(meta).length ? { meta } : {}) });
+      let credential: string | undefined;
+      if (topology === 'peer') {
+        const cred = await loadOrCreateAgentCredential(root, driver);
+        if (cred.kind === 'error') throw new Error(`initiator credential: ${cred.detail}`);
+        credential = cred.token;
+      }
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, topology, ...(Object.keys(meta).length ? { meta } : {}) }, credential);
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);
@@ -85,6 +93,17 @@ export async function runBrokerCli(
       // timeout re-arm lost the thread entirely (codex blocker 1).
       const fusedThread = type === 'ask' && sent?.kind === 'message-sent' ? sent.id : undefined;
       return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true, fusedThread);
+    }
+    if (command === 'attach') {
+      // Peer 1A: bind THIS connection as the agent using its own stored
+      // (or freshly minted) credential; -Regenerate mints anew post-rebind.
+      const as = required(flags, 'as', 'attach requires -As <your own agent name>').toLowerCase();
+      if (gateway.agentAttach === undefined) throw new Error('attach requires the broker gateway.');
+      const cred = await loadOrCreateAgentCredential(root, as, { regenerate: has(flags, 'regenerate') });
+      if (cred.kind === 'error') throw new Error(`agent credential: ${cred.detail}`);
+      const bound = await gateway.agentAttach(as, cred.token);
+      out(`${bound.agent} attached (credential v${bound.credentialVersion})${bound.admitted ? ' and is ADMITTED' : ''}. This tag lives with the connection — long-running waits re-attach automatically on reconnect.`);
+      return 0;
     }
     if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
@@ -144,7 +163,7 @@ export async function runBrokerCli(
   } finally { await gateway.close(); }
 }
 
-async function execute(gateway: CliGateway, as: AgentId, command: Command): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() } }); }
+async function execute(gateway: CliGateway, as: AgentId, command: Command, credential?: string): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() }, ...(credential === undefined ? {} : { credential }) }); }
 
 async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
   const status = await gateway.status();
@@ -212,7 +231,14 @@ function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
   if (reg) {
     const left = Object.values(reg.agents).filter((a) => a.status === 'left').map((a) => a.id);
     out(`Session:   ${s.session.sessionId ?? '(pre-M1 — none)'}   Registry: v${reg.version} (${s.session.agents.length} live, cap ${MAX_AGENTS}${left.length ? `; left: ${left.join(', ')}` : ''})`);
-  } else out('Session:   (pre-M1 broker — no registry)'); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+  } else out('Session:   (pre-M1 broker — no registry)');
+  // Peer 1A: durable human-attention + admitting progress.
+  if (s.session.topology === 'peer') {
+    const planning = s.session.planning;
+    if (planning?.substate === 'admitting') out(`Admitting: ${planning.admitted.length}/${planning.authorizedExpected.length} attached (${planning.authorizedExpected.filter((a) => !planning.admitted.includes(a)).join(', ') || 'none'} outstanding)${planning.deadlineAt ? `; deadline ${planning.deadlineAt}` : ''}`);
+    else out(`Phase:     ${s.session.phase}${planning ? ` (${planning.substate})` : ''}`);
+    for (const item of s.session.attention) out(`ATTENTION: [${item.category}] ${item.detail} (${item.at})`);
+  } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));

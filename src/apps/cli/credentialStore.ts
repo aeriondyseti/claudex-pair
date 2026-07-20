@@ -34,6 +34,17 @@ function credentialPath(root: string): string {
   return join(base, 'claudex', 'user', `${hash}.cred`);
 }
 
+/** Peer 1A: per-agent credential path — same store, `agents/` namespace,
+ * keyed by root AND agent so multi-agent panes on one machine never share
+ * a secret (rev 4: credentials are agent-generated, never distributed). */
+function agentCredentialPath(root: string, agent: string): string {
+  const hash = createHash('sha256').update(`${normalizedRoot(root)}::${agent}`).digest('hex').slice(0, 16);
+  const base = process.platform === 'win32'
+    ? (process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'))
+    : join(homedir(), '.local', 'share');
+  return join(base, 'claudex', 'agents', `${hash}.cred`);
+}
+
 /** 32 random bytes as lowercase hex — the frozen wire encoding. */
 const newToken = (): string => randomBytes(32).toString('hex');
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
@@ -42,8 +53,23 @@ const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
  * opts into a plaintext 0600 file (their credential decision was DPAPI). */
 const plaintextFallbackAllowed = (): boolean => process.env['CLAUDEX_ALLOW_PLAINTEXT_CRED'] === '1';
 
+/** Peer 1A: load or mint THIS agent's credential. `regenerate` supports
+ * the user-rebind flow (the old secret is revoked broker-side; the agent
+ * mints a fresh one). Same DPAPI/0600 handling as the user token. */
+export async function loadOrCreateAgentCredential(root: string, agent: string, options: { regenerate?: boolean } = {}): Promise<CredentialResult> {
+  const path = agentCredentialPath(root, agent);
+  if (options.regenerate) {
+    const { rm } = await import('node:fs/promises');
+    await rm(path, { force: true });
+  }
+  return loadOrCreateAt(path, { createIfMissing: true });
+}
+
 export async function loadOrCreateUserToken(root: string, options: { createIfMissing: boolean } = { createIfMissing: true }): Promise<CredentialResult> {
-  const path = credentialPath(root);
+  return loadOrCreateAt(credentialPath(root), options);
+}
+
+async function loadOrCreateAt(path: string, options: { createIfMissing: boolean }): Promise<CredentialResult> {
   if (process.platform !== 'win32' && !plaintextFallbackAllowed()) {
     return { kind: 'error', detail: 'DPAPI is unavailable on this platform. Set CLAUDEX_ALLOW_PLAINTEXT_CRED=1 to explicitly accept a plaintext 0600 credential file instead.' };
   }
@@ -68,7 +94,7 @@ export async function loadOrCreateUserToken(root: string, options: { createIfMis
     // overwrite the winner's credential (codex slice review #3).
     await writeFile(path, stored, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return loadOrCreateUserToken(root, { createIfMissing: false });
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return loadOrCreateAt(path, { createIfMissing: false });
     throw error;
   }
   await chmod(path, 0o600).catch(() => undefined);

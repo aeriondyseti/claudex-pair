@@ -34,11 +34,19 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
   }
 
   async execute(request: ExecuteRequest): Promise<ExecuteOutcome> {
-    const response = await this.response((client) => client.execute(request.as, { command: request.command }, request.identity.reqId), true);
+    const response = await this.response((client) => client.execute(request.as, { command: request.command, ...(request.credential === undefined ? {} : { credential: request.credential }) }, request.identity.reqId), true);
     const data = response.data as Omit<ExecuteOutcome, 'seq' | 'events'>;
     return { ...data, ...(response.seq === undefined ? {} : { seq: response.seq }), events: (response.events ?? []) as ExecuteOutcome['events'] };
   }
   async status(): Promise<StatusDto> { return this.query<StatusDto>('status'); }
+  /** Peer 1A: attach THIS connection as the agent (no internal retry —
+   * the caller re-attaches; TOFU is idempotent by credential). */
+  async agentAttach(agent: string, credential: string): Promise<{ agent: string; credentialVersion: number; admitted: boolean }> {
+    const client = await this.getClient(true);
+    const response = await client.agentAttach(agent, credential);
+    if (!response.ok) throw new BrokerWireError(response.error.code, response.error.message);
+    return response.data as { agent: string; credentialVersion: number; admitted: boolean };
+  }
   async log(tail = 10): Promise<readonly StoredMessage[]> { return this.query<readonly StoredMessage[]>('log', { tail }); }
   async grants(): Promise<readonly Grant[]> { return this.query<readonly Grant[]>('grants'); }
   async brokerStatus(): Promise<BrokerStatusDto> {

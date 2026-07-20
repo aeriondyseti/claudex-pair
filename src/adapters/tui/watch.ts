@@ -127,6 +127,13 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
     const age = ageSeconds(model.now, a.sentAt);
     lines.push(` ${DIM}awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId}${age === undefined ? '' : ` (${formatAge(age)} ago)`}${RESET}`);
   }
+  // Peer 1A: durable human-attention items — loud regardless of when the
+  // pane attached (the state carries them, not a live push).
+  if (model.session.topology === 'peer') {
+    for (const item of model.session.attention) {
+      lines.push(` ${WARN}${BOLD}⚠ ATTENTION [${item.category}]${RESET} ${WARN}${item.detail}${RESET}`);
+    }
+  }
   if (model.session.status === 'paused') {
     lines.push('', ` ${WARN}${BOLD}⏸ SESSION PAUSED by the user — agents are braked; /resume to continue.${RESET}`);
   }
