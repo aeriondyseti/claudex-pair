@@ -48,6 +48,19 @@ export type Command =
   // U1 slice 4b: the brake. Pause freezes agent mutations (allowlist:
   // leave, active-grant completion); resume restores ONLY the status.
   | { kind: 'user-pause-session'; reason: string; groupId: string; noticeIdBase: string }
+  /** Peer 1A: post-init admission authorization (the agent still attaches
+   * with its own credential; this only adds it to authorizedExpected). */
+  | { kind: 'user-admit-agent'; agent: AgentId; groupId: string; noticeIdBase: string }
+  /** Peer 1A: pending-new-binding — invalidates the old verifier, revokes
+   * and wakes all old-version tags; the next attach TOFUs at version+1. */
+  | { kind: 'user-rebind-agent'; agent: AgentId; groupId: string; noticeIdBase: string }
+  /** Peer 1A: per-absentee admitting ruling — abstain drops the invitee
+   * from expected (authorized pending observer); wait sets a new absolute
+   * deadline. */
+  | { kind: 'user-rule-absentee'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; groupId: string; noticeIdBase: string }
+  /** Peer 1A: bounded forced transition — planning->provisioning ONLY;
+   * outcome is permanently 'forced', never unanimity. */
+  | { kind: 'user-force-phase'; to: import('./types.ts').SessionPhase; reason: string; groupId: string; noticeIdBase: string }
   | { kind: 'user-resume-session'; groupId: string; noticeIdBase: string };
 
 export type GrantScopeInput =

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { CommandEnvelope } from '../../src/core/commands.ts';
 import { decide } from '../../src/core/decide.ts';
-import { replay } from '../../src/core/evolve.ts';
+import { evolve, replay } from '../../src/core/evolve.ts';
 import type { SessionState } from '../../src/core/types.ts';
 
 /** Peer 1A-1: discriminated state, peer init bootstrap shape, and the
@@ -65,5 +65,81 @@ describe('peer command matrix: no driver authority', () => {
     const d = decide(peerState(), env({ kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: 'x' }, 'claude', 'fy1'));
     // to-codex rejected while codex is unadmitted (not a participant).
     expect(d.ok).toBeFalse();
+  });
+});
+
+
+describe('peer 1A privileged user verbs', () => {
+  const userEnv = (command: unknown, id: string) => env(command, 'user', id);
+  const base = { groupId: 'g1', noticeIdBase: 'n1' };
+
+  function userReady(expected: string[] = ['claude', 'codex', 'agy']): SessionState {
+    const s = decide(undefined, env({ kind: 'init-session', task: 'p', agents: expected, driver: 'claude', sessionId: 'session-p-0002', topology: 'peer' }, 'claude', 'i2'));
+    if (!s.ok) throw s.error;
+    const events = [...s.value, { kind: 'user-channel-registered', tokenHash: 'h'.repeat(64), at: AT }];
+    return replay(events as Parameters<typeof replay>[0])!;
+  }
+
+  function applyDecided(s: SessionState, command: unknown, id: string): SessionState {
+    const d = decide(s, userEnv(command, id));
+    if (!d.ok) throw d.error;
+    return d.value.reduce<SessionState | undefined>((acc, e) => (acc === undefined ? acc : (evolve(acc, e) ?? acc)), s)!;
+  }
+
+  test('user-admit-agent authorizes (admitting only, cap-bounded); authorization is not membership', () => {
+    let s = userReady();
+    s = applyDecided(s, { kind: 'user-admit-agent', agent: 'gemini', ...base }, 'ua1');
+    if (s.topology !== 'peer' || s.planning?.substate !== 'admitting') throw new Error('shape');
+    expect(s.planning.authorizedExpected).toContain('gemini');
+    expect(s.agents).not.toContain('gemini');
+
+    const dup = decide(s, userEnv({ kind: 'user-admit-agent', agent: 'gemini', ...base }, 'ua2'));
+    expect(dup.ok).toBeFalse();
+  });
+
+  test('user-rule-absentee: the CLOSING abstain completes admission; wait requires a deadline; non-absentees rejected', () => {
+    let s = userReady(['claude', 'codex']);
+    s = applyDecided(s, { kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'ur1');
+    if (s.topology !== 'peer') throw new Error('shape');
+    expect(s.planning).toEqual({ substate: 'collecting' });
+
+    const s2 = userReady();
+    const noDeadline = decide(s2, userEnv({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', ...base }, 'ur2'));
+    expect(noDeadline.ok).toBeFalse();
+    const waited = applyDecided(s2, { kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', newDeadlineAt: '2026-07-21 09:00:00', ...base }, 'ur3');
+    if (waited.topology !== 'peer' || waited.planning?.substate !== 'admitting') throw new Error('shape');
+    expect(waited.planning.deadlineAt).toBe('2026-07-21 09:00:00');
+
+    const notAbsent = decide(s2, userEnv({ kind: 'user-rule-absentee', agent: 'claude', ruling: 'abstain', ...base }, 'ur4'));
+    expect(notAbsent.ok ? '' : (notAbsent.error as { code?: string }).code).toBe('not-an-absentee');
+  });
+
+  test('user-force-phase: planning->provisioning with outcome FORCED; implementation unavailable', () => {
+    const s = userReady();
+    const forced = decide(s, userEnv({ kind: 'user-force-phase', to: 'provisioning', reason: 'livelock', ...base }, 'uf1'));
+    expect(forced.ok).toBeTrue();
+    if (!forced.ok) return;
+    expect(forced.value.find((e) => e.kind === 'phase-transition')).toMatchObject({ from: 'planning', to: 'provisioning', outcome: 'forced' });
+    const after = forced.value.reduce<SessionState | undefined>((acc, e) => (acc === undefined ? acc : (evolve(acc, e) ?? acc)), s)!;
+    if (after.topology !== 'peer') throw new Error('shape');
+    expect(after.phase).toBe('provisioning');
+    expect(after.planning).toBeUndefined();
+
+    const beyond = decide(s, userEnv({ kind: 'user-force-phase', to: 'implementation', reason: '', ...base }, 'uf2'));
+    expect(beyond.ok ? '' : (beyond.error as { code?: string }).code).toBe('phase-unavailable');
+  });
+
+  test('user-rebind-agent needs an existing binding and emits the canonical rebound transition', () => {
+    const s = userReady();
+    const unbound = decide(s, userEnv({ kind: 'user-rebind-agent', agent: 'codex', ...base }, 'ub1'));
+    expect(unbound.ok).toBeFalse();
+
+    const bound = evolve(s, { kind: 'registry-updated', version: 99, change: 'bound', agent: 'claude', binding: { bindingId: 'b1', credentialVersion: 1, boundAt: AT }, at: AT })!;
+    const rebind = decide(bound, userEnv({ kind: 'user-rebind-agent', agent: 'claude', ...base }, 'ub2'));
+    expect(rebind.ok).toBeTrue();
+    if (!rebind.ok) return;
+    expect(rebind.value.find((e) => e.kind === 'registry-updated')).toMatchObject({ change: 'rebound', agent: 'claude', version: 100 });
+    const after = rebind.value.reduce<SessionState | undefined>((acc, e) => (acc === undefined ? acc : (evolve(acc, e) ?? acc)), bound)!;
+    expect(after.registry.agents['claude']!.binding).toBeUndefined();
   });
 });

@@ -201,3 +201,35 @@ describe('auth BEFORE dedup; tag-derived principal; mailbox ownership', () => {
     expect(ownAck.ok).toBeTrue();
   });
 });
+
+
+describe('user-rebind-agent: pending-new-binding, revoked tags, TOFU at version+1', () => {
+  test('rebind clears the private verifier, revokes+wakes old tags, and the next attach TOFUs at v2', async () => {
+    const core = await peerCore(await tempRoot());
+    core.onConnection('conn-codex', 'open');
+    expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
+
+    // A blocked wait on the codex tag observes the wake.
+    const errors: unknown[] = [];
+    const sub = await core.subscribe('sub-1', { id: 'conn-codex', sendDelivery: async () => undefined, sendError: async (code) => void errors.push(code) }, 'codex', 0);
+    expect(sub.ok).toBeTrue();
+
+    // User channel + rebind action.
+    core.onConnection('conn-user', 'open');
+    const attach = await core.userAttach('uat-1', { id: 'conn-user', sendObserver: async () => undefined }, 'client-user', 'f'.repeat(64));
+    expect(attach.ok).toBeTrue();
+    const rebind = await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'rebind', agent: 'codex' });
+    expect(rebind.ok).toBeTrue();
+    expect(errors).toContain('credential-revoked'); // blocked wait woken
+
+    // The old tag is gone: execute on it fails closed.
+    const stale = await core.execute('x1', 'client-codex', 'codex', { command: { kind: 'send-message', to: 'claude', type: 'info', turn: 'keep', body: 'x' } }, 'conn-codex');
+    expect((stale as { error?: { code?: string } }).error?.code).toBe('agent-not-attached');
+
+    // Next attach TOFUs at version+1 with a FRESH credential.
+    core.onConnection('conn-codex-2', 'open');
+    const again = await core.agentAttach('at-2', 'conn-codex-2', 'client-codex', 'codex', 'd'.repeat(64));
+    expect(again.ok).toBeTrue();
+    expect((again as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(2);
+  });
+});

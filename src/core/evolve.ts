@@ -117,6 +117,23 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
         ? { ...state, planning: { substate: 'collecting' } }
         : state;
+    case 'admission-authorized':
+      return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
+        ? { ...state, planning: { ...state.planning, authorizedExpected: state.planning.authorizedExpected.includes(event.agent) ? state.planning.authorizedExpected : [...state.planning.authorizedExpected, event.agent] } }
+        : state;
+    case 'absentee-ruled':
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'admitting') return state;
+      if (event.ruling === 'abstain') {
+        return { ...state, planning: { ...state.planning, authorizedExpected: state.planning.authorizedExpected.filter((a) => a !== event.agent) } };
+      }
+      return { ...state, planning: { ...state.planning, ...(event.newDeadlineAt === undefined ? {} : { deadlineAt: event.newDeadlineAt }) } };
+    case 'phase-transition': {
+      if (!state || state.topology !== 'peer') return state;
+      const { planning: _closed, ...rest } = state;
+      // Leaving planning drops the planning substate wholesale; later
+      // phases carry their own state (plan artifact arrives with 1C).
+      return { ...rest, phase: event.to };
+    }
     case 'attention-raised':
       return state && state.topology === 'peer'
         ? { ...state, attention: [...state.attention, { id: event.id, category: event.category, detail: event.detail, at: event.at }] }

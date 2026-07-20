@@ -96,7 +96,125 @@ function decideInner(
       return withLive(state, (s) => decideUserPause(s, command, envelope));
     case 'user-resume-session':
       return withLive(state, (s) => decideUserResume(s, command, envelope));
+    case 'user-admit-agent':
+      return withLive(state, (s) => decideUserAdmit(s, command, envelope));
+    case 'user-rebind-agent':
+      return withLive(state, (s) => decideUserRebind(s, command, envelope));
+    case 'user-rule-absentee':
+      return withLive(state, (s) => decideUserRuleAbsentee(s, command, envelope));
+    case 'user-force-phase':
+      return withLive(state, (s) => decideUserForcePhase(s, command, envelope));
   }
+}
+
+/** Peer 1A privileged user verbs — all typed, all through the same
+ * auth->dedup->state routing as the slice-4 set. */
+function requirePeer(s: SessionState, verb: string): SessionState & { topology: 'peer' } | ProtocolError {
+  if (s.topology !== 'peer') return new ProtocolError('not-peer-topology', `${verb} is peer-topology machinery.`);
+  return s as SessionState & { topology: 'peer' };
+}
+
+function decideUserAdmit(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-admit-agent' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-admit-agent');
+  if (bad) return err(bad);
+  const peer = requirePeer(s, 'user-admit-agent');
+  if (peer instanceof ProtocolError) return err(peer);
+  if (peer.planning?.substate !== 'admitting') {
+    return err(new ProtocolError('admitting-closed', 'Admission authorization after the barrier opens lands with 1B (post-barrier admits become observers).'));
+  }
+  if (command.agent === USER_IDENTITY) return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity.`));
+  if (!AGENT_NAME_PATTERN.test(command.agent)) return err(new ProtocolError('invalid-agents', `invalid agent name '${command.agent}'`));
+  if (peer.planning.authorizedExpected.includes(command.agent) || peer.agents.includes(command.agent)) {
+    return err(new ProtocolError('already-participant', `'${command.agent}' is already authorized or admitted.`));
+  }
+  if (peer.planning.authorizedExpected.length >= MAX_AGENTS) {
+    return err(new ProtocolError('registry-full', `The roster is at the M1 bound (${MAX_AGENTS}).`));
+  }
+  const events: Event[] = [{ kind: 'admission-authorized', agent: command.agent, at: envelope.meta.at }];
+  peer.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'admit', 'info', `USER AUTHORIZED '${command.agent}' to join — it becomes a member when it attaches with its own credential.`, envelope.meta.at));
+  });
+  return ok(events);
+}
+
+function decideUserRebind(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-rebind-agent' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-rebind-agent');
+  if (bad) return err(bad);
+  const peer = requirePeer(s, 'user-rebind-agent');
+  if (peer instanceof ProtocolError) return err(peer);
+  const record = peer.registry.agents[command.agent];
+  if (!record?.binding) {
+    return err(new ProtocolError('invalid-agents', `'${command.agent}' has no credential binding to rebind.`));
+  }
+  const events: Event[] = [
+    { kind: 'registry-updated', version: peer.registry.version + 1, change: 'rebound', agent: command.agent, at: envelope.meta.at },
+  ];
+  peer.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'rebind', 'info', `USER REBOUND '${command.agent}' — its old credential is revoked; it must re-attach with a freshly generated one.`, envelope.meta.at));
+  });
+  return ok(events);
+}
+
+function decideUserRuleAbsentee(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-rule-absentee' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-rule-absentee');
+  if (bad) return err(bad);
+  const peer = requirePeer(s, 'user-rule-absentee');
+  if (peer instanceof ProtocolError) return err(peer);
+  if (peer.planning?.substate !== 'admitting') {
+    return err(new ProtocolError('admitting-closed', 'Absentee rulings apply to the admitting substate (barrier rulings arrive with slice 2).'));
+  }
+  const isAbsentee = peer.planning.authorizedExpected.includes(command.agent) && !peer.planning.admitted.includes(command.agent);
+  if (!isAbsentee) return err(new ProtocolError('not-an-absentee', `'${command.agent}' is not an expected-but-unadmitted invitee.`));
+  if (command.ruling === 'wait' && !command.newDeadlineAt) {
+    return err(new ProtocolError('not-an-absentee', "ruling 'wait' requires a new absolute deadline (-NewDeadlineAt)."));
+  }
+  const events: Event[] = [{ kind: 'absentee-ruled', agent: command.agent, ruling: command.ruling, ...(command.newDeadlineAt === undefined ? {} : { newDeadlineAt: command.newDeadlineAt }), at: envelope.meta.at }];
+  if (command.ruling === 'abstain') {
+    // The closing ruling opens the barrier atomically (rev 3): every
+    // remaining expected member is admitted once this absentee drops.
+    const remaining = peer.planning.authorizedExpected.filter((a) => a !== command.agent);
+    if (remaining.every((a) => peer.planning !== undefined && peer.planning.substate === 'admitting' && peer.planning.admitted.includes(a))) {
+      events.push({ kind: 'admission-completed', at: envelope.meta.at });
+    }
+  }
+  peer.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'rule-absentee', 'info', `USER RULED absentee '${command.agent}': ${command.ruling}${command.newDeadlineAt ? ` (new deadline ${command.newDeadlineAt})` : ''}.`, envelope.meta.at));
+  });
+  return ok(events);
+}
+
+function decideUserForcePhase(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-force-phase' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-force-phase');
+  if (bad) return err(bad);
+  const peer = requirePeer(s, 'user-force-phase');
+  if (peer instanceof ProtocolError) return err(peer);
+  // Bounded (rev 3): only planning->provisioning is forceable — no phase
+  // can exist before its substrate (implementation needs the slice-4 saga).
+  if (!(peer.phase === 'planning' && command.to === 'provisioning')) {
+    return err(new ProtocolError('phase-unavailable', `Forcing ${peer.phase} -> ${command.to} is unavailable: only planning -> provisioning until the slice-4 branch saga exists.`));
+  }
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  const events: Event[] = [{ kind: 'phase-transition', from: 'planning', to: 'provisioning', outcome: 'forced', ...(command.reason ? { reason: command.reason } : {}), at: envelope.meta.at }];
+  peer.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'force-phase', 'info', `USER FORCED the phase to provisioning (outcome: FORCED — this is not a ballot pass).${reasonSuffix}`, envelope.meta.at));
+  });
+  return ok(events);
 }
 
 /** U1 slice 4b: the brake. Repeated transitions are STABLE errors (F-A9). */

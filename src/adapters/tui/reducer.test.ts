@@ -357,6 +357,22 @@ describe('slice-4 action confirmation: freeze-then-mint (F-A7)', () => {
   };
   const type = (s: ReturnType<typeof registered>, text: string) => reduceWatch(s, { kind: 'text', text }).state;
 
+  test('peer 1A verbs parse with exact-args displays; malformed shapes hint instead of freezing', () => {
+    const admit = reduceWatch(type(registered(), '/admit gemini'), { kind: 'key', key: 'submit', reqId: 'r-a' });
+    expect(admit.state.composer?.confirming).toMatchObject({ verb: 'admit', agent: 'gemini', display: '/admit gemini' });
+    const rebind = reduceWatch(type(registered(), '/rebind codex'), { kind: 'key', key: 'submit', reqId: 'r-b' });
+    expect(rebind.state.composer?.confirming).toMatchObject({ verb: 'rebind', agent: 'codex' });
+    const rule = reduceWatch(type(registered(), '/rule-absentee agy wait 2026-07-21 09:00:00'), { kind: 'key', key: 'submit', reqId: 'r-c' });
+    expect(rule.state.composer?.confirming).toMatchObject({ verb: 'rule-absentee', agent: 'agy', ruling: 'wait', newDeadlineAt: '2026-07-21 09:00:00' });
+    const badRule = reduceWatch(type(registered(), '/rule-absentee agy wait'), { kind: 'key', key: 'submit', reqId: 'r-d' });
+    expect(badRule.state.composer?.confirming).toBeUndefined();
+    expect(badRule.state.composer?.actionHint).toContain('absolute deadline');
+    const force = reduceWatch(type(registered(), '/force-phase provisioning livelock'), { kind: 'key', key: 'submit', reqId: 'r-e' });
+    expect(force.state.composer?.confirming).toMatchObject({ verb: 'force-phase', to: 'provisioning', reason: 'livelock' });
+    const badForce = reduceWatch(type(registered(), '/force-phase implementation'), { kind: 'key', key: 'submit', reqId: 'r-f' });
+    expect(badForce.state.composer?.confirming).toBeUndefined();
+  });
+
   test('first Enter freezes the immutable action with NO effect and NO reqId; second Enter mints the reqId and emits the action effect', () => {
     let state = type(registered(), '/kick codex wedged');
     const first = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-first' });

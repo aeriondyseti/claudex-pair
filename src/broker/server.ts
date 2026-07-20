@@ -703,19 +703,51 @@ export class BrokerCore {
         command = { kind: 'user-pause-session', reason: str(fields.reason), ...shared };
       } else if (verb === 'resume') {
         command = { kind: 'user-resume-session', ...shared };
+      } else if (verb === 'admit') {
+        if (!str(fields.agent)) return err(reqId, 'bad-command', 'user action admit requires an agent.');
+        command = { kind: 'user-admit-agent', agent: str(fields.agent), ...shared };
+      } else if (verb === 'rebind') {
+        if (!str(fields.agent)) return err(reqId, 'bad-command', 'user action rebind requires an agent.');
+        command = { kind: 'user-rebind-agent', agent: str(fields.agent), ...shared };
+      } else if (verb === 'rule-absentee') {
+        const ruling = str((fields as { ruling?: unknown }).ruling);
+        if (!str(fields.agent) || (ruling !== 'abstain' && ruling !== 'wait')) return err(reqId, 'bad-command', 'user action rule-absentee requires an agent and ruling abstain|wait.');
+        const newDeadlineAt = str((fields as { newDeadlineAt?: unknown }).newDeadlineAt);
+        command = { kind: 'user-rule-absentee', agent: str(fields.agent), ruling, ...(newDeadlineAt ? { newDeadlineAt } : {}), ...shared };
+      } else if (verb === 'force-phase') {
+        const to = str((fields as { to?: unknown }).to);
+        if (to !== 'planning' && to !== 'provisioning' && to !== 'implementation') return err(reqId, 'bad-command', 'user action force-phase requires to: planning|provisioning|implementation.');
+        command = { kind: 'user-force-phase', to, reason: str(fields.reason), ...shared };
       } else {
-        return err(reqId, 'bad-command', `Unknown user action verb '${String(verb)}' (verbs: end, cancel-grant, kick, pause, resume).`);
+        return err(reqId, 'bad-command', `Unknown user action verb '${String(verb)}' (verbs: end, cancel-grant, kick, pause, resume, admit, rebind, rule-absentee, force-phase).`);
       }
       const envelope: CommandEnvelope = { command, meta: { id: base, at: this.#clock.now(), principal: USER_IDENTITY } };
-      return this.#commitUserEnvelope(reqId, clientId, envelope);
+      // Peer 1A: a rebind commit clears the PRIVATE verifier in the same
+      // txn (pending-new-binding — the version survives; the next attach
+      // TOFUs at version+1) and revokes + wakes every old-version tag.
+      const rebindAgent = command.kind === 'user-rebind-agent' ? command.agent : undefined;
+      const result = await this.#commitUserEnvelope(reqId, clientId, envelope, rebindAgent === undefined ? undefined : { privateBindings: { [rebindAgent]: null } });
+      if (result.ok && rebindAgent !== undefined) {
+        for (const [connId, tag] of [...this.#agentConnections]) {
+          if (tag.agent !== rebindAgent) continue;
+          this.#agentConnections.delete(connId);
+          const sub = this.#subscriptions.get(connId);
+          if (sub) {
+            void sub.sink.sendError('credential-revoked', 'Your credential was rebound by the user — generate a new one and re-attach.').catch(() => undefined);
+            this.#subscriptions.delete(connId);
+          }
+        }
+        this.#notifyPresence();
+      }
+      return result;
     });
   }
 
   /** User-channel envelopes commit through the SAME roster-aware primitive
    * as agent execute (slice-4 design REV 6, tail B) — a user kick voids the
    * kicked agent's mail exactly like a driver kick. Already inside #chain. */
-  async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope): Promise<BrokerResponse> {
-    return this.#commitEnvelope(reqId, clientId, envelope, this.#journal.sessionState);
+  async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
+    return this.#commitEnvelope(reqId, clientId, envelope, this.#journal.sessionState, opts);
   }
 
   /**

@@ -13,7 +13,7 @@ import type { AgentMeta, AgentId, GrantId, GrantScope, MessageId, MessageType, T
 /** U1 slice 4: durable discriminator on ACTION notices — provenance+groupId
  * alone are indistinguishable from advisory user messages (design REV 6,
  * round-2 B). Renderers key the ⚡ marker on this, never on provenance. */
-export type UserActionKind = 'end' | 'cancel-grant' | 'kick' | 'pause' | 'resume';
+export type UserActionKind = 'end' | 'cancel-grant' | 'kick' | 'pause' | 'resume' | 'admit' | 'rebind' | 'rule-absentee' | 'force-phase';
 
 export type JournalRecord = {
   /** Monotonic position in the journal; assigned by the Journal port on append. */
@@ -35,6 +35,11 @@ export type Event =
   /** Peer 1A: the last expected admission (or closing ruling) — planning
    * leaves 'admitting' atomically in the same txn. */
   | { kind: 'admission-completed'; at: Timestamp }
+  | { kind: 'admission-authorized'; agent: AgentId; at: Timestamp }
+  | { kind: 'absentee-ruled'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; at: Timestamp }
+  /** Peer 1A: outcome provenance is permanent — 'forced' can never read
+   * as 'ballot-passed' (codex rev 3). */
+  | { kind: 'phase-transition'; from: import('./types.ts').SessionPhase; to: import('./types.ts').SessionPhase; outcome: 'forced' | 'ballot-passed'; reason?: string; at: Timestamp }
   | { kind: 'attention-raised'; id: string; category: 'tofu-bind'; detail: string; at: Timestamp }
   | { kind: 'attention-cleared'; id: string; at: Timestamp }
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }

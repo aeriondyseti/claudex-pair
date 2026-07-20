@@ -149,7 +149,30 @@ function parseActionDraft(buffer: string): { draft?: UserActionDraft & { display
     const reason = reasonParts.join(' ');
     return { draft: { verb: 'kick', agent, reason, display: `/kick ${agent}${reason ? ` — reason: ${reason}` : ''}` } };
   }
-  return { hint: `unknown action '/${verb}' — actions: /end /cancel-grant /kick /pause /resume; send a literal /${verb} with //${verb}` };
+  if (verb === 'admit') {
+    const [agent = ''] = restParts;
+    if (!agent || restParts.length !== 1) return { hint: 'usage: /admit <agent>' };
+    return { draft: { verb: 'admit', agent, display: `/admit ${agent}` } };
+  }
+  if (verb === 'rebind') {
+    const [agent = ''] = restParts;
+    if (!agent || restParts.length !== 1) return { hint: 'usage: /rebind <agent> — revokes its credential; it must re-attach with a fresh one' };
+    return { draft: { verb: 'rebind', agent, display: `/rebind ${agent}` } };
+  }
+  if (verb === 'rule-absentee') {
+    const [agent = '', ruling = '', ...deadlineParts] = restParts;
+    const newDeadlineAt = deadlineParts.join(' ');
+    if (!agent || (ruling !== 'abstain' && ruling !== 'wait')) return { hint: "usage: /rule-absentee <agent> abstain | /rule-absentee <agent> wait <new deadline 'YYYY-MM-DD HH:mm:ss'>" };
+    if (ruling === 'wait' && !newDeadlineAt) return { hint: "ruling 'wait' requires the new absolute deadline" };
+    return { draft: { verb: 'rule-absentee', agent, ruling, ...(newDeadlineAt ? { newDeadlineAt } : {}), display: `/rule-absentee ${agent} ${ruling}${newDeadlineAt ? ` ${newDeadlineAt}` : ''}` } };
+  }
+  if (verb === 'force-phase') {
+    const [to = '', ...reasonParts] = restParts;
+    const reason = reasonParts.join(' ');
+    if (to !== 'provisioning') return { hint: 'usage: /force-phase provisioning [reason] — only planning->provisioning is forceable until slice 4' };
+    return { draft: { verb: 'force-phase', to, reason, display: `/force-phase ${to}${reason ? ` — reason: ${reason}` : ''}` } };
+  }
+  return { hint: `unknown action '/${verb}' — actions: /end /cancel-grant /kick /pause /resume /admit /rebind /rule-absentee /force-phase; send a literal /${verb} with //${verb}` };
 }
 
 function key(state: WatchTuiState, event: Extract<WatchEvent, { kind: 'key' }>): WatchStep {
