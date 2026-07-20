@@ -438,3 +438,38 @@ describe('action retry survives a recovery re-push (codex step-5 audit B)', () =
     expect(retry.state.composer?.pending).toMatchObject({ reqId: 'r-mint', state: 'sending' });
   });
 });
+
+describe('action safety: buffer clears at execution; displays are exact (codex audit C+D)', () => {
+  const registered = () => {
+    let state = attached(snapshot({ transcript: [] }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    return state;
+  };
+  const type = (s: ReturnType<typeof registered>, text: string) => reduceWatch(s, { kind: 'text', text }).state;
+
+  test('a successful action leaves an EMPTY composer — no leftover slash command one Enter from re-confirmation', () => {
+    let state = type(registered(), '/kick codex wedged');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'rf' })); // freeze
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'rm' })); // mint: buffer clears NOW
+    expect(state.composer?.buffer).toBe('');
+    ({ state } = reduceWatch(state, {
+      kind: 'activity',
+      activity: { seq: 5, session: active, entries: [{ deliveryId: 'n:claude', message: userStored('n', 'claude', 'rm') }], ackedDeliveryIds: [], voidedDeliveryIds: [] },
+    }));
+    expect(state.composer?.buffer).toBe('');
+    expect(state.composer?.pending).toBeUndefined();
+    expect(state.composer?.confirming).toBeUndefined();
+    // One more Enter is a no-op on an empty composer — nothing to re-confirm.
+    expect(reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'rx' }).effects).toEqual([]);
+  });
+
+  test('CONFIRM displays carry the full normalized arguments; /resume with args hints instead of silently normalizing', () => {
+    const kick = reduceWatch(type(registered(), '/kick codex totally wedged'), { kind: 'key', key: 'submit', reqId: 'r1' });
+    expect(kick.state.composer?.confirming?.display).toBe('/kick codex — reason: totally wedged');
+    const cancel = reduceWatch(type(registered(), '/cancel-grant g1 no longer needed'), { kind: 'key', key: 'submit', reqId: 'r2' });
+    expect(cancel.state.composer?.confirming?.display).toBe('/cancel-grant g1 — reason: no longer needed');
+    const resume = reduceWatch(type(registered(), '/resume now please'), { kind: 'key', key: 'submit', reqId: 'r3' });
+    expect(resume.state.composer?.confirming).toBeUndefined();
+    expect(resume.state.composer?.actionHint).toContain('/resume (no arguments)');
+  });
+});

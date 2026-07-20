@@ -132,17 +132,22 @@ function parseActionDraft(buffer: string): { draft?: UserActionDraft & { display
   const rest = restParts.join(' ');
   const verb = head.toLowerCase();
   if (verb === 'end') return { draft: { verb: 'end', summary: rest, display: `/end ${rest || '(default summary)'}`.trim() } };
-  if (verb === 'resume') return { draft: { verb: 'resume', display: '/resume' } };
+  if (verb === 'resume') {
+    if (rest) return { hint: 'usage: /resume (no arguments) — the typed text and the executed action must match exactly' };
+    return { draft: { verb: 'resume', display: '/resume' } };
+  }
   if (verb === 'pause') return { draft: { verb: 'pause', reason: rest, display: `/pause ${rest}`.trim() } };
   if (verb === 'cancel-grant') {
     const [grantId = '', ...reasonParts] = restParts;
     if (!grantId) return { hint: 'usage: /cancel-grant <grantId> [reason]' };
-    return { draft: { verb: 'cancel-grant', grantId, reason: reasonParts.join(' '), display: `/cancel-grant ${grantId}` } };
+    const reason = reasonParts.join(' ');
+    return { draft: { verb: 'cancel-grant', grantId, reason, display: `/cancel-grant ${grantId}${reason ? ` — reason: ${reason}` : ''}` } };
   }
   if (verb === 'kick') {
     const [agent = '', ...reasonParts] = restParts;
     if (!agent) return { hint: 'usage: /kick <agent> [reason]' };
-    return { draft: { verb: 'kick', agent, reason: reasonParts.join(' '), display: `/kick ${agent}` } };
+    const reason = reasonParts.join(' ');
+    return { draft: { verb: 'kick', agent, reason, display: `/kick ${agent}${reason ? ` — reason: ${reason}` : ''}` } };
   }
   return { hint: `unknown action '/${verb}' — actions: /end /cancel-grant /kick /pause /resume; send a literal /${verb} with //${verb}` };
 }
@@ -213,8 +218,12 @@ function submit(state: WatchTuiState, composer: ComposerState, candidateReqId: s
     const frozen = composer.confirming;
     const { display: _display, ...draft } = frozen;
     const pending = { reqId: candidateReqId, target: '*' as const, body: frozen.display, state: 'sending' as const, action: true as const };
+    // The buffer clears as execution BEGINS: after commit the composer must
+    // be empty — a leftover slash command one Enter away from re-confirming
+    // a destructive action is a safety hole (codex audit C). `confirming`
+    // stays as the immutable retry payload until cleared/discarded.
     return step(
-      { ...state, composer: { ...composer, pending } },
+      { ...state, composer: { ...composer, buffer: '', pending } },
       ['render', { kind: 'action', reqId: candidateReqId, action: draft as UserActionDraft, display: frozen.display }],
     );
   }
