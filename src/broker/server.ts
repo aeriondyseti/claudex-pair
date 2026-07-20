@@ -222,79 +222,7 @@ export class BrokerCore {
         return err(reqId, 'partner-active', `${holder} holds a live delivery lease (still working) — revocation rejected. Retry after the lease expires or the reply lands.`);
       }
     }
-    const decided = decide(state, envelope);
-    if (!decided.ok) {
-      // Rejections are not journaled (pure decide; retries re-evaluate).
-      const code = decided.error instanceof ProtocolError ? decided.error.code : 'rejected';
-      return err(reqId, code, decided.error.message);
-    }
-    const events = decided.value;
-    // F18/F21: roster removals void the agent's undelivered mail in the same
-    // txn — capture the open set now (pre-commit) for the mirror moves.
-    const removedAgents = events.flatMap((e) => (e.kind === 'agent-left' || e.kind === 'agent-kicked' ? [e.agent] : []));
-    const voidedPreexisting = removedAgents.length
-      ? this.#journal.openDeliveries().filter((d) => removedAgents.includes(d.message.to))
-      : [];
-    let gitignoreUpdated: boolean | undefined;
-    if (command.kind === 'init-session') {
-      // Init writes its mirror inline so gitignoreUpdated is truthful in the
-      // outcome (rare path; documented deviation from post-ack mirroring).
-      const postInit = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), state);
-      gitignoreUpdated = postInit ? (await this.#mirrors.applyInit(postInit)).gitignoreUpdated : undefined;
-    }
-    const receipt = {
-      messageFiles: events.flatMap((e) =>
-        e.kind === 'message-sent' ? [this.#codec.filename({ id: e.id, from: e.from, to: e.to, type: e.type, turn: e.turn, sent: e.at, body: e.body })] : [],
-      ),
-    };
-    // Post-state computed purely BEFORE commit — the journaled outcome must
-    // be complete; post-commit mutation of an already-serialized response
-    // made restart replays structurally incomplete (codex handler review;
-    // same latent bug as the user path).
-    const post = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), state)!;
-    const response: BrokerResponse = {
-      reqId,
-      ok: true,
-      seq: this.#journal.headSeq + 1,
-      events: [...events],
-      data: { session: post, receipt, ...(gitignoreUpdated === undefined ? {} : { gitignoreUpdated }) },
-    };
-    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
-    const open = this.#journal.openDeliveries();
-    const fresh = record.deliveries.flatMap((d) => {
-      // Voided-in-same-txn deliveries are already closed — never pushed.
-      const match = open.find((o) => o.deliveryId === d.deliveryId);
-      return match ? [match] : [];
-    });
-    // Voided notices enqueued by THIS txn still need their mirror moved
-    // inbox → archive (they were never open post-commit).
-    const voidedNew = removedAgents.length
-      ? record.events.flatMap((e) =>
-          e.kind === 'message-sent' && removedAgents.includes(e.to)
-            ? [{ deliveryId: `${e.id}:${e.to}`, deliverySeq: 0, message: e }]
-            : [],
-        )
-      : [];
-    // Ack the requester first (the return), then mirrors + delivery push,
-    // with mirror application serialized in commit order.
-    const voided = [...voidedPreexisting, ...voidedNew];
-    this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh, voided));
-    // Observer fan-out happens HERE, synchronously at commit inside the
-    // single-writer chain — never on the mirror chain. Commit order = call
-    // order = per-socket write order, so an ack activity (also emitted
-    // in-chain) can never overtake the send activity it acknowledges
-    // (codex live review 2026-07-14).
-    this.#notifyObservers({
-      kind: 'activity',
-      seq: record.seq,
-      at: record.at,
-      principal: record.principal,
-      events: record.events,
-      session: post,
-      ackedDeliveryIds: [],
-      voidedDeliveryIds: voided.map((d) => d.deliveryId),
-    });
-    return response;
+    return this.#commitEnvelope(reqId, clientId, envelope, state);
   }
 
   async #afterCommit(state: SessionState, events: readonly Event[], seq: number, deliveries: OpenDelivery[], voided: OpenDelivery[] = []): Promise<void> {
@@ -586,39 +514,124 @@ export class BrokerCore {
     });
   }
 
-  /** Shared commit flow for user-channel envelopes (already inside #chain).
-   * Simplified from #execute: user commands never init, revoke, or remove
-   * agents — no liveness pre-check, no roster voiding, no init mirror. */
+  /**
+   * U1 slice 4: privileged user actions (design REV 6). ORDERING IS
+   * NORMATIVE (tail C): (a) authenticate the LIVE connection first — a
+   * dedup result is never returned to an unauthenticated caller; (b) dedup
+   * by (clientId, reqId); (c) state/effect checks in decide. Dedup before
+   * state means a COMMITTED end whose response was lost replays success on
+   * retry even though the session is now completed. The handler allocates
+   * groupId (=== reqId) and the collision-proof noticeIdBase; decide
+   * computes per-verb recipients (protocol lives in the core).
+   */
+  userAction(reqId: string, clientId: string, connectionId: string, action: unknown): Promise<BrokerResponse> {
+    this.#lastBusyAt = Date.now();
+    return this.#chain(async () => {
+      if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
+      if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
+      if (!this.#userConnections.has(connectionId)) {
+        return err(reqId, 'user-channel-required', 'user-action requires an authenticated user-attach on this connection.');
+      }
+      const recorded = this.#journal.recordedOutcome(clientId, reqId);
+      if (recorded !== undefined) return recorded as BrokerResponse; // replay BEFORE state checks (tail C)
+      // Runtime shape validation — JSON frames are not made safe by types.
+      const verb = action && typeof action === 'object' ? (action as { verb?: unknown }).verb : undefined;
+      const fields = (action ?? {}) as { summary?: unknown; grantId?: unknown; agent?: unknown; reason?: unknown };
+      const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+      const base = this.#ids.messageId();
+      const shared = { groupId: reqId, noticeIdBase: `${base}-s${this.#journal.headSeq + 1}` };
+      let command: Command;
+      if (verb === 'end') {
+        command = { kind: 'user-end-session', summary: str(fields.summary), ...shared };
+      } else if (verb === 'cancel-grant') {
+        if (!str(fields.grantId)) return err(reqId, 'bad-command', 'user action cancel-grant requires a grantId.');
+        command = { kind: 'user-cancel-grant', grantId: str(fields.grantId), reason: str(fields.reason), ...shared };
+      } else if (verb === 'kick') {
+        if (!str(fields.agent)) return err(reqId, 'bad-command', 'user action kick requires an agent.');
+        command = { kind: 'user-kick-agent', agent: str(fields.agent), reason: str(fields.reason), ...shared };
+      } else {
+        return err(reqId, 'bad-command', `Unknown user action verb '${String(verb)}' (4a verbs: end, cancel-grant, kick).`);
+      }
+      const envelope: CommandEnvelope = { command, meta: { id: base, at: this.#clock.now(), principal: USER_IDENTITY } };
+      return this.#commitUserEnvelope(reqId, clientId, envelope);
+    });
+  }
+
+  /** User-channel envelopes commit through the SAME roster-aware primitive
+   * as agent execute (slice-4 design REV 6, tail B) — a user kick voids the
+   * kicked agent's mail exactly like a driver kick. Already inside #chain. */
   async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope): Promise<BrokerResponse> {
-    const decided = decide(this.#journal.sessionState, envelope);
+    return this.#commitEnvelope(reqId, clientId, envelope, this.#journal.sessionState);
+  }
+
+  /**
+   * ONE shared roster-aware commit primitive (slice-4 design REV 6, tail B):
+   * decide -> removed-agent capture -> optional init mirror -> journal
+   * commit with removedAgents -> mirror void moves -> observer fan-out with
+   * voidedDeliveryIds -> kicked-subscription terminal wake. Copied-partial
+   * commit logic is retired; callers handle stopping/conflict/dedup/auth
+   * and any path-specific pre-checks (revoke liveness) BEFORE this.
+   */
+  async #commitEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined): Promise<BrokerResponse> {
+    const decided = decide(state, envelope);
     if (!decided.ok) {
       const code = decided.error instanceof ProtocolError ? decided.error.code : 'rejected';
       return err(reqId, code, decided.error.message);
     }
     const events = decided.value;
+    // F18/F21: roster removals void the agent's undelivered mail in the same
+    // txn — capture the open set now (pre-commit) for the mirror moves.
+    const removedAgents = events.flatMap((e) => (e.kind === 'agent-left' || e.kind === 'agent-kicked' ? [e.agent] : []));
+    const voidedPreexisting = removedAgents.length
+      ? this.#journal.openDeliveries().filter((d) => removedAgents.includes(d.message.to))
+      : [];
+    let gitignoreUpdated: boolean | undefined;
+    if (envelope.command.kind === 'init-session') {
+      // Init writes its mirror inline so gitignoreUpdated is truthful in the
+      // outcome (rare path; documented deviation from post-ack mirroring).
+      const postInit = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), state);
+      gitignoreUpdated = postInit ? (await this.#mirrors.applyInit(postInit)).gitignoreUpdated : undefined;
+    }
     const receipt = {
       messageFiles: events.flatMap((e) =>
         e.kind === 'message-sent' ? [this.#codec.filename({ id: e.id, from: e.from, to: e.to, type: e.type, turn: e.turn, sent: e.at, body: e.body })] : [],
       ),
     };
-    // Post-state is computed PURELY before commit so the journaled outcome
-    // is complete — mutating the response after commit serialized it left
-    // restart replays structurally incomplete (codex handler review).
-    const post = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), this.#journal.sessionState)!;
+    // Post-state computed purely BEFORE commit — the journaled outcome must
+    // be complete; post-commit mutation of an already-serialized response
+    // made restart replays structurally incomplete (codex handler review).
+    const post = events.reduce<SessionState | undefined>((s, e) => evolve(s, e), state)!;
+    const command = envelope.command as { groupId?: string };
     const response: BrokerResponse = {
       reqId,
       ok: true,
       seq: this.#journal.headSeq + 1,
       events: [...events],
-      data: { session: post, receipt, groupId: envelope.command.kind === 'user-message' ? envelope.command.groupId : undefined },
+      data: {
+        session: post,
+        receipt,
+        ...(gitignoreUpdated === undefined ? {} : { gitignoreUpdated }),
+        ...(command.groupId === undefined ? {} : { groupId: command.groupId }),
+      },
     };
-    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId });
+    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
+      // Voided-in-same-txn deliveries are already closed — never pushed.
       const match = open.find((o) => o.deliveryId === d.deliveryId);
       return match ? [match] : [];
     });
-    this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh));
+    // Voided notices enqueued by THIS txn still need their mirror moved
+    // inbox -> archive (they were never open post-commit).
+    const voidedNew = removedAgents.length
+      ? record.events.flatMap((e) =>
+          e.kind === 'message-sent' && removedAgents.includes(e.to)
+            ? [{ deliveryId: `${e.id}:${e.to}`, deliverySeq: 0, message: e }]
+            : [],
+        )
+      : [];
+    const voided = [...voidedPreexisting, ...voidedNew];
+    this.#mirrorSerial = this.#mirrorSerial.then(() => this.#afterCommit(post, record.events, record.seq, fresh, voided));
     this.#notifyObservers({
       kind: 'activity',
       seq: record.seq,
@@ -627,8 +640,20 @@ export class BrokerCore {
       events: record.events,
       session: post,
       ackedDeliveryIds: [],
-      voidedDeliveryIds: [],
+      voidedDeliveryIds: voided.map((d) => d.deliveryId),
     });
+    // Slice-4 kicked-wait wake (design 4b, KICK-ONLY): a removed agent with
+    // a live subscription gets a typed terminal control, then deregisters —
+    // an infinite wait must never be stranded. sendError failures are moot
+    // (the socket is already gone).
+    for (const agent of removedAgents) {
+      for (const [id, sub] of [...this.#subscriptions]) {
+        if (sub.as === agent) {
+          void sub.sink.sendError('removed-from-session', 'You were removed from the session. Stop all work; do not re-arm this wait.').catch(() => undefined);
+          this.#subscriptions.delete(id);
+        }
+      }
+    }
     return response;
   }
 

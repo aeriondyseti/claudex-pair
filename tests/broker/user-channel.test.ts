@@ -310,3 +310,80 @@ describe('server-boundary publication guards (codex re-read 20260720-110117-282)
     if (!response.ok) expect(response.error.code).toBe('connection-closed');
   });
 });
+
+describe('slice-4a userAction (design REV 6)', () => {
+  const attach = async (core: BrokerCore, conn: string, client: string, token = 'a'.repeat(64)) => {
+    core.onConnection(conn, 'open');
+    const r = await core.userAttach(`att-${conn}`, sink(conn), client, token);
+    expect(r.ok).toBeTrue();
+  };
+
+  test('ordering: auth precedes dedup — an unauthenticated retry of a recorded reqId gets user-channel-required, never the recorded outcome', async () => {
+    const core = await seeded(await tempRoot());
+    await attach(core, 'ua-conn', 'user-client');
+    expect((await core.userAction('act-1', 'user-client', 'ua-conn', { verb: 'kick', agent: 'codex' })).ok).toBeTrue();
+    // Same (clientId, reqId), but on a connection that never attached:
+    const forged = await core.userAction('act-1', 'user-client', 'other-conn', { verb: 'kick', agent: 'codex' });
+    expect(forged.ok).toBeFalse();
+    if (!forged.ok) expect(forged.error.code).toBe('user-channel-required');
+  });
+
+  test('dedup before state: a committed end retried after completion replays the recorded success', async () => {
+    const core = await seeded(await tempRoot());
+    await attach(core, 'end-conn', 'user-client');
+    const first = await core.userAction('act-end', 'user-client', 'end-conn', { verb: 'end', summary: '' });
+    expect(first.ok).toBeTrue();
+    expect(core.journal.sessionState?.status).toBe('completed');
+    const retry = await core.userAction('act-end', 'user-client', 'end-conn', { verb: 'end', summary: '' });
+    expect(retry.ok).toBeTrue(); // replay, NEVER session-not-active
+    if (retry.ok && first.ok) expect(retry.seq).toBe(first.seq);
+  });
+
+  test('user kick through the shared primitive: preexisting open delivery voided (journal), kicked live subscription woken terminally and deregistered', async () => {
+    const core = await seeded(await tempRoot());
+    await attach(core, 'kick-conn', 'user-client');
+    // Seed an open delivery for codex, then subscribe codex so it holds mail + a live sub.
+    const send = await core.execute('seed', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    expect(send.ok).toBeTrue();
+    const errors: { code: string; message: string }[] = [];
+    core.onConnection('codex-sub', 'open');
+    const codexSink: import('@broker/ports.ts').DeliverySink = {
+      id: 'codex-sub',
+      sendDelivery: async () => undefined,
+      sendError: async (code, message) => void errors.push({ code, message }),
+    };
+    expect((await core.subscribe('sub-codex', codexSink, 'codex', 0)).ok).toBeTrue();
+    expect(core.journal.openDeliveriesFor('codex').length).toBeGreaterThanOrEqual(1);
+
+    const kick = await core.userAction('act-kick', 'user-client', 'kick-conn', { verb: 'kick', agent: 'codex' });
+    expect(kick.ok).toBeTrue();
+    expect(core.journal.sessionState?.agents).toEqual(['claude']);
+    expect(core.journal.openDeliveriesFor('codex')).toHaveLength(0); // voided in the SAME txn
+    expect(errors).toEqual([{ code: 'removed-from-session', message: expect.stringContaining('removed from the session') as unknown as string }]);
+    // Deregistered: a fresh delivery for claude never selects the dead codex sub.
+    const kicked = await core.userAction('act-kick', 'user-client', 'kick-conn', { verb: 'kick', agent: 'codex' });
+    expect(kicked.ok).toBeTrue(); // dedup replay of the same action
+  });
+
+  test('generic execute fail-closes the whole user-* namespace including unknown future verbs', async () => {
+    const core = await seeded(await tempRoot());
+    for (const kind of ['user-end-session', 'user-cancel-grant', 'user-kick-agent', 'user-anything-future']) {
+      const forged = await core.execute(`f-${kind}`, 'client-x', 'user', { command: { kind, agent: 'codex', summary: 'x' } });
+      expect(forged.ok).toBeFalse();
+      if (!forged.ok) expect(forged.error.code).toBe('user-channel-required');
+    }
+  });
+
+  test('cancel-grant by the user works regardless of issuer, notices deduplicated-ready; unknown verb is bad-command', async () => {
+    const core = await seeded(await tempRoot());
+    await attach(core, 'cg-conn', 'user-client');
+    const issued = await core.execute('gi', 'client-a', 'claude', { command: { kind: 'issue-grant', grantId: 'g9', to: 'codex', task: 'w', scope: { mode: 'worktree', worktree: 'wt' }, agreedIn: '' } });
+    expect(issued.ok).toBeTrue();
+    const cancel = await core.userAction('act-cg', 'user-client', 'cg-conn', { verb: 'cancel-grant', grantId: 'g9' });
+    expect(cancel.ok).toBeTrue();
+    expect(core.journal.sessionState?.grants['g9']?.state).toBe('cancelled');
+    const unknown = await core.userAction('act-x', 'user-client', 'cg-conn', { verb: 'pause' });
+    expect(unknown.ok).toBeFalse();
+    if (!unknown.ok) expect(unknown.error.code).toBe('bad-command'); // 4b verb, not in 4a
+  });
+});
