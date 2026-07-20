@@ -140,17 +140,19 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
 
 
 describe('item 7: thread-scoped wait (fake gateway)', () => {
-  test('wait -Thread prints and acks unrelated deliveries but exits only on the reply to the named message', async () => {
+  test('wait -Thread prints and acks unrelated deliveries but exits only when the journal clears the ask', async () => {
     const log: Log = [];
-    const { gateway, deliver, closes } = makeFakeGateway(log);
+    const { gateway, deliver, closes, setAwaiting } = makeFakeGateway(log);
+    setAwaiting([{ messageId: 'ask-7', from: 'claude', to: 'codex', sentAt: 's' }]);
     const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'ask-7']]);
     const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
     await until(() => log.includes('subscribe (closeCount=0)'));
 
-    deliver('m-unrelated:claude'); // no replyTo — printed + acked, wait continues
+    deliver('m-unrelated:claude'); // no replyTo, debt still open — wait continues
     await until(() => log.includes('ack m-unrelated:claude (closeCount=0)'));
     expect(closes()).toBe(0); // still waiting on the thread
 
+    setAwaiting([]);
     deliver('m-answer:claude', 'ask-7');
     expect(await result).toBe(0);
     expect(log).toContain('ack m-answer:claude (closeCount=0)');
@@ -176,15 +178,17 @@ function captureOut(): { text: () => string; restore: () => void } {
 describe('item 7: fused ask threading and control wakes (codex blockers 1+5)', () => {
   test('fused ask ignores unrelated deliveries and exits only on its own reply', async () => {
     const log: Log = [];
-    const { gateway, deliver, closes } = makeFakeGateway(log);
+    const { gateway, deliver, closes, setAwaiting } = makeFakeGateway(log);
+    setAwaiting([{ messageId: 'm1', from: 'claude', to: 'codex', sentAt: 's' }]);
     const flags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['type', 'ask'], ['message', 'x']]);
     const result = runBrokerCli('send', flags, [], 'unused-root', () => gateway);
     await until(() => log.includes('subscribe (closeCount=0)'));
 
-    deliver('m-noise:claude'); // no replyTo — printed + acked, fused ask keeps waiting
+    deliver('m-noise:claude'); // no replyTo, debt open — fused ask keeps waiting
     await until(() => log.includes('ack m-noise:claude (closeCount=0)'));
     expect(closes()).toBe(0);
 
+    setAwaiting([]);
     deliver('m-reply:claude', 'm1');
     expect(await result).toBe(0);
     expect(closes()).toBe(1);
@@ -337,4 +341,45 @@ describe('item 7 round 2: log -Thread full-archive fixpoint closure', () => {
     expect(text).not.toContain('raw-u1');
     expect(text).not.toContain('raw-u2');
   });
+});
+
+
+describe('item 7 round 3: untagged resolution wakes the thread; absent authority fails closed', () => {
+  test('an untagged compatibility answer ends the fused thread (journal cleared, no replyTo)', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes, setAwaiting } = makeFakeGateway(log);
+    setAwaiting([{ messageId: 'm1', from: 'claude', to: 'codex', sentAt: 's' }]);
+    const flags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['type', 'ask'], ['message', 'x']]);
+    const result = runBrokerCli('send', flags, [], 'unused-root', () => gateway);
+    await until(() => log.includes('subscribe (closeCount=0)'));
+
+    deliver('n1:claude'); // debt still open — keeps waiting
+    await until(() => log.includes('ack n1:claude (closeCount=0)'));
+    expect(closes()).toBe(0);
+
+    setAwaiting([]); // the journal applied the untagged compat rule
+    deliver('ans:claude'); // NO replyTo
+    expect(await result).toBe(0);
+    expect(closes()).toBe(1);
+  }, 10_000);
+
+  test('awaiting === undefined is NOT confirmation: the thread wait stays armed and says so', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes } = makeFakeGateway(log);
+    // A broker without an awaiting-set: strip the field from status.
+    const bare = { ...gateway, status: async () => { const { awaiting: _a, ...rest } = await gateway.status(); return rest as StatusDto; } };
+    const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'ask-7']]);
+    const capture = captureOut();
+    try {
+      const result = runBrokerCli('wait', flags, [], 'unused-root', () => bare);
+      await until(() => log.includes('subscribe (closeCount=0)'));
+
+      deliver('m-answer:claude', 'ask-7'); // even a matching replyTo cannot confirm
+      await until(() => capture.text().includes('cannot confirm thread ask-7'));
+      expect(closes()).toBe(0); // fail closed — still armed
+
+      deliver('u1:claude', undefined, { from: 'user', type: 'info', provenance: 'trusted_user_client' });
+      expect(await result).toBe(0); // control wake remains the escape hatch
+    } finally { capture.restore(); }
+  }, 10_000);
 });

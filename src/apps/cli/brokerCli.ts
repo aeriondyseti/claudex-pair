@@ -164,19 +164,20 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
       return 0;
     }
     if (threadId) {
-      if (header.replyTo !== threadId) {
-        out(`(waiting on thread ${threadId} — the above was a different delivery; still listening)`);
-        continue;
-      }
-      // Round 2 (codex): a replyTo naming the thread is only a CANDIDATE —
-      // the journal's awaiting-set is the authority on resolution. A tagged
-      // wrong-type/wrong-endpoint message keeps this wait armed.
+      // Round 3 (codex): resolution may arrive UNTAGGED (compat rule), so
+      // consult the authoritative awaiting-set on EVERY non-control
+      // delivery — exit iff the watched ask disappeared from a PRESENT
+      // set. An absent set is NOT confirmation: fail closed, keep armed.
       const s = await gateway.status();
-      if ((s.awaiting ?? []).some((a) => a.messageId === threadId)) {
-        out(`(a reply candidate named thread ${threadId} but did not resolve the ask — wrong type or endpoints; still listening)`);
+      if (s.awaiting === undefined) {
+        out(`(cannot confirm thread ${threadId}: this broker reports no awaiting-set; still listening — check pair status manually)`);
         continue;
       }
-      renderTurn(s, as); return 0;
+      if (!s.awaiting.some((a) => a.messageId === threadId)) { renderTurn(s, as); return 0; }
+      out(header.replyTo === threadId
+        ? `(a reply candidate named thread ${threadId} but did not resolve the ask — wrong type or endpoints; still listening)`
+        : `(waiting on thread ${threadId} — the above did not resolve it; still listening)`);
+      continue;
     }
     renderTurn((await gateway.status()), as); return 0;
   }

@@ -21,19 +21,25 @@ export const systemClock: Clock = {
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-/** Item 7 round 2 (codex): millisecond-only ids collide under same-tick
- * sends (a fast loop, or two processes sharing a clock tick). Suffix =
- * 2 base36 chars of per-process sequence (same-process ids can never
- * collide) + 4 random base36 chars (cross-process safety). The sortable
- * wall-clock prefix is kept; session_id is deliberately deferred to the
- * M1 registry identity work. */
-let idSeq = 0;
-function idSuffix(): string {
-  idSeq = (idSeq + 1) % 1296;
-  const rand = Math.floor(Math.random() * 1_679_616); // 36^4
-  return `${idSeq.toString(36).padStart(2, '0')}${rand.toString(36).padStart(4, '0')}`;
+/** Item 7 round 3 (codex): same-tick uniqueness must be STRUCTURAL, never
+ * a random coincidence — a per-tick counter that never wraps guarantees
+ * same-process uniqueness at any rate; the per-process nonce separates
+ * processes sharing a tick. Factory form so tests can freeze the clock
+ * and cross the old wrap boundary. session_id remains deferred to the M1
+ * registry identity work. */
+export function makeMessageIdSource(nonce: string, now: () => Date): () => string {
+  let lastPrefix = '';
+  let seq = 0;
+  return () => {
+    const prefix = formatMessageId(now());
+    if (prefix === lastPrefix) seq += 1;
+    else { lastPrefix = prefix; seq = 0; }
+    return `${prefix}-${nonce}${seq.toString(36)}`;
+  };
 }
 
+const processNonce = Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0'); // 36^4
+
 export const systemIds: Ids = {
-  messageId: () => `${formatMessageId(new Date())}-${idSuffix()}`,
+  messageId: makeMessageIdSource(processNonce, () => new Date()),
 };

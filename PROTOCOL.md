@@ -71,8 +71,9 @@ turn-holder, and `handoff` is only accepted from the current driver. FYIs
 
 ## Threading (`reply_to`, item 7)
 
-Message ids are collision-safe (`yyyyMMdd-HHmmss-fff-xxxxxx`: sortable
-wall-clock prefix + per-process sequence + random suffix); a `session_id`
+Message ids are collision-safe (`yyyyMMdd-HHmmss-fff-<nonce><n>`: sortable
+wall-clock prefix, per-process nonce, and a non-wrapping per-tick counter —
+same-process uniqueness is structural, not probabilistic); a `session_id`
 field is deliberately deferred to the M1 registry work. Replies carry
 causality in the optional `reply_to` header field, which never moves the
 turn.
