@@ -275,6 +275,56 @@ describe('watch event loop host', () => {
     expect(await loop).toBe(0);
   }, 10_000);
 
+  test('mid-submit idempotent recovery: broker commits but the response is lost — the retry dedups to exactly ONE commit (design §5)', async () => {
+    const userChannel = { registered: true, authenticated: true };
+    // Committed reqIds survive "broker restart" here because dedup is
+    // journal-backed in the real broker (pinned by the core test 'dedup
+    // replays before allocation'); this models that contract at the host
+    // seam to prove the recovery path composes with it.
+    const commits: string[] = [];
+    let attempts = 0;
+    const makeUserSession = (failAfterCommit: boolean) => {
+      const s = fakeSession(1);
+      (s.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
+      return {
+        ...s.session,
+        send: async (reqId: string) => {
+          attempts += 1;
+          if (!commits.includes(reqId)) commits.push(reqId); // commit lands
+          if (failAfterCommit) throw new Error('IPC connection closed'); // …but the response is lost
+        },
+      };
+    };
+    const attachCalls: boolean[] = [];
+    const gateway: ObserverGatewayLike = {
+      observe: async () => { throw new Error('token present'); },
+      userAttach: async (_token, spawn) => {
+        attachCalls.push(spawn === true);
+        return attachCalls.length === 1 ? makeUserSession(true) : makeUserSession(false);
+      },
+      close: async () => undefined,
+    };
+    let handlers: TerminalHandlers | undefined;
+    const seen: WatchEvent[] = [];
+    const spy: WatchReducer = (state, event) => { seen.push(event); return reduceWatch(state, event); };
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2, userToken: 'u'.repeat(64) }, spy, {
+      gateway,
+      terminal: (h) => { handlers = h; return { interactive: true, width: () => 80, close: () => undefined }; },
+      reattachDelayMs: 25,
+      write: () => undefined,
+    });
+    await until(() => seen.some((e) => e.kind === 'user-channel' && e.state === 'registered'));
+    handlers!.onText!('exactly once');
+    handlers!.onKey?.('submit');
+    await until(() => seen.some((e) => e.kind === 'submit-result' && e.ok));
+
+    expect(attempts).toBe(2); // original + the single recovery retry
+    expect(commits.length).toBe(1); // dedup by verbatim reqId: exactly one commit
+    expect(attachCalls[attachCalls.length - 1]).toBeTrue(); // recovery reattached with spawn allowed
+    handlers!.onQuit();
+    expect(await loop).toBe(0);
+  }, 10_000);
+
   test('non-TTY exclusion proof (close-out #7): zero credential activity, zero user-attach, no send path — even with a registered broker binding', async () => {
     const { mkdtemp, mkdir, rm } = await import('node:fs/promises');
     const { join } = await import('node:path');

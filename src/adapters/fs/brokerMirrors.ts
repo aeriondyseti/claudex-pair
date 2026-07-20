@@ -58,7 +58,12 @@ export class FsMirrors implements MirrorStore {
 
   /** Init mirror, written inline pre-ack so gitignoreUpdated is truthful. */
   async applyInit(state: SessionState): Promise<{ gitignoreUpdated: boolean }> {
-    return this.#sessions.initialize(toDiskSession(state));
+    const result = await this.#sessions.initialize(toDiskSession(state));
+    // A fresh session must never inherit the previous session's user-channel
+    // mirror (codex round 1): normalize per the NEW state — which removes
+    // the file, since a just-initialized session has no binding.
+    await this.#writeUserChannel(state);
+    return result;
   }
 
   /** Apply one committed txn's events to the mirror files (post-ack). */
@@ -196,8 +201,10 @@ export class FsMirrors implements MirrorStore {
       for (const grant of Object.values(state.grants)) {
         await this.#writeGrantAbsolute(grant.id, state);
       }
-      await this.#writeUserChannel(state); // recreate or REMOVE per recovered state
     }
+    // Outside the state guard deliberately: rebuild(undefined) must also
+    // remove a stale mirror — no recovered session means no binding.
+    await this.#writeUserChannel(state);
     for (const agent of state?.agents ?? []) {
       const dir = join(this.pairDir, 'inbox', agent);
       await rm(dir, { recursive: true, force: true });

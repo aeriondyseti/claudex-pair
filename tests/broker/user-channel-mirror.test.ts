@@ -76,6 +76,27 @@ describe('user-channel informational mirror', () => {
     expect(existsSync(join(dir2, '.pair', 'user-channel.json'))).toBeFalse();
   });
 
+  test('a new session init and rebuild(undefined) both clear a stale mirror — registered:true never leaks into an unbound session (codex round 1)', async () => {
+    const dir = await root();
+    const mirrors = new FsMirrors(dir);
+    const path = join(dir, '.pair', 'user-channel.json');
+
+    // Session 1 registers; its mirror exists.
+    await mirrors.applyInit(base);
+    await mirrors.applyEvents(registered, [{ kind: 'user-channel-registered', tokenHash: registered.userChannelTokenHash!, at: 'now' }], 2);
+    expect(existsSync(path)).toBeTrue();
+
+    // A NEW session initializes over it: the stale binding claim is gone.
+    await mirrors.applyInit(base);
+    expect(existsSync(path)).toBeFalse();
+
+    // Recreate, then rebuild with NO recovered state: also gone.
+    await mirrors.applyEvents(registered, [{ kind: 'user-channel-registered', tokenHash: registered.userChannelTokenHash!, at: 'now' }], 3);
+    expect(existsSync(path)).toBeTrue();
+    await mirrors.rebuild(undefined, [], 4);
+    expect(existsSync(path)).toBeFalse();
+  });
+
   test('authoritative-set tamper still conflicts — the exemption is exactly one informational file', async () => {
     const dir = await root();
     const mirrors = new FsMirrors(dir);
