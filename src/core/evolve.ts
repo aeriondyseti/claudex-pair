@@ -35,6 +35,7 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
           initiator: event.driver,
           phase: 'planning' as const,
           planning: { substate: 'admitting' as const, authorizedExpected: event.agents, admitted: [event.driver] },
+          attention: [],
         };
       }
       return { ...base, topology: 'pair' as const, agents: event.agents, driver: event.driver, turn: event.driver };
@@ -101,6 +102,29 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state && { ...state, registry: applyRegistryUpdate(state.registry, event) };
     case 'message-sent':
       return state; // delivery is the Mailbox port's concern, not session state
+    case 'agent-admitted':
+      // Peer 1A: admission makes the authorized identity a MEMBER.
+      return state && state.topology === 'peer'
+        ? {
+            ...state,
+            agents: state.agents.includes(event.agent) ? state.agents : [...state.agents, event.agent],
+            ...(state.planning?.substate === 'admitting'
+              ? { planning: { ...state.planning, admitted: state.planning.admitted.includes(event.agent) ? state.planning.admitted : [...state.planning.admitted, event.agent] } }
+              : {}),
+          }
+        : state;
+    case 'admission-completed':
+      return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
+        ? { ...state, planning: { substate: 'collecting' } }
+        : state;
+    case 'attention-raised':
+      return state && state.topology === 'peer'
+        ? { ...state, attention: [...state.attention, { id: event.id, category: event.category, detail: event.detail, at: event.at }] }
+        : state;
+    case 'attention-cleared':
+      return state && state.topology === 'peer'
+        ? { ...state, attention: state.attention.filter((a) => a.id !== event.id) }
+        : state;
     case 'user-channel-registered':
       // U1: journal-authoritative binding — replay restores it; mirrors can
       // never rebind (they are views of this, not sources).
@@ -131,6 +155,11 @@ export function applyRegistryUpdate(registry: Registry, event: Extract<Event, { 
       });
     } else if (event.change === 'left' || event.change === 'kicked') {
       agents[event.agent] = { ...(prev ?? liveRecord(event.agent, event.at)), status: 'left', leftAt: event.at };
+    } else if (event.change === 'bound' && prev && event.binding) {
+      agents[event.agent] = { ...prev, binding: event.binding };
+    } else if (event.change === 'rebound' && prev) {
+      const { binding: _revoked, ...rest } = prev;
+      agents[event.agent] = rest;
     }
   }
   return { version: event.version, agents };

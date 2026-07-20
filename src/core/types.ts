@@ -80,6 +80,22 @@ export type AgentRecord = {
   readonly status: AgentLifecycle;
   readonly joinedAt: Timestamp;
   readonly leftAt?: Timestamp;
+  /** Peer 1A: PUBLIC credential-binding metadata — the verifier hash is
+   * broker-private (journal privateBindings), never here (codex rev 4). */
+  readonly binding?: { readonly bindingId: string; readonly credentialVersion: number; readonly boundAt: Timestamp };
+};
+
+/** Peer 1A: agent credentials are agent-generated 32 random bytes, wire
+ * encoding frozen as lowercase hex (same grammar as the U1 user token). */
+export const AGENT_CREDENTIAL_PATTERN = /^[0-9a-f]{64}$/;
+
+/** Peer 1A: durable human-attention item — loud TOFU, admission deadlines
+ * and no-show paging must survive with no watch pane attached. */
+export type AttentionItem = {
+  readonly id: string;
+  readonly category: 'tofu-bind';
+  readonly detail: string;
+  readonly at: Timestamp;
 };
 
 /** M1: bounded practical roster limit — registry-defined, fail-closed at
@@ -161,6 +177,9 @@ export type PeerSession = SessionBase & {
   readonly initiator: AgentId;
   readonly phase: SessionPhase;
   readonly planning?: PlanningState;
+  /** Durable human-attention queue (peer 1A; codex guardrail: never
+   * depend on a live watch connection for visibility). */
+  readonly attention: readonly AttentionItem[];
   readonly driver?: never;
   readonly turn?: never;
 };

@@ -22,7 +22,11 @@ export type UserSendFrame = WireBase & { kind: 'user-send'; reqId: string; to: s
 /** U1 slice 4: privileged user action — tokenless connection-bound like
  * user-send; `action` is runtime-validated broker-side. */
 export type UserActionFrame = WireBase & { kind: 'user-action'; reqId: string; action: unknown };
-export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame | UserActionFrame;
+/** Peer 1A: connection-bound agent identity. The credential is presented
+ * ONCE (transport edge); the broker tags the connection and thereafter
+ * derives the principal from the TAG, never from frame `as`/clientId. */
+export type AgentAttachFrame = WireBase & { kind: 'agent-attach'; reqId: string; agent: string; credential: string };
+export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame | UserActionFrame | AgentAttachFrame;
 
 export type ErrorFrame = { reqId?: string; ok: false; error: { code: string; message: string } };
 export type ResponseFrame = { reqId: string; ok: true; seq?: number; events?: unknown[]; data?: unknown } | ErrorFrame;

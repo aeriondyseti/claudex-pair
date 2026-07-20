@@ -29,7 +29,14 @@ export type Event =
    * membership event itself mutates the registry in evolve, so replaying
    * pre-M1 journals still builds a correct registry). version is the
    * POST-change registry version. */
-  | { kind: 'registry-updated'; version: number; change: 'init' | 'joined' | 'left' | 'kicked'; agent?: AgentId; meta?: AgentMeta; at: Timestamp }
+  | { kind: 'registry-updated'; version: number; change: 'init' | 'joined' | 'left' | 'kicked' | 'bound' | 'rebound'; agent?: AgentId; meta?: AgentMeta; binding?: { bindingId: string; credentialVersion: number; boundAt: Timestamp }; at: Timestamp }
+  /** Peer 1A: attach admitted this agent (authorizedExpected -> member). */
+  | { kind: 'agent-admitted'; agent: AgentId; at: Timestamp }
+  /** Peer 1A: the last expected admission (or closing ruling) — planning
+   * leaves 'admitting' atomically in the same txn. */
+  | { kind: 'admission-completed'; at: Timestamp }
+  | { kind: 'attention-raised'; id: string; category: 'tofu-bind'; detail: string; at: Timestamp }
+  | { kind: 'attention-cleared'; id: string; at: Timestamp }
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
   | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }
   | { kind: 'turn-passed'; to: AgentId }

@@ -5,7 +5,7 @@ import { ProtocolError } from '@core/errors.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
 import { navigators, openGrants } from '@core/queries.ts';
-import { USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
+import { AGENT_CREDENTIAL_PATTERN, USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
 import type { Clock, Ids, StoredMessage } from '@app/ports/index.ts';
 import type { BrokerStatusDto, StatusDto } from '@app/ports/gateway.ts';
 import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
@@ -94,6 +94,10 @@ export class BrokerCore {
   /** Connections tagged by a successful user-attach (connection-bound
    * auth, U1): only these may user-send; the tag dies with the socket. */
   #userConnections = new Set<string>();
+  /** Peer 1A: connection tags from agent-attach — the ONLY source of the
+   * peer principal. Multiple live tags per agent are legal (command lane +
+   * blocked wait + keepalive). */
+  #agentConnections = new Map<string, { agent: string; credentialVersion: number }>();
   #leases = new Map<string, Lease>(); // deliveryId → lease
   #connections = new Set<string>();
   #stopping = false;
@@ -169,6 +173,7 @@ export class BrokerCore {
     const wasListener = this.#subscriptions.delete(id);
     this.#observers.delete(id);
     this.#userConnections.delete(id);
+    this.#agentConnections.delete(id);
     // Leases held by the vanished connection expire naturally (F4); the
     // expiry sweep redelivers to the next live subscriber.
     if (wasListener) this.#notifyPresence(); // item 8: listener set changed
@@ -184,15 +189,31 @@ export class BrokerCore {
     return next;
   }
 
-  execute(reqId: string, clientId: string, as: string, payload: unknown): Promise<BrokerResponse> {
+  execute(reqId: string, clientId: string, as: string, payload: unknown, connectionId?: string): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
-    return this.#chain(() => this.#execute(reqId, clientId, as, payload));
+    return this.#chain(() => this.#execute(reqId, clientId, as, payload, connectionId));
   }
 
-  async #execute(reqId: string, clientId: string, as: string, payload: unknown): Promise<BrokerResponse> {
+  async #execute(reqId: string, clientId: string, as: string, payload: unknown, connectionId?: string): Promise<BrokerResponse> {
     if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
     if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
-    const recorded = this.#journal.recordedOutcome(clientId, reqId);
+    const state = this.#journal.sessionState;
+    // Peer 1A: AUTH BEFORE DEDUP (codex rev 4). The principal derives from
+    // the connection tag, never from frame `as`/clientId; the replay
+    // namespace derives from session identity + agent + credential version,
+    // so a forged `as` can never touch (or replay) recorded outcomes.
+    let dedupKey = clientId;
+    if (state?.topology === 'peer') {
+      const tag = connectionId === undefined ? undefined : this.#agentConnections.get(connectionId);
+      if (!tag) return err(reqId, 'agent-not-attached', 'Peer sessions require agent-attach on this connection before any command.');
+      if (tag.agent !== as) return err(reqId, 'identity-mismatch', `This connection is attached as '${tag.agent}', not '${as}'.`);
+      const binding = this.#journal.binding(as);
+      if (!binding || binding.hash === undefined || binding.credentialVersion !== tag.credentialVersion) {
+        return err(reqId, 'credential-revoked', `The credential behind this attach was revoked — re-attach with the current credential.`);
+      }
+      dedupKey = `${state.sessionId ?? 'legacy'}:${as}:${tag.credentialVersion}`;
+    }
+    const recorded = this.#journal.recordedOutcome(dedupKey, reqId);
     if (recorded !== undefined) return recorded as BrokerResponse; // F2: replay, never re-execute
     const forged = userChannelKindFrom(payload);
     if (forged) {
@@ -206,7 +227,32 @@ export class BrokerCore {
       command,
       meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as },
     };
-    const state = this.#journal.sessionState;
+    // Peer 1A bootstrap: peer init carries the INITIATOR credential at the
+    // transport edge (payload, never envelope/journal) and performs an
+    // implicit attach — binding + tag in the same txn as the init.
+    let initBind: { agent: string; credentialVersion: number; extraEvents: Event[]; privateBindings: Record<string, { hash: string; credentialVersion: number }> } | undefined;
+    if (command.kind === 'init-session' && command.topology === 'peer') {
+      const credential = (payload as { credential?: unknown }).credential;
+      if (typeof credential !== 'string' || !AGENT_CREDENTIAL_PATTERN.test(credential)) {
+        return err(reqId, 'invalid-credential', 'Peer init requires the initiator credential (64 lowercase hex chars) at the transport edge.');
+      }
+      if (connectionId === undefined || !this.#connections.has(connectionId)) {
+        return err(reqId, 'connection-closed', 'Peer init must arrive on a live connection — the initiator is tagged on it.');
+      }
+      const at = envelope.meta.at;
+      const bindingId = this.#ids.messageId();
+      initBind = {
+        agent: command.driver,
+        credentialVersion: 1,
+        // Post-init registry version is 1 (init v0 + registry-updated v1);
+        // the bound transition is v2.
+        extraEvents: [
+          { kind: 'registry-updated', version: 2, change: 'bound', agent: command.driver, binding: { bindingId, credentialVersion: 1, boundAt: at }, at },
+          { kind: 'attention-raised', id: `tofu-${bindingId}`, category: 'tofu-bind', detail: `${command.driver} bound credential v1 (TOFU) — confirm this attach is yours.`, at },
+        ],
+        privateBindings: { [command.driver]: { hash: sha256Hex(credential), credentialVersion: 1 } },
+      };
+    }
     // 8a liveness pre-check — the fact pure decide cannot know: an active
     // delivery lease means the turn holder is mid-work; reject rather than
     // rob them. A missing listener or expired lease admits the revocation.
@@ -222,7 +268,88 @@ export class BrokerCore {
         return err(reqId, 'partner-active', `${holder} holds a live delivery lease (still working) — revocation rejected. Retry after the lease expires or the reply lands.`);
       }
     }
-    return this.#commitEnvelope(reqId, clientId, envelope, state);
+    const result = await this.#commitEnvelope(reqId, dedupKey, envelope, state, initBind === undefined ? undefined : { extraEvents: initBind.extraEvents, privateBindings: initBind.privateBindings });
+    if (result.ok && initBind && connectionId !== undefined && this.#connections.has(connectionId)) {
+      // Publication guard: the binding stands even if the socket died; a
+      // dead connection is never tagged.
+      this.#agentConnections.set(connectionId, { agent: initBind.agent, credentialVersion: initBind.credentialVersion });
+    }
+    return result;
+  }
+
+  /**
+   * Peer 1A: connection-bound agent identity (codex rev 4). The credential
+   * is agent-generated; the broker stores ONLY a private sha256 verifier
+   * (journal privateBindings — CRC-covered, never projected). First bind is
+   * loud TOFU (durable attention item + admission when expected); reconnect
+   * proves the same secret constant-time. Multiple live tags per agent are
+   * legal; a dead connection is never tagged (publication guard).
+   */
+  agentAttach(reqId: string, connectionId: string, clientId: string, agent: string, credential: string): Promise<BrokerResponse> {
+    this.#lastBusyAt = Date.now();
+    return this.#chain(async () => {
+      if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
+      if (this.#conflict) return err(reqId, 'mirror-conflict', this.#conflict.message);
+      const state = this.#journal.sessionState;
+      if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      if (state.topology !== 'peer') return err(reqId, 'not-peer-topology', 'agent-attach is peer-topology machinery; pair sessions identify by frame.');
+      if (!AGENT_CREDENTIAL_PATTERN.test(credential)) {
+        return err(reqId, 'invalid-credential', 'Agent credential must be 64 lowercase hex characters (32 bytes).');
+      }
+      const admittingAuthorized = state.planning?.substate === 'admitting' && state.planning.authorizedExpected.includes(agent);
+      if (!state.agents.includes(agent) && !admittingAuthorized) {
+        return err(reqId, 'admission-not-authorized', `'${agent}' is not authorized for this session — admission is by user action or the plan's policy, never self-declared.`);
+      }
+      const existing = this.#journal.binding(agent);
+      if (existing?.hash !== undefined) {
+        // Reconnect: prove the SAME secret (constant-time), no txn.
+        if (!constantTimeEqualHex(sha256Hex(credential), existing.hash)) {
+          return err(reqId, 'agent-auth-failed', 'Credential rejected.');
+        }
+        if (!this.#connections.has(connectionId)) return err(reqId, 'connection-closed', 'Connection closed during agent-attach; re-attach.');
+        this.#agentConnections.set(connectionId, { agent, credentialVersion: existing.credentialVersion });
+        return { reqId, ok: true, data: { agent, credentialVersion: existing.credentialVersion, admitted: state.agents.includes(agent) } };
+      }
+      // TOFU: no dedup shortcut (mirrors user-attach — an unrelated recorded
+      // outcome must never stand in for a bind); a retry lands in the
+      // reconnect branch above and re-proves its own credential.
+      if (this.#journal.recordedOutcome(clientId, reqId) !== undefined) {
+        return err(reqId, 'agent-auth-failed', 'reqId already used by another request — retry agent-attach with a fresh reqId.');
+      }
+      const at = this.#clock.now();
+      const bindingId = this.#ids.messageId();
+      const credentialVersion = (existing?.credentialVersion ?? 0) + 1;
+      const events: Event[] = [];
+      let version = state.registry.version;
+      const willAdmit = admittingAuthorized && !state.agents.includes(agent);
+      if (willAdmit) {
+        // Admission IS the membership change — fresh joinedAt at admission
+        // time (the init-time record was the authorization, not membership).
+        events.push({ kind: 'registry-updated', version: ++version, change: 'joined', agent, at });
+      }
+      events.push({ kind: 'registry-updated', version: ++version, change: 'bound', agent, binding: { bindingId, credentialVersion, boundAt: at }, at });
+      if (willAdmit) {
+        events.push({ kind: 'agent-admitted', agent, at });
+        const admittedAfter = new Set([...(state.planning?.substate === 'admitting' ? state.planning.admitted : []), agent]);
+        const expected = state.planning?.substate === 'admitting' ? state.planning.authorizedExpected : [];
+        // Last expected admission atomically leaves 'admitting' (rev 3).
+        if (expected.every((a) => admittedAfter.has(a))) events.push({ kind: 'admission-completed', at });
+      }
+      events.push({ kind: 'attention-raised', id: `tofu-${bindingId}`, category: 'tofu-bind', detail: `${agent} bound credential v${credentialVersion} (TOFU) — confirm this attach is yours.`, at });
+      const envelope: CommandEnvelope = {
+        // Broker-authored pseudo-command: not in COMMAND_KINDS (the wire
+        // cannot forge it) and carries NO secret material.
+        command: { kind: 'bind-agent', agent, bindingId, credentialVersion } as unknown as CommandEnvelope['command'],
+        meta: { id: this.#ids.messageId(), at, principal: agent },
+      };
+      const committed = await this.#commitDecided(reqId, clientId, envelope, state, events, { privateBindings: { [agent]: { hash: sha256Hex(credential), credentialVersion } } });
+      if (!committed.ok) return committed;
+      // Publication guard: binding + admission are durably committed; a
+      // dead connection is simply not tagged (reconnect proves the secret).
+      if (!this.#connections.has(connectionId)) return err(reqId, 'connection-closed', 'Connection closed during agent-attach; the binding is committed — re-attach.');
+      this.#agentConnections.set(connectionId, { agent, credentialVersion });
+      return { reqId, ok: true, data: { agent, credentialVersion, admitted: true } };
+    });
   }
 
   async #afterCommit(state: SessionState, events: readonly Event[], seq: number, deliveries: OpenDelivery[], voided: OpenDelivery[] = []): Promise<void> {
@@ -309,6 +436,13 @@ export class BrokerCore {
       // may have closed while this request sat behind the commit chain — a
       // dead sink registered here would WIN delivery selection repeatedly.
       if (!this.#connections.has(sink.id)) return err(reqId, 'connection-closed', 'Connection closed before the subscription registered.');
+      // Peer 1A: mailbox ownership — you subscribe only as the agent this
+      // connection is attached as.
+      const subState = this.#journal.sessionState;
+      if (subState?.topology === 'peer') {
+        const tag = this.#agentConnections.get(sink.id);
+        if (!tag || tag.agent !== as) return err(reqId, 'identity-mismatch', `subscribe as '${as}' requires an agent-attach for that agent on this connection.`);
+      }
       this.#subscriptions.set(sink.id, { sink, as, connectedSince: this.#clock.now(), lastActivity: this.#clock.now() });
       this.#notifyPresence(); // item 8: listener appeared
       // Open/unacked beats cursor (frozen rule): every open delivery for
@@ -355,11 +489,17 @@ export class BrokerCore {
     });
   }
 
-  ack(reqId: string, deliveryId: string, clientId: string): Promise<BrokerResponse> {
+  ack(reqId: string, deliveryId: string, clientId: string, connectionId?: string): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
     return this.#chain(async () => {
       const open = this.#journal.openDeliveries().find((d) => d.deliveryId === deliveryId);
       if (!open) return { reqId, ok: true }; // idempotent (F5/F11)
+      // Peer 1A: only the RECIPIENT consumes its mail (tag-derived).
+      const ackState = this.#journal.sessionState;
+      if (ackState?.topology === 'peer') {
+        const tag = connectionId === undefined ? undefined : this.#agentConnections.get(connectionId);
+        if (!tag || tag.agent !== open.message.to) return err(reqId, 'identity-mismatch', `ack of ${deliveryId} requires an agent-attach as its recipient ('${open.message.to}').`);
+      }
       const at = this.#clock.now();
       await this.#journal.ackDelivery(deliveryId, clientId, at);
       this.#leases.delete(deliveryId);
@@ -383,7 +523,14 @@ export class BrokerCore {
     });
   }
 
-  extend(reqId: string, deliveryId: string): BrokerResponse {
+  extend(reqId: string, deliveryId: string, connectionId?: string): BrokerResponse {
+    // Peer 1A: lease extension is recipient-owned like ack.
+    const extState = this.#journal.sessionState;
+    if (extState?.topology === 'peer') {
+      const open = this.#journal.openDeliveries().find((d) => d.deliveryId === deliveryId);
+      const tag = connectionId === undefined ? undefined : this.#agentConnections.get(connectionId);
+      if (open && (!tag || tag.agent !== open.message.to)) return err(reqId, 'identity-mismatch', `extend of ${deliveryId} requires an agent-attach as its recipient.`);
+    }
     const lease = this.#leases.get(deliveryId);
     if (lease) lease.expiresAt = Date.now() + this.#config.deliveryLeaseMs;
     return { reqId, ok: true };
@@ -579,13 +726,19 @@ export class BrokerCore {
    * commit logic is retired; callers handle stopping/conflict/dedup/auth
    * and any path-specific pre-checks (revoke liveness) BEFORE this.
    */
-  async #commitEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined): Promise<BrokerResponse> {
+  async #commitEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, opts?: { extraEvents?: Event[]; privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
     const decided = decide(state, envelope);
     if (!decided.ok) {
       const code = decided.error instanceof ProtocolError ? decided.error.code : 'rejected';
       return err(reqId, code, decided.error.message);
     }
-    const events = decided.value;
+    return this.#commitDecided(reqId, clientId, envelope, state, [...decided.value, ...(opts?.extraEvents ?? [])], opts);
+  }
+
+  /** The post-decide half of the shared commit primitive — also the direct
+   * entry for BROKER-AUTHORED events (peer agent-attach binds, which carry
+   * private verifiers that must never transit decide/commands). */
+  async #commitDecided(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, events: readonly Event[], opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
     // F18/F21: roster removals void the agent's undelivered mail in the same
     // txn — capture the open set now (pre-commit) for the mirror moves.
     const removedAgents = events.flatMap((e) => (e.kind === 'agent-left' || e.kind === 'agent-kicked' ? [e.agent] : []));
@@ -621,7 +774,7 @@ export class BrokerCore {
         ...(command.groupId === undefined ? {} : { groupId: command.groupId }),
       },
     };
-    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents);
+    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents, opts?.privateBindings);
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
       // Voided-in-same-txn deliveries are already closed — never pushed.

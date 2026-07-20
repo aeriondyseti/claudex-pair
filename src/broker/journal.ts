@@ -29,6 +29,12 @@ export type TxnRecord = {
    * backward compatibility with pre-W2c journals.
    */
   voided?: DeliveryRef[];
+  /**
+   * Peer 1A: BROKER-PRIVATE credential verifiers, CRC-covered with the
+   * record but NEVER projected (no event, state, outcome, mirror, or
+   * observer surface carries them — codex rev 4). null revokes.
+   */
+  privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>;
   outcome: unknown;
   crc32: number;
 };
@@ -61,6 +67,8 @@ export type Snapshot = {
    * snapshots lack it — recovery then seeds the ring from openDeliveries so
    * pre-snapshot open mail is never invisible to watch (codex review). */
   transcript?: TranscriptRecord[];
+  /** Peer 1A: private verifier map persisted across snapshots. */
+  bindings?: Record<string, { hash: string; credentialVersion: number }>;
   /** Item 7: first-class awaiting-set (asks not yet validly answered).
    * Persisted so cap pressure on the transcript ring can never lose an
    * unresolved ask across restart. Optional: a legacy snapshot lacks it —
@@ -189,6 +197,10 @@ export class Journal {
   /** Item 7: authoritative awaiting-set — replayed with the records and
    * persisted in snapshots, NEVER derived from the bounded ring. */
   private awaiting_ = new Map<string, AwaitingEntry>();
+  /** Peer 1A: broker-private credential verifiers (agent → hash+version).
+   * A revoked binding keeps its version (hash cleared) so the next TOFU
+   * binds at version+1. */
+  private bindings_ = new Map<string, { hash?: string; credentialVersion: number }>();
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -220,6 +232,10 @@ export class Journal {
   awaiting(): AwaitingEntry[] {
     return [...this.awaiting_.values()];
   }
+  /** Peer 1A: the PRIVATE verifier for an agent (never projected). */
+  binding(agent: string): { hash?: string; credentialVersion: number } | undefined {
+    return this.bindings_.get(agent);
+  }
 
   /** Committed-success dedup lookup (spec: rejections re-evaluate). */
   recordedOutcome(clientId: string, reqId: string): unknown | undefined {
@@ -246,6 +262,7 @@ export class Journal {
       // persist the set itself, closing the cap-pressure gap.
       const awaiting = snapshot.awaiting ?? legacyAwaitingFrom(seeded);
       this.awaiting_ = new Map(awaiting.map((a) => [a.messageId, a]));
+      this.bindings_ = new Map(Object.entries(snapshot.bindings ?? {}));
     }
     const segments = (await readdir(this.dir)).filter((n) => /^segment-\d{6}\.jsonl$/.test(n)).sort();
     for (let s = 0; s < segments.length; s++) {
@@ -295,6 +312,7 @@ export class Journal {
       // clean up entries a removed agent can no longer answer.
       if (event.kind === 'message-sent') applyMessageToAwaiting(this.awaiting_, { id: event.id, from: event.from, to: event.to, type: event.type, sent: event.at, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }) });
       else if (event.kind === 'agent-left' || event.kind === 'agent-kicked') removeAgentFromAwaiting(this.awaiting_, event.agent);
+      // (peer bindings replay from record.privateBindings below, not events)
       else if (event.kind === 'session-ended') this.awaiting_.clear();
       if (event.kind === 'message-sent') {
         const ref = record.deliveries.find((d) => d.deliveryId === `${event.id}:${event.to}`);
@@ -318,6 +336,12 @@ export class Journal {
       this.open_.delete(d.deliveryId);
       const entry = this.transcript_.get(d.deliveryId);
       if (entry) entry.state = 'voided';
+    }
+    for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {
+      if (verifier === null) {
+        const prev = this.bindings_.get(agent);
+        if (prev) this.bindings_.set(agent, { credentialVersion: prev.credentialVersion });
+      } else this.bindings_.set(agent, verifier);
     }
     this.lastSeq = record.seq;
     for (const d of record.deliveries) {
@@ -368,6 +392,7 @@ export class Journal {
     outcome: unknown,
     reqIdentity: { clientId: string; reqId: string },
     voidRecipients: readonly string[] = [],
+    privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>,
   ): Promise<TxnRecord> {
     const deliveries: DeliveryRef[] = [];
     for (const event of events) {
@@ -396,6 +421,7 @@ export class Journal {
       events: [...events],
       deliveries,
       ...(voided.length ? { voided } : {}),
+      ...(privateBindings === undefined ? {} : { privateBindings }),
       outcome,
     };
     await this.appendLine(encodeRecord(record));
@@ -446,6 +472,7 @@ export class Journal {
       openDeliveries: this.openDeliveries(),
       transcript: this.transcript(),
       awaiting: this.awaiting(),
+      bindings: Object.fromEntries([...this.bindings_].filter(([, v]) => v.hash !== undefined) as [string, { hash: string; credentialVersion: number }][]),
     };
     const target = join(this.dir, 'snapshot.json');
     const tmp = join(this.dir, `snapshot.json.${process.pid}.tmp`);

@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { encodeFrame, NdjsonDecoder } from './framing.ts';
-import type { AckFrame, ClientFrame, DeliveryFrame, ErrorFrame, ExecuteFrame, ExtendFrame, ObserveFrame, ObserverPushFrame, QueryFrame, ResponseFrame, ServerFrame, SubscribeFrame, UserActionFrame, UserAttachFrame, UserSendFrame } from './types.ts';
+import type { ClientFrame, DeliveryFrame, ErrorFrame, ExecuteFrame, ObserverPushFrame, QueryFrame, ResponseFrame, ServerFrame } from './types.ts';
 
 export type IpcClientOptions = { endpoint: string; token: string; epoch: number; clientId?: string; retryCount?: number };
 
@@ -51,6 +51,9 @@ export class IpcClient {
    * poison the caller's already-armed push queue — the host rebuilds the
    * whole session instead (codex slice review #6). */
   async userAttach(userToken: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'user-attach', reqId, userToken }, 0); }
+  /** Peer 1A: no internal retry — the TOFU bind must never double-fire on
+   * an ambiguous drop; the caller re-attaches (idempotent by credential). */
+  async agentAttach(agent: string, credential: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'agent-attach', reqId, agent, credential }, 0); }
   async userSend(to: string, body: string, reqId: string) { return this.#requestWithRetry({ ...this.#base(), kind: 'user-send', reqId, to, body }, 0); }
   /** U1 slice 4: privileged action — no internal retry (dedup-safe retries
    * are the HOST's decision with the same reqId, like user-send). */
@@ -59,13 +62,13 @@ export class IpcClient {
   async extend(deliveryId: string, reqId = randomUUID()) { return this.#requestWithRetry({ ...this.#base(), kind: 'extend', reqId, deliveryId }, this.options.retryCount ?? 1); }
 
   #base() { return { token: this.options.token, epoch: this.options.epoch, clientId: this.clientId }; }
-  async #requestWithRetry(frame: ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame | UserActionFrame, retries: number): Promise<ResponseFrame> {
+  async #requestWithRetry(frame: ClientFrame, retries: number): Promise<ResponseFrame> {
     for (let attempt = 0;; attempt++) {
       try { await this.connect(); return await this.#request(frame); }
       catch (error) { this.close(); if (attempt >= retries) throw error; }
     }
   }
-  async #request(frame: ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame | ExtendFrame | ObserveFrame | UserAttachFrame | UserSendFrame | UserActionFrame): Promise<ResponseFrame> {
+  async #request(frame: ClientFrame): Promise<ResponseFrame> {
     const response = new Promise<ResponseFrame>((resolve, reject) => this.#pending.set(frame.reqId, { resolve, reject }));
     try { await this.#send(frame); } catch (error) { this.#pending.delete(frame.reqId); throw error; }
     return response;

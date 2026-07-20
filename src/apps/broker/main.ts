@@ -115,7 +115,9 @@ async function main(): Promise<number> {
   const handler = async (frame: ClientFrame, connection: ServerConnection): Promise<ServerFrame | void> => {
     switch (frame.kind) {
       case 'execute':
-        return (await core.execute(frame.reqId, frame.clientId, frame.as, frame.envelope)) as ServerFrame;
+        return (await core.execute(frame.reqId, frame.clientId, frame.as, frame.envelope, connection.id)) as ServerFrame;
+      case 'agent-attach':
+        return (await core.agentAttach(frame.reqId, connection.id, frame.clientId, frame.agent, frame.credential)) as ServerFrame;
       case 'query': {
         const response = (await core.query(frame.reqId, frame.what, frame.args)) as ServerFrame;
         if (frame.what === 'broker-stop') {
@@ -136,9 +138,9 @@ async function main(): Promise<number> {
       case 'user-action':
         return (await core.userAction(frame.reqId, frame.clientId, connection.id, frame.action)) as ServerFrame;
       case 'ack':
-        return (await core.ack(frame.reqId, frame.deliveryId, frame.clientId)) as ServerFrame;
+        return (await core.ack(frame.reqId, frame.deliveryId, frame.clientId, connection.id)) as ServerFrame;
       case 'extend':
-        return core.extend(frame.reqId, frame.deliveryId) as ServerFrame;
+        return core.extend(frame.reqId, frame.deliveryId, connection.id) as ServerFrame;
     }
   };
 
