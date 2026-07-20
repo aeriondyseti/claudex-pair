@@ -404,3 +404,19 @@ describe('M1: registry-updated reaches activity subscribers with the post-state 
     expect(session.registry.agents['agy']!.display).toBe('Antigravity');
   });
 });
+
+
+describe('M1 round 3: direct broker init without sessionId is rejected, nothing created', () => {
+  test('typed invalid-session-id; no journal record, no session', async () => {
+    const core = makeCore(await tempRoot());
+    expect(await core.recover()).not.toBe('conflict');
+    const r = await core.execute('init-x', 'client-x', 'claude', {
+      command: { kind: 'init-session', task: 'no-id', agents: ['claude', 'codex'], driver: 'claude' },
+    });
+    expect(r.ok).toBeFalse();
+    expect((r as { error?: { code?: string } }).error?.code).toBe('invalid-session-id');
+    const status = await core.query('st-x', 'status');
+    expect(status.ok).toBeFalse(); // no session was created
+    expect((status as { error?: { code?: string } }).error?.code).toBe('session-not-active');
+  });
+});

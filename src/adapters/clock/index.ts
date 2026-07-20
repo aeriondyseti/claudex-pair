@@ -25,8 +25,8 @@ export const systemClock: Clock = {
  * a random coincidence — a per-tick counter that never wraps guarantees
  * same-process uniqueness at any rate; the per-process nonce separates
  * processes sharing a tick. Factory form so tests can freeze the clock
- * and cross the old wrap boundary. session_id remains deferred to the M1
- * registry identity work. */
+ * and cross the old wrap boundary. session_id is a separate identity
+ * minted at pair init (M1) - not derived from message ids. */
 export function makeMessageIdSource(nonce: string, now: () => Date): () => string {
   let lastPrefix = '';
   let seq = 0;

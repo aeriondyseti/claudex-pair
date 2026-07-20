@@ -188,9 +188,10 @@ lifetime records don't count). Rejoin is a new admission: fresh
 
 A **`session_id`** is minted once at `pair init` (deferred here from item
 7) and persists in state, `session.json`, and `agents.json`.
-Conversational messages carry it as a `session_id:` header line
-(backward-compatible codec, like `reply_to`); system notices derive theirs
-from the transcript in v1. Pre-M1 sessions synthesize a v0 registry from
+EVERY message-sent of a new session — conversational sends, grant and
+lifecycle notices, user broadcasts, privileged-action notices — carries it
+as a `session_id:` header line (backward-compatible codec, like
+`reply_to`); it is absent only in legacy replay. Pre-M1 sessions synthesize a v0 registry from
 `agents[]` and have no `session_id`; status renders both compatibly.
 Peer-model electorate snapshots key on the registry version. Admission
 **authorization** beyond driver admittance (credential binding,

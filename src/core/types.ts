@@ -108,8 +108,9 @@ export type SessionState = {
   readonly status: SessionStatus;
   readonly started: Timestamp;
   readonly grants: Readonly<Record<GrantId, Grant>>;
-  /** M1: session identity — minted at init from M1 on; absent only on
-   * pre-M1 sessions. Conversational message headers carry it (`session:`). */
+  /** M1: session identity — an init INVARIANT from M1 on (every ingress
+   * mints or supplies one); absent only on legacy pre-M1 state. EVERY
+   * message-sent of a new session carries it (`session_id:` header). */
   readonly sessionId?: string;
   /** M1: full lifecycle registry. `agents` above remains the LIVE-member
    * projection (evolve keeps both consistent) — existing validation and
