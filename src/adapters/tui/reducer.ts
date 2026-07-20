@@ -107,7 +107,7 @@ function activity(state: WatchTuiState, value: WatchActivity): WatchStep {
     const entry = entries.get(id);
     if (entry) entries.set(id, { ...entry, pending: false, voided: true });
   }
-  const model = rebuildBrokerModel(state.model, value.session, value.seq, entries, state.liveness, state.now);
+  const model = rebuildBrokerModel(state.model, value.session, value.seq, entries, state.liveness, state.now, value.awaiting);
   const composer = activityComposer(state, entries, value.session.agents);
   const next = { ...state, model, headSeq: value.seq, entries, composer };
   return step(next, value.session.status === 'completed' ? ['render', 'exit'] : ['render']); // paused is LIVE
@@ -448,6 +448,7 @@ function brokerModel(input: {
     navigators: navigators(snapshot.session),
     openGrants: openGrants(snapshot.session),
     transcript,
+    awaiting: snapshot.awaiting ?? [],
     presence: presenceFrom(snapshot.session, input.liveness, transcript),
     now: input.now,
     notices: input.notices,
@@ -461,6 +462,7 @@ function rebuildBrokerModel(
   entries: ReadonlyMap<string, TranscriptEntry>,
   liveness: LivenessDto | undefined,
   now: string,
+  awaiting: readonly import('@core/awaiting.ts').AwaitingEntry[] | undefined,
 ): WatchViewModel {
   const transcript = [...entries.values()];
   const source = previous.source;
@@ -472,6 +474,9 @@ function rebuildBrokerModel(
     navigators: navigators(session),
     openGrants: openGrants(session),
     transcript,
+    // Item 7: authoritative per-commit; a pre-item-7 broker omits it and
+    // the previous view stands.
+    awaiting: awaiting ?? previous.awaiting,
     presence: presenceFrom(session, liveness, transcript),
     now,
     notices: [],

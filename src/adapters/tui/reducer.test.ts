@@ -74,7 +74,7 @@ describe('watch reducer attach and replacement', () => {
 
     const fsModel: WatchViewModel = {
       source: { kind: 'fs-diagnostic', reason: 'legacy-session' }, session: completed,
-      navigators: ['codex'], openGrants: [], transcript: [], presence: [], now: 'now', notices: [],
+      navigators: ['codex'], openGrants: [], transcript: [], awaiting: [], presence: [], now: 'now', notices: [],
     };
     const replaced = reduceWatch(attach.state, { kind: 'replace-model', model: fsModel });
     expect(replaced.effects).toEqual(['render', 'exit']);
@@ -257,7 +257,7 @@ describe('watch reducer composer', () => {
 
     const fsModel: WatchViewModel = {
       source: { kind: 'fs-diagnostic', reason: 'broker-unreachable' }, session: active,
-      navigators: [], openGrants: [], transcript: [], presence: [], now: 'now', notices: [],
+      navigators: [], openGrants: [], transcript: [], awaiting: [], presence: [], now: 'now', notices: [],
     };
     ({ state } = reduceWatch(state, { kind: 'replace-model', model: fsModel }));
     expect(state.composer).toBeUndefined();
@@ -317,7 +317,7 @@ describe('deferred pre-attach user-channel events (close-out #2)', () => {
     ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'credential-error', detail: 'DPAPI failed' }));
     const fsModel: WatchViewModel = {
       source: { kind: 'fs-diagnostic', reason: 'broker-unreachable' }, session: active,
-      navigators: [], openGrants: [], transcript: [], presence: [], now: 'now', notices: [],
+      navigators: [], openGrants: [], transcript: [], awaiting: [], presence: [], now: 'now', notices: [],
     };
     ({ state } = reduceWatch(state, { kind: 'replace-model', model: fsModel }));
     expect(state.composer).toBeUndefined(); // fs never gains composer authority

@@ -31,6 +31,8 @@ export type PairMessage = {
   type: MessageType;
   turn: TurnMode;
   sent: Timestamp;
+  /** Item 7: serialized as `reply_to:` (optional, backward compatible). */
+  replyTo?: MessageId;
   body: string;
 };
 

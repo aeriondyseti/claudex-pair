@@ -91,6 +91,7 @@ export class FsMirrors implements MirrorStore {
           await this.#mailbox.publish({
             id: event.id, from: event.from, to: event.to,
             type: event.type, turn: event.turn, sent: event.at, body: event.body,
+            ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }),
           });
           break;
         case 'grant-issued':
@@ -233,6 +234,7 @@ export class FsMirrors implements MirrorStore {
       await this.#mailbox.publish({
         id: d.message.id, from: d.message.from, to: d.message.to,
         type: d.message.type, turn: d.message.turn, sent: d.message.at, body: d.message.body,
+        ...(d.message.replyTo === undefined ? {} : { replyTo: d.message.replyTo }),
       });
     }
     await this.writeManifest(headSeq);
@@ -241,7 +243,7 @@ export class FsMirrors implements MirrorStore {
   async archived(last?: number): Promise<readonly StoredMessage[]> {
     return (await this.#mailbox.archived(last)).map((a) => ({
       name: a.name,
-      header: { id: a.message.id, from: a.message.from, to: a.message.to, type: a.message.type, turn: a.message.turn, sent: a.message.sent },
+      header: { id: a.message.id, from: a.message.from, to: a.message.to, type: a.message.type, turn: a.message.turn, sent: a.message.sent, ...(a.message.replyTo === undefined ? {} : { replyTo: a.message.replyTo }) },
       body: a.message.body,
       raw: serializeMessage(a.message),
     }));
@@ -288,8 +290,8 @@ export class FsMirrors implements MirrorStore {
 
 /** The fs adapter's message codec, injected into the broker core. */
 export const fsMessageCodec = {
-  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; body: string }) => messageFilename(m as PairMessage),
-  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; body: string }) => serializeMessage(m as PairMessage),
+  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; body: string }) => messageFilename(m as PairMessage),
+  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; body: string }) => serializeMessage(m as PairMessage),
 };
 
 function toDiskSession(state: SessionState): DiskSession {

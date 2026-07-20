@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { CommandEnvelope } from '@core/commands.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
+import { applyMessageToAwaiting, removeAgentFromAwaiting, type AwaitingEntry } from '@core/awaiting.ts';
 import type { SessionState } from '@core/types.ts';
 
 /**
@@ -60,6 +61,11 @@ export type Snapshot = {
    * snapshots lack it — recovery then seeds the ring from openDeliveries so
    * pre-snapshot open mail is never invisible to watch (codex review). */
   transcript?: TranscriptRecord[];
+  /** Item 7: first-class awaiting-set (asks not yet validly answered).
+   * Persisted so cap pressure on the transcript ring can never lose an
+   * unresolved ask across restart. Optional: a legacy snapshot lacks it —
+   * recovery then seeds best-effort from the (bounded) transcript. */
+  awaiting?: AwaitingEntry[];
 };
 
 export class CorruptJournalError extends Error {
@@ -116,6 +122,18 @@ function decodeRecord(line: string): TxnRecord | undefined {
 
 const segmentName = (n: number) => `segment-${String(n).padStart(6, '0')}.jsonl`;
 
+/** Legacy-snapshot fallback only: replay the shared rule over the bounded
+ * transcript. Honest gap — an ask already trimmed from a LEGACY snapshot's
+ * ring is unrecoverable; every new snapshot persists awaiting first-class. */
+function legacyAwaitingFrom(transcript: readonly TranscriptRecord[]): AwaitingEntry[] {
+  const map = new Map<string, AwaitingEntry>();
+  for (const t of transcript) {
+    const m = t.message;
+    applyMessageToAwaiting(map, { id: m.id, from: m.from, to: m.to, type: m.type, sent: m.at, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }) });
+  }
+  return [...map.values()];
+}
+
 export class Journal {
   private state: SessionState | undefined;
   private lastSeq = 0;
@@ -126,6 +144,9 @@ export class Journal {
    * on recover from the replayed tail — a fresh restart serves only the
    * post-snapshot history, which is honest: it is what the journal holds. */
   private transcript_ = new Map<string, TranscriptRecord>();
+  /** Item 7: authoritative awaiting-set — replayed with the records and
+   * persisted in snapshots, NEVER derived from the bounded ring. */
+  private awaiting_ = new Map<string, AwaitingEntry>();
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -153,6 +174,10 @@ export class Journal {
   transcript(): TranscriptRecord[] {
     return [...this.transcript_.values()];
   }
+  /** Item 7: asks awaiting a valid reply (authoritative, journal-derived). */
+  awaiting(): AwaitingEntry[] {
+    return [...this.awaiting_.values()];
+  }
 
   /** Committed-success dedup lookup (spec: rejections re-evaluate). */
   recordedOutcome(clientId: string, reqId: string): unknown | undefined {
@@ -174,6 +199,11 @@ export class Journal {
         (d): TranscriptRecord => ({ deliveryId: d.deliveryId, message: d.message, state: 'open' }),
       );
       this.transcript_ = new Map(seeded.map((t) => [t.deliveryId, t]));
+      // Awaiting: first-class from the snapshot. A legacy snapshot without
+      // it seeds best-effort from the bounded transcript — new snapshots
+      // persist the set itself, closing the cap-pressure gap.
+      const awaiting = snapshot.awaiting ?? legacyAwaitingFrom(seeded);
+      this.awaiting_ = new Map(awaiting.map((a) => [a.messageId, a]));
     }
     const segments = (await readdir(this.dir)).filter((n) => /^segment-\d{6}\.jsonl$/.test(n)).sort();
     for (let s = 0; s < segments.length; s++) {
@@ -213,6 +243,12 @@ export class Journal {
   private applyRecord(record: TxnRecord): void {
     for (const event of record.events) {
       this.state = evolve(this.state, event);
+      // Item 7: the awaiting-set replays with the records themselves — the
+      // shared core rule decides registration/resolution; membership events
+      // clean up entries a removed agent can no longer answer.
+      if (event.kind === 'message-sent') applyMessageToAwaiting(this.awaiting_, { id: event.id, from: event.from, to: event.to, type: event.type, sent: event.at, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }) });
+      else if (event.kind === 'agent-left' || event.kind === 'agent-kicked') removeAgentFromAwaiting(this.awaiting_, event.agent);
+      else if (event.kind === 'session-ended') this.awaiting_.clear();
       if (event.kind === 'message-sent') {
         const ref = record.deliveries.find((d) => d.deliveryId === `${event.id}:${event.to}`);
         if (ref) {
@@ -362,6 +398,7 @@ export class Journal {
       dedup: Object.fromEntries([...this.dedup].map(([c, m]) => [c, Object.fromEntries(m)])),
       openDeliveries: this.openDeliveries(),
       transcript: this.transcript(),
+      awaiting: this.awaiting(),
     };
     const target = join(this.dir, 'snapshot.json');
     const tmp = join(this.dir, `snapshot.json.${process.pid}.tmp`);

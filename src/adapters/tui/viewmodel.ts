@@ -1,3 +1,4 @@
+import type { AwaitingEntry } from '@core/awaiting.ts';
 import type { AgentId, Grant, SessionState } from '@core/types.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 
@@ -62,6 +63,9 @@ export type WatchViewModel = {
   readonly navigators: readonly AgentId[];
   readonly openGrants: readonly Grant[];
   readonly transcript: readonly TranscriptEntry[];
+  /** Item 7: journal-authoritative awaiting-set — [] when the source cannot
+   * supply one (fs-diagnostic has no authoritative broker view). */
+  readonly awaiting: readonly AwaitingEntry[];
   readonly presence: readonly AgentPresence[];
   /** Render-time clock ('YYYY-MM-DD HH:mm:ss', same format as message sent). */
   readonly now: string;

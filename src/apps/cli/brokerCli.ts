@@ -67,11 +67,24 @@ export async function runBrokerCli(
       const fuse = turn === 'pass' && type !== 'done' && !has(flags, 'nowait') && r.session.status === 'active';
       if (!fuse) { if (turn === 'pass' && r.session.status === 'active') out(`You handed over the turn. Now block on: pair wait -As ${from}`); return 0; }
       out('You handed over the turn. Waiting for the reply (-NoWait skips the fused wait).');
-      return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true);
+      // Item 7: a fused ASK waits on its own thread — the sent message id.
+      // Without this the first unrelated delivery ended the fused ask, and a
+      // timeout re-arm lost the thread entirely (codex blocker 1).
+      const fusedThread = type === 'ask' && sent?.kind === 'message-sent' ? sent.id : undefined;
+      return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true, fusedThread);
     }
     if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
-    if (command === 'log') { const messages = await gateway.log(num(flags, 'tail', 10)); if (!messages.length) out('No archived messages yet.'); for (const m of messages) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`); return 0; }
+    if (command === 'log') {
+      const thread = str(flags, 'thread');
+      // Item 7 (`pair log -Thread <id>`): a chain is sparse in the archive,
+      // so -Thread widens the fetch before filtering to root + replies.
+      const messages = await gateway.log(num(flags, 'tail', thread ? 500 : 10));
+      const selected = thread ? threadChain(messages, thread) : messages;
+      if (!selected.length) out(thread ? `No archived messages in thread ${thread}.` : 'No archived messages yet.');
+      for (const m of selected) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`);
+      return 0;
+    }
     if (command === 'grants') { const grants = [...await gateway.grants()].sort((a, b) => a.id.localeCompare(b.id)); if (has(flags, 'json')) out(JSON.stringify(grants, null, 2)); else if (!grants.length) out('No grants in this session.'); else for (const g of grants) { out(`${g.id}  [${g.state}]  ${g.issuer} -> ${g.assignee}  ${g.scope.mode === 'worktree' ? `worktree ${g.scope.worktree}` : `files: ${g.scope.files.join(', ')}`}`); out(`    task: ${g.task}${g.result ? `\n    result: ${g.result}` : ''}`); } return 0; }
     if (command === 'revoke-turn') {
       const from = required(flags, 'from', 'revoke-turn requires -From <driver>').toLowerCase();
@@ -133,11 +146,24 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
   // Item 7: -Thread <messageId> — every delivery still prints and acks
   // normally (at-least-once consumption is unchanged); the wait simply
   // EXITS only when the reply to that specific message arrives.
+  // A timeout re-arm must preserve the thread scope (codex blocker 1).
+  const rearm = `pair wait -As ${as} -TimeoutSec ${timeoutSec}${threadId ? ` -Thread ${threadId}` : ''}`;
   for (;;) {
     const delivery = await nextDelivery(subscription, timeoutSec);
-    if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); return 2; }
+    if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: ${rearm}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: ${rearm}`); return 2; }
     await printDeliveryThenAck(delivery, subscription);
-    if (threadId && (delivery.message.header as { replyTo?: string }).replyTo !== threadId) {
+    const header = delivery.message.header;
+    // Item 7 (codex blocker 5): user-channel traffic must WAKE a
+    // thread-scoped wait — the harness has to act on the user's input NOW.
+    // It never resolves the thread. Seam: future control notices
+    // (phase/lease) belong on this exit too.
+    if (threadId && (header.provenance === 'trusted_user_client' || header.actionKind !== undefined)) {
+      const s = await gateway.status();
+      renderTurn(s, as);
+      if (s.session.agents.includes(as) && s.session.status !== 'completed') out(`Thread ${threadId} is NOT resolved by this — after handling the user input above, re-arm: pair wait -As ${as} -Thread ${threadId}`);
+      return 0;
+    }
+    if (threadId && header.replyTo !== threadId) {
       out(`(waiting on thread ${threadId} — the above was a different delivery; still listening)`);
       continue;
     }
@@ -157,6 +183,17 @@ function renderTurn(s: StatusDto, as: AgentId) {
   else if (s.session.status !== 'active') out(`SESSION ${s.session.status.toUpperCase()} — your partner ended the session. Wrap up and report to the user; do not wait again.`);
   else if (s.session.turn === as) out(`It is now YOUR turn, ${as}. Your role: ${s.session.driver === as ? 'DRIVER' : 'NAVIGATOR'}. Act on the message, then send a reply (turn: pass) and wait again.`);
   else out(`FYI only — the turn stays with ${s.session.turn}. Note the content and continue; if you are idle, re-arm: pair wait -As ${as}`);
+}
+/** Item 7 (`pair log -Thread`): the root plus every message whose replyTo
+ * chains back into the thread. Archive order is id-chronological, so a
+ * reply's parent is always classified before the reply itself. */
+function threadChain<T extends { readonly header: { readonly id: string; readonly replyTo?: string } }>(messages: readonly T[], root: string): T[] {
+  const inThread = new Set([root]);
+  const selected: T[] = [];
+  for (const m of messages) {
+    if (m.header.id === root || (m.header.replyTo !== undefined && inThread.has(m.header.replyTo))) { inThread.add(m.header.id); selected.push(m); }
+  }
+  return selected;
 }
 function required(flags: Flags, name: string, message: string): string { const value = str(flags, name); if (!value) throw new Error(message); return value; }
 async function bodyFrom(flags: Flags): Promise<string> { const file = str(flags, 'file'); if (file) return Bun.file(file).text(); const message = str(flags, 'message'); if (message) return message; throw new Error("Provide the message body via -Message '...' or -File <path>"); }

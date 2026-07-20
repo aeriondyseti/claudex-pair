@@ -77,9 +77,9 @@ function makeFakeGateway(log: Log) {
 
   return {
     gateway,
-    deliver: (id: string, replyTo?: string) => {
+    deliver: (id: string, replyTo?: string, headerExtra?: Record<string, unknown>) => {
       if (!pushDelivery) throw new Error('subscribe was never called');
-      pushDelivery({ deliverySeq: 1, deliveryId: id, message: { name: `${id}.md`, header: { id, from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: 's', ...(replyTo ? { replyTo } : {}) }, body: 'b', raw: 'raw-body' } as Delivery['message'] });
+      pushDelivery({ deliverySeq: 1, deliveryId: id, message: { name: `${id}.md`, header: { id, from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: 's', ...(replyTo ? { replyTo } : {}), ...(headerExtra ?? {}) }, body: 'b', raw: 'raw-body' } as Delivery['message'] });
     },
     closes: () => closeCount,
   };
@@ -96,7 +96,7 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     await until(() => log.includes('subscribe (closeCount=0)')); // wait armed with the gateway still open
     expect(closes()).toBe(0); // the old bug: close() had already run here
 
-    deliver('m2:claude');
+    deliver('m2:claude', 'm1'); // item 7: a fused ask exits only on ITS reply
     expect(await result).toBe(0);
     expect(closes()).toBe(1);
     expect(log).toContain('ack m2:claude (closeCount=0)'); // delivery acked before any close
@@ -128,7 +128,7 @@ describe('runBrokerCli gateway lifecycle ordering', () => {
     await until(() => factoryCalls === 2 && log.includes('subscribe (closeCount=0)')); // outer dispatch + recursive 'send', wait armed
     expect(closes()).toBe(0); // NEITHER gateway closed while the wait is armed
 
-    deliver('m4:claude');
+    deliver('m4:claude', 'm1'); // item 7: the fused ask is thread-scoped
     expect(await result).toBe(0);
     expect(closes()).toBe(2); // both levels closed, both after settle
   }, 10_000);
@@ -151,5 +151,97 @@ describe('item 7: thread-scoped wait (fake gateway)', () => {
     expect(await result).toBe(0);
     expect(log).toContain('ack m-answer:claude (closeCount=0)');
     expect(closes()).toBe(1);
+  });
+});
+
+
+/** Captures stdout for hint assertions; preserves write-callback semantics
+ * (printDeliveryThenAck awaits the flush callback). */
+function captureOut(): { text: () => string; restore: () => void } {
+  const chunks: string[] = [];
+  const original = process.stdout.write.bind(process.stdout);
+  (process.stdout as unknown as { write: unknown }).write = (chunk: unknown, ...rest: unknown[]) => {
+    chunks.push(String(chunk));
+    const cb = rest.find((r) => typeof r === 'function') as ((e?: unknown) => void) | undefined;
+    if (cb) cb();
+    return true;
+  };
+  return { text: () => chunks.join(''), restore: () => { (process.stdout as unknown as { write: unknown }).write = original; } };
+}
+
+describe('item 7: fused ask threading and control wakes (codex blockers 1+5)', () => {
+  test('fused ask ignores unrelated deliveries and exits only on its own reply', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes } = makeFakeGateway(log);
+    const flags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['type', 'ask'], ['message', 'x']]);
+    const result = runBrokerCli('send', flags, [], 'unused-root', () => gateway);
+    await until(() => log.includes('subscribe (closeCount=0)'));
+
+    deliver('m-noise:claude'); // no replyTo — printed + acked, fused ask keeps waiting
+    await until(() => log.includes('ack m-noise:claude (closeCount=0)'));
+    expect(closes()).toBe(0);
+
+    deliver('m-reply:claude', 'm1');
+    expect(await result).toBe(0);
+    expect(closes()).toBe(1);
+  }, 10_000);
+
+  test('user-channel traffic wakes a thread wait distinctly, without resolving the thread', async () => {
+    const log: Log = [];
+    const { gateway, deliver } = makeFakeGateway(log);
+    const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'ask-7']]);
+    const capture = captureOut();
+    try {
+      const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
+      await until(() => log.includes('subscribe (closeCount=0)'));
+      deliver('u1:claude', undefined, { from: 'user', type: 'info', provenance: 'trusted_user_client' });
+      expect(await result).toBe(0); // exits — the harness must act on the user NOW
+    } finally { capture.restore(); }
+    expect(capture.text()).toContain('Thread ask-7 is NOT resolved');
+    expect(capture.text()).toContain('-Thread ask-7');
+  }, 10_000);
+
+  test('a thread wait timeout re-arm hint preserves -Thread', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '1'], ['thread', 'ask-7']]);
+    const capture = captureOut();
+    try {
+      const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
+      expect(await result).toBe(2);
+    } finally { capture.restore(); }
+    expect(capture.text()).toContain('-Thread ask-7');
+  }, 10_000);
+});
+
+describe('item 7: pair log -Thread (codex blocker 6)', () => {
+  test('prints the root and its transitive reply chain only', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    const stored = (id: string, replyTo?: string) => ({ name: `${id}.md`, header: { id, from: 'claude', to: 'codex', type: 'info', turn: 'keep', sent: 's', ...(replyTo ? { replyTo } : {}) }, body: 'b', raw: `raw-${id}` });
+    const fixture = [stored('ask-1'), stored('u1'), stored('r1', 'ask-1'), stored('u2', 'u1'), stored('r2', 'r1')];
+    const threaded = { ...gateway, log: async () => fixture as unknown as Awaited<ReturnType<CliGateway['log']>> };
+    const capture = captureOut();
+    try {
+      const flags = new Map<string, string | true>([['thread', 'ask-1']]);
+      expect(await runBrokerCli('log', flags, [], 'unused-root', () => threaded)).toBe(0);
+    } finally { capture.restore(); }
+    const text = capture.text();
+    expect(text).toContain('raw-ask-1');
+    expect(text).toContain('raw-r1');
+    expect(text).toContain('raw-r2'); // transitive: r2 -> r1 -> ask-1
+    expect(text).not.toContain('raw-u1');
+    expect(text).not.toContain('raw-u2');
+  });
+
+  test('an unknown thread reports emptiness explicitly', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    const capture = captureOut();
+    try {
+      const flags = new Map<string, string | true>([['thread', 'nope']]);
+      expect(await runBrokerCli('log', flags, [], 'unused-root', () => gateway)).toBe(0);
+    } finally { capture.restore(); }
+    expect(capture.text()).toContain('No archived messages in thread nope.');
   });
 });

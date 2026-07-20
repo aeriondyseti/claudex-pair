@@ -1,3 +1,4 @@
+import type { AwaitingEntry } from '@core/awaiting.ts';
 import type { Event } from '@core/events.ts';
 import type { SessionState } from '@core/types.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
@@ -18,6 +19,8 @@ export type MirrorMessage = {
   type: string;
   turn: string;
   sent: string;
+  /** Item 7: serialized as `reply_to:` (optional, backward compatible). */
+  replyTo?: string;
   body: string;
 };
 
@@ -70,6 +73,8 @@ export type ObserverPushWire =
       session: SessionState;
       ackedDeliveryIds: readonly string[];
       voidedDeliveryIds: readonly string[];
+      /** Item 7: the post-commit journal-authoritative awaiting-set. */
+      awaiting: readonly AwaitingEntry[];
     }
   | { kind: 'presence'; liveness: unknown };
 

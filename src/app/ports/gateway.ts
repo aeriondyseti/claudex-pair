@@ -72,9 +72,9 @@ export type StatusDto = {
   readonly recent: readonly StoredMessage[];
   /** Absent in file mode — file mode has no listener signal to report. */
   readonly liveness?: LivenessDto;
-  /** Item 7 threading: asks not yet answered (broker mode; derived from the
-   * bounded transcript ring at recovery, live-updated at commit — an ask
-   * older than the ring bound ages out of this view, honestly). */
+  /** Item 7 threading: asks not yet validly answered. Journal-authoritative:
+   * replayed with the records and persisted in snapshots, so cap pressure
+   * on the transcript ring never loses an unresolved ask (broker mode). */
   readonly awaiting?: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
 };
 
@@ -150,6 +150,9 @@ export type ObserverSnapshotDto = {
   readonly seq: number;
   readonly session: SessionState;
   readonly transcript: readonly ObserverTranscriptEntry[];
+  /** Item 7: journal-authoritative awaiting-set (absent only from a
+   * pre-item-7 broker). */
+  readonly awaiting?: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
   readonly liveness: LivenessDto;
   readonly broker: { readonly pid: number; readonly epoch: number; readonly endpoint: string; readonly heartbeatAt: string };
   /** U1: present only on a SUCCESSFUL user-attach snapshot — plain observe
@@ -175,6 +178,9 @@ export type ObserverPush =
       readonly session: SessionState;
       readonly ackedDeliveryIds: readonly string[];
       readonly voidedDeliveryIds: readonly string[];
+      /** Item 7: post-commit awaiting-set (absent from a pre-item-7 broker
+       * — consumers keep their previous view). */
+      readonly awaiting?: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
     }
   | { readonly kind: 'presence'; readonly liveness: LivenessDto };
 

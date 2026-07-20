@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { FsGrantStore, FsMailbox, FsSessionStore, MEMORY_TEMPLATE, parseMessage, type DiskGrant, type DiskSession } from './index.ts';
+import { FsGrantStore, FsMailbox, FsSessionStore, MEMORY_TEMPLATE, parseMessage, serializeMessage, type DiskGrant, type DiskSession, type PairMessage } from './index.ts';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -42,5 +42,25 @@ describe('FsGrantStore', () => {
     expect(active).toMatchObject({ state: 'active', revision: 1, updated: '2026-07-12 12:01:00' });
     await expect(store.transition(grant.id, ['offered'], (g) => g, 'later')).rejects.toThrow("is 'active' (expected: offered)");
     expect(await readdir(store.grantsDir)).toEqual(['g1-codex.json']);
+  });
+});
+
+
+describe('item 7: reply_to codec round-trip (codex blocker 2)', () => {
+  const base: PairMessage = { id: '20260720-1', from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: '2026-07-20 13:00:00', body: 'the answer' };
+
+  test('replyTo serializes as reply_to and parses back; disk headers keep causality', () => {
+    const threaded: PairMessage = { ...base, replyTo: 'ask-1' };
+    const raw = serializeMessage(threaded);
+    expect(raw).toContain('reply_to: ask-1');
+    expect(parseMessage(raw)).toEqual(threaded);
+  });
+
+  test('backward compatible: no replyTo emits no reply_to line; legacy raw parses with it absent', () => {
+    const raw = serializeMessage(base);
+    expect(raw).not.toContain('reply_to');
+    const parsed = parseMessage(raw);
+    expect(parsed).toEqual(base);
+    expect('replyTo' in parsed).toBeFalse();
   });
 });

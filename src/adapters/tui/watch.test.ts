@@ -91,6 +91,7 @@ function model(overrides: Partial<WatchViewModel> = {}): WatchViewModel {
       },
     ],
     now: '2026-07-14 18:10:00',
+    awaiting: [],
     notices: ['observer reconnected'],
     ...overrides,
   };
@@ -267,14 +268,10 @@ describe('slice 4b: paused rendering', () => {
 });
 
 describe('item 7: awaiting rendering', () => {
-  test('asks without replies render who-owes-whom with age; replied and voided asks do not', () => {
-    const ask = { message: message({ id: 'ask-1', type: 'ask', sent: '2026-07-14 18:08:00' }), pending: true };
-    const answered = { message: message({ id: 'ask-2', type: 'ask' }), pending: false };
-    const reply = { message: message({ id: 'ans-2', from: 'codex', to: 'claude', type: 'answer', replyTo: 'ask-2' } as Partial<StoredMessage['header']>), pending: false };
-    const voidedAsk = { message: message({ id: 'ask-3', type: 'ask' }), pending: false, voided: true };
-    const frame = renderWatchFrame({ model: model({ transcript: [ask, answered, reply, voidedAsk] }), width: 110, tail: 10 });
+  test('renders the broker-authoritative awaiting-set with ages; an empty set renders nothing', () => {
+    const withAwaiting = model({ awaiting: [{ messageId: 'ask-1', from: 'claude', to: 'codex', sentAt: '2026-07-14 18:08:00' }] });
+    const frame = renderWatchFrame({ model: withAwaiting, width: 110, tail: 10 });
     expect(frame).toContain('awaiting: codex owes claude a reply to ask-1 (2m 0s ago)');
-    expect(frame).not.toContain('reply to ask-2');
-    expect(frame).not.toContain('reply to ask-3');
+    expect(renderWatchFrame({ model: model(), width: 110, tail: 10 })).not.toContain('awaiting:');
   });
 });

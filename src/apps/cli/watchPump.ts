@@ -21,6 +21,7 @@ export function decodePush(push: ObserverPush): WatchEvent {
     ),
     ackedDeliveryIds: push.ackedDeliveryIds,
     voidedDeliveryIds: push.voidedDeliveryIds,
+    ...(push.awaiting === undefined ? {} : { awaiting: push.awaiting }),
   };
   return { kind: 'activity', activity };
 }
@@ -30,7 +31,7 @@ export function attachEvent(snapshot: ObserverSnapshotDto, endpoint: string, now
 }
 
 export function toStored(event: Extract<Event, { kind: 'message-sent' }>): StoredMessage {
-  const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body };
+  const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }) };
   return {
     name: fsMessageCodec.filename(pair),
     header: {

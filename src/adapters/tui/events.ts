@@ -23,6 +23,9 @@ export type WatchActivity = {
   readonly session: SessionState;
   readonly entries: readonly { readonly deliveryId: string; readonly message: StoredMessage }[];
   readonly ackedDeliveryIds: readonly string[];
+  /** Item 7: broker-authoritative awaiting-set (absent from a pre-item-7
+   * broker — the reducer keeps its previous view). */
+  readonly awaiting?: readonly import('@core/awaiting.ts').AwaitingEntry[];
   readonly voidedDeliveryIds: readonly string[];
 };
 

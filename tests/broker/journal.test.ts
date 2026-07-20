@@ -116,3 +116,83 @@ describe('journal (BROKER-SPEC F1/F2/F6/F11/F12)', () => {
     expect(reopened.deliveryHead).toBe(before);
   });
 });
+
+
+/** Item 7 — the journal-authoritative awaiting-set (codex blockers 3+4).
+ * Events are hand-built: the journal replays records as given; decide-level
+ * validation is pinned in tests/core. */
+describe('journal item-7 awaiting-set', () => {
+  const at = '2026-07-20 13:00:00';
+  const msg = (id: string, from: string, to: string, type: string, replyTo?: string) =>
+    [{ kind: 'message-sent', id, from, to, type, turn: 'keep', body: 'b', at, ...(replyTo ? { replyTo } : {}) }] as never[];
+  const commitMsg = (journal: Journal, id: string, from: string, to: string, type: string, replyTo?: string) =>
+    journal.commit(env({ kind: 'send-message' }, from, id), msg(id, from, to, type, replyTo), { ok: true }, { clientId: 'c', reqId: `r-${id}` });
+
+  test('an acked unresolved ask survives ring cap pressure, snapshot, and restart (blocker 3)', async () => {
+    const { journal, pairDir } = await freshJournal();
+    await commitInit(journal);
+    await commitMsg(journal, 'a1', 'claude', 'codex', 'ask');
+    await journal.ackDelivery('a1:codex', 'c', at); // consumed but NOT answered
+    for (let i = 0; i < 205; i++) {
+      await commitMsg(journal, `n${i}`, 'claude', 'codex', 'info');
+      await journal.ackDelivery(`n${i}:codex`, 'c', at);
+    }
+    // The ring dropped the acked ask; the awaiting-set did not.
+    expect(journal.transcript().some((t) => t.deliveryId === 'a1:codex')).toBeFalse();
+    expect(journal.awaiting()).toEqual([{ messageId: 'a1', from: 'claude', to: 'codex', sentAt: at }]);
+
+    await journal.snapshot();
+    const reopened = new Journal(pairDir);
+    await reopened.recover();
+    expect(reopened.awaiting()).toEqual([{ messageId: 'a1', from: 'claude', to: 'codex', sentAt: at }]);
+
+    await commitMsg(reopened, 'ans', 'codex', 'claude', 'answer', 'a1');
+    expect(reopened.awaiting()).toEqual([]);
+  }, 60_000);
+
+  test('resolution demands a valid reply type on the reverse endpoints (blocker 4)', async () => {
+    const { journal } = await freshJournal();
+    await commitInit(journal);
+    await commitMsg(journal, 'a9', 'claude', 'codex', 'ask');
+
+    await commitMsg(journal, 'w1', 'codex', 'claude', 'info', 'a9'); // wrong type
+    await commitMsg(journal, 'w2', 'agy', 'claude', 'answer', 'a9'); // wrong sender
+    await commitMsg(journal, 'w3', 'codex', 'agy', 'answer', 'a9'); // wrong recipient
+    await commitMsg(journal, 'w4', 'codex', 'claude', 'answer', 'nope'); // unknown id
+    expect(journal.awaiting().map((a) => a.messageId)).toEqual(['a9']);
+
+    await commitMsg(journal, 'ok', 'codex', 'claude', 'review', 'a9'); // review resolves too
+    expect(journal.awaiting()).toEqual([]);
+  });
+
+  test('membership cleanup: kick, leave, and session end clear entries the agent can no longer settle', async () => {
+    const { journal } = await freshJournal();
+    await commitInit(journal);
+    await commitMsg(journal, 'k1', 'claude', 'codex', 'ask');
+    await journal.commit(env({ kind: 'kick-agent' }, 'claude', 'kk'), [{ kind: 'agent-kicked', agent: 'codex', reason: '', at }] as never[], { ok: true }, { clientId: 'c', reqId: 'r-kk' });
+    expect(journal.awaiting()).toEqual([]);
+
+    await commitMsg(journal, 'l1', 'claude', 'agy', 'ask');
+    await journal.commit(env({ kind: 'leave-session' }, 'agy', 'll'), [{ kind: 'agent-left', agent: 'agy', at }] as never[], { ok: true }, { clientId: 'c', reqId: 'r-ll' });
+    expect(journal.awaiting()).toEqual([]);
+
+    await commitMsg(journal, 'e1', 'claude', 'agy', 'ask');
+    await journal.commit(env({ kind: 'end-session' }, 'claude', 'ee'), [{ kind: 'session-ended', by: 'claude', summary: 's', at }] as never[], { ok: true }, { clientId: 'c', reqId: 'r-ee' });
+    expect(journal.awaiting()).toEqual([]);
+  });
+
+  test('legacy snapshot without awaiting seeds best-effort from the transcript', async () => {
+    const { journal, pairDir } = await freshJournal();
+    await commitInit(journal);
+    await commitMsg(journal, 'a2', 'claude', 'codex', 'ask');
+    await journal.snapshot();
+    const snapPath = join(pairDir, 'journal', 'snapshot.json');
+    const snap = JSON.parse(await readFile(snapPath, 'utf8')) as { awaiting?: unknown };
+    delete snap.awaiting; // simulate a pre-item-7 snapshot
+    await Bun.write(snapPath, JSON.stringify(snap));
+
+    const reopened = new Journal(pairDir);
+    await reopened.recover();
+    expect(reopened.awaiting().map((a) => a.messageId)).toEqual(['a2']);
+  });
+});

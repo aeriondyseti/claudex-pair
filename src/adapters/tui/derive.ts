@@ -75,20 +75,3 @@ export function derivePresence(
       && pendingAgeSec >= threshold,
   };
 }
-
-/** Item 7 threading: derive the awaiting-set from the transcript — every
- * ask with no message carrying replyTo === its id. Same rule as the
- * broker's ring rebuild; pure and wire-free (the watch already holds the
- * transcript). Bounded by whatever transcript the caller holds. */
-export function deriveAwaiting(
-  transcript: readonly { readonly message: { readonly header: { readonly id: string; readonly from: string; readonly to: string; readonly type: string; readonly sent: string; readonly replyTo?: string } }; readonly voided?: boolean }[],
-): readonly { readonly messageId: string; readonly from: string; readonly to: string; readonly sentAt: string }[] {
-  const answered = new Set<string>();
-  for (const t of transcript) {
-    const replyTo = t.message.header.replyTo;
-    if (replyTo) answered.add(replyTo);
-  }
-  return transcript
-    .filter((t) => t.message.header.type === 'ask' && !t.voided && !answered.has(t.message.header.id))
-    .map((t) => ({ messageId: t.message.header.id, from: t.message.header.from, to: t.message.header.to, sentAt: t.message.header.sent }));
-}

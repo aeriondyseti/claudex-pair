@@ -363,6 +363,7 @@ async function buildFsViewModel(deps: ReturnType<typeof bindFsDeps>): Promise<Wa
     transcript: entries,
     presence: fsPresence(session, entries),
     now: deps.clock.now(),
+    awaiting: [], // fs-diagnostic: no authoritative source — honestly empty
     notices: [],
   };
 }
