@@ -95,9 +95,9 @@ The CLI is written in TypeScript and is verb-for-verb compatible with the origin
   is the default runtime (see [docs/BROKER-SPEC.md](docs/BROKER-SPEC.md));
   richer topologies are designed in [docs/ENHANCEMENTS.md](docs/ENHANCEMENTS.md)
   (M1–M6) and [docs/PEER-MODEL.md](docs/PEER-MODEL.md).
-- Broker daemons spawned on demand from *inside a sandboxed agent command*
-  (e.g. Codex's Windows sandbox) die with that command — sandbox job objects
-  defeat `detached:true`. This is harmless (restarts are transparent: waits
-  reconnect with bounded backoff, acks rediscover, epochs advance) but noisy;
-  for a maximally stable broker, run one `pair` command from your own
-  terminal so the daemon spawns outside any sandbox.
+- Broker daemons **idle-exit by design** ~60s after the last participant
+  connection closes (observers like `pair watch` deliberately do not pin
+  them), then respawn on demand at the next epoch. Expect epoch numbers to
+  climb during quiet stretches — that is architecture, not a crash, and
+  restarts are transparent: waits reconnect with bounded backoff and acks
+  rediscover the new broker.
