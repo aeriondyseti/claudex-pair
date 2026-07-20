@@ -221,8 +221,11 @@ confirmation*, per ENHANCEMENTS U1:
   `user-resume-session`, AND an unknown future `user-anything` → rejected
   by the namespace gate (fail closed), regardless of claimed principal.
 - F-A2 `user-action` on a never-attached connection → `user-channel-required`;
-  on a connection whose socket closed mid-action → the action still commits
-  iff it reached the chain (durable), response lost, dedup replays on retry.
+  on a connection whose socket closes mid-action → the action commits IFF
+  the live-auth check passed INSIDE the serialized chain before close
+  processing pruned the connection (round-2 verdict: auth-at-execution, not
+  reached-the-chain); if it committed, the response is lost and dedup
+  replays the recorded outcome on retry.
 - F-A3 dedup: same `(clientId, reqId)` replayed → recorded outcome, no
   double kick/cancel/end.
 - F-A4 `user-cancel-grant` on a completed/cancelled grant → stable error,
@@ -245,12 +248,18 @@ confirmation*, per ENHANCEMENTS U1:
 - F-A12 watch while paused: attach renders the PAUSED banner with a usable
   composer; activity pushes (user messages, allowed agent leaves/grant
   completions) flow and render while paused (tail C).
-- F-A8 real-wire: user `/kick` end-to-end with a SEEDED preexisting open
-  delivery for the kicked agent — confirm, wire frame, shared-primitive
-  commit, journal AND mirror voiding proven, observer voidedDeliveryIds
-  pushed, survivor notice delivered, and the kicked agent's ALREADY-BLOCKED
-  wait wakes terminally via removed-from-session (production handler
-  wiring, like the slice-3 broadcast test).
+- F-A8 real-wire: user `/kick` end-to-end — confirm, wire frame,
+  shared-primitive commit, journal AND mirror voiding proven, observer
+  voidedDeliveryIds pushed, survivor notice delivered, and the kicked
+  agent's ALREADY-BLOCKED wait wakes terminally via removed-from-session
+  (production handler wiring, like the slice-3 broadcast test).
+  **Test topology** (round-2 verdict): one subscription cannot be both
+  blocked and eligible for a seeded unleased open delivery — subscribe
+  receives open deliveries immediately. Use TWO same-agent subscriptions:
+  the FIRST takes the seeded delivery's lease (unacked, proving the void
+  path), the SECOND is genuinely empty-blocked (proving the terminal
+  wake); alternatively split into two real-wire cases if the double
+  subscription complicates the harness.
 
 ## Open questions — ALL RESOLVED (codex tail C rulings)
 
