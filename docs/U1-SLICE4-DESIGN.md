@@ -1,10 +1,13 @@
 # U1 slice 4 — privileged user actions (design, pre-code)
 
-Status: REV 4 — round 1 (blockers R1/R2, tails A/B/C) and round 2 (B:
-durable `actionKind` discriminator on action notices; C: zero-recipient
-kick fallback removed — the driver always survives in pair topology —
-and cancel-notice recipients deduplicated) fully applied; all five open
-questions ruled. No code until approved (slice-4 design gate, per the
+Status: REV 5 — rounds 1 and 2 fully applied including the round-2 tail
+(B: durable `actionKind` discriminator; C: impossible zero-recipient kick
+fallback removed, cancel notices deduplicated; D: the kicked-wait wire
+seam specified end to end — IpcClient onServerError for unsolicited
+ErrorFrames, typed latched terminal removed-from-session, reconnect
+suppression, KICK-ONLY scope so a racing error can never hide the end
+summary; E editorial: paused is the third status, resume preserves
+allowed paused mutations); all five open questions ruled. No code until approved (slice-4 design gate, per the
 slice-3 close verdict `20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
 credential, connection-bound auth, `user-message`, watch composer).
 Upstream requirements: ENHANCEMENTS.md U1 ("state changes go through
@@ -38,7 +41,7 @@ are NOT in this slice.
 | `user-pause-session` / `user-resume-session` | 4b | freeze/unfreeze agent mutations | n/a (new) |
 | (extension seam) `user-confirm-verification`, arbitration verdicts, forced phase transitions, absentee rulings | peer-model slices | — | — |
 
-**Pause semantics (4b)**: `session.status: 'paused'` — a *fourth* status.
+**Pause semantics (4b)**: `session.status: 'paused'` — the *third* status (joining `active` and `completed`).
 Statuses partition into **live** (`active`, `paused`) and **terminal**
 (`completed`, plus any future terminal kinds); every existing
 `status !== 'active'` branch must be re-audited against that partition
@@ -116,16 +119,27 @@ and-restore. Pause is a brake on agents, never on the human.
    liveness pre-check), never copied-partial logic. F-A8 seeds a
    preexisting open delivery for the kicked agent and proves journal AND
    mirror voiding plus observer `voidedDeliveryIds`.
-4b. **Waking the kicked agent's blocked wait** (codex tail B): "the next
-   wait rejects" would strand an in-flight infinite wait. On kick commit,
-   if the kicked agent has a live subscription, the broker sends a typed
-   terminal control through it — `sendError('removed-from-session', …)` —
-   then deregisters the sink; the CLI wait surfaces "you were removed from
-   the session by the user" and exits terminally (no re-arm hint, no
-   reconnect loop — reconnect-with-backoff must treat this code as
-   terminal, not churn). The same mechanism serves `user-end-session` for
-   agents whose wait would otherwise sleep through the done fan-out they
-   are no longer roster-entitled to receive.
+4b. **Waking the kicked agent's blocked wait — the whole seam, KICK-ONLY**
+   (codex tail B + round-2 D): "the next wait rejects" would strand an
+   in-flight infinite wait. On kick commit, if the kicked agent has a live
+   subscription, the broker sends `sendError('removed-from-session', …)`
+   through it, then deregisters the sink. That alone is NOT sufficient —
+   IpcClient currently DROPS an unsolicited ErrorFrame carrying no reqId —
+   so the seam is specified end to end:
+   - **IpcClient**: unsolicited server errors (ErrorFrame without reqId)
+     are surfaced to a dedicated `onServerError` listener instead of being
+     dropped (request/response matching unchanged).
+   - **BrokerGateway subscription**: on a `removed-from-session` server
+     error, the delivery queue FAILS with that typed terminal error;
+     `scheduleReconnect` is suppressed for it; and the terminal reason is
+     LATCHED — a subsequent socket close (the broker deregistering) must
+     not replace it with a generic connection error.
+   - **CLI wait**: renders "you were removed from the session by the user"
+     and exits terminally — no re-arm hint, no reconnect churn.
+   - **Scope: kick ONLY.** `user-end-session` does NOT use this mechanism:
+     its done notice fans out to every agent and already wakes blocked
+     waits WITH the summary; a competing terminal error could win the race
+     and hide it (round-2 D).
 5. **Action correlation** (codex tail A — blocking; recipients and marker
    corrected per round 2 B/C): the composer's pending slot clears ONLY on
    durable activity/snapshot content with `groupId === reqId`, and reused
@@ -215,8 +229,8 @@ confirmation*, per ENHANCEMENTS U1:
   no state change; `user-kick-agent` on a non-member → error.
 - F-A5 pause: every agent mutation kind rejected `session-paused`; ack,
   leave, and active-grant `grant-done` allowed; user verbs + user-send
-  allowed; resume restores exactly; all across a broker restart (journal
-  replay of paused state).
+  allowed; resume changes ONLY the status and preserves allowed paused
+  mutations; all across a broker restart (journal replay of paused state).
 - F-A6 end while paused → valid (user outranks the brake).
 - F-A7 confirmation UX: reducer never emits an action effect from the first
   submit; Esc aborts; reqId minted at confirm and reused on retry; the
