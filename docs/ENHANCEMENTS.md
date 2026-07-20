@@ -291,6 +291,15 @@ ack loss, lease expiry/redelivery, broker-crash recovery, end races).
 
 ## Multi-agent generalization (user-requested direction)
 
+> **Direction update (2026-07-20):** the flagship parallelism direction is now the
+> **peer model** — see [PEER-MODEL.md](PEER-MODEL.md) (rev 2.2, review-converged
+> 2026-07-20: claude drafted, codex blind-reviewed and approved after three
+> adversarial rounds — 10 blind findings, 8 round-2, 4 round-3). It supersedes
+> M3's *leader-follower* preset (single-model-in-charge is the shape being moved
+> away from); M1/M4/M5 remain load-bearing as its prerequisites, M3's `pair`,
+> `round-robin`, and `adversarial` mechanics survive (the adversarial barrier
+> becomes the peer model's planning opener).
+
 The user has asked for this explicitly: arbitrary agent count, per-agent roles, and
 support for known collaboration topologies. This is a **protocol evolution**, not a
 widening of `ValidateSet('claude','codex')`. The central design move (from codex's
