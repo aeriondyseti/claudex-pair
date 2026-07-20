@@ -8,13 +8,10 @@ import type { AgentMeta, AgentRecord, Registry, SessionState } from './types.ts'
  */
 export function evolve(state: SessionState | undefined, event: Event): SessionState | undefined {
   switch (event.kind) {
-    case 'session-initialized':
-      return {
+    case 'session-initialized': {
+      const base = {
         task: event.task,
-        agents: event.agents,
-        driver: event.driver,
-        turn: event.driver,
-        status: 'active',
+        status: 'active' as const,
         started: event.at,
         grants: {},
         ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
@@ -27,10 +24,27 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
           agents: Object.fromEntries(event.agents.map((a) => [a, liveRecord(a, event.at, event.meta?.[a])])),
         },
       };
+      // Peer 1A: peer sessions begin ADMITTING — the roster named at init
+      // is authorizedExpected; only the initiator (bound in the init txn)
+      // is a member. Legacy events lack topology → pair.
+      if (event.topology === 'peer') {
+        return {
+          ...base,
+          topology: 'peer' as const,
+          agents: [event.driver],
+          initiator: event.driver,
+          phase: 'planning' as const,
+          planning: { substate: 'admitting' as const, authorizedExpected: event.agents, admitted: [event.driver] },
+        };
+      }
+      return { ...base, topology: 'pair' as const, agents: event.agents, driver: event.driver, turn: event.driver };
+    }
     case 'turn-passed':
-      return state && { ...state, turn: event.to };
+      // Peer sessions have no standing turn token (1A); the planning
+      // convergence turn arrives as its own substate machinery in 1C.
+      return state && state.topology === 'pair' ? { ...state, turn: event.to } : state;
     case 'driver-changed':
-      return state && { ...state, driver: event.driver };
+      return state && state.topology === 'pair' ? { ...state, driver: event.driver } : state;
     case 'session-ended':
       return state && { ...state, status: 'completed' };
     case 'session-paused':

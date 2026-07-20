@@ -346,9 +346,9 @@ function toDiskSession(state: SessionState): DiskSession {
   return {
     task: state.task,
     agents: [...state.agents],
-    driver: state.driver,
-    navigators: state.agents.filter((a) => a !== state.driver),
-    turn: state.turn,
+    ...(state.topology === 'pair'
+      ? { driver: state.driver, navigators: state.agents.filter((a) => a !== state.driver), turn: state.turn }
+      : { topology: 'peer' as const, initiator: state.initiator, phase: state.phase }),
     status: state.status,
     started: state.started,
     ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),

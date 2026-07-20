@@ -100,11 +100,32 @@ export type Registry = {
 export type SessionStatus = 'active' | 'paused' | 'completed';
 export const LIVE_STATUSES: readonly SessionStatus[] = ['active', 'paused'];
 
-export type SessionState = {
+/** Peer 1A: session phases (peer topology only; slices 1-2 occupy
+ * planning and provisioning — implementation arrives with slice 4). */
+export type SessionPhase = 'planning' | 'provisioning' | 'implementation';
+export type Topology = 'pair' | 'peer';
+
+/** Peer 1A bootstrap: substate union — states that cannot coexist are
+ * unrepresentable (codex rev-3/4 rulings). convergenceTurn exists ONLY
+ * while converging. Later substates (collecting/converging/balloting)
+ * gain their fields in 1B/1C; 1A ships admitting. */
+export type PlanningState =
+  | {
+      readonly substate: 'admitting';
+      /** init roster + later user/policy authorizations — NOT yet members. */
+      readonly authorizedExpected: readonly AgentId[];
+      /** attached-and-bound agents; only these enter agents[]. */
+      readonly admitted: readonly AgentId[];
+      /** Absolute deadline for admission; expiry pages the human (durable). */
+      readonly deadlineAt?: Timestamp;
+    }
+  | { readonly substate: 'collecting' }
+  | { readonly substate: 'converging'; readonly convergenceTurn: AgentId }
+  | { readonly substate: 'balloting' };
+
+type SessionBase = {
   readonly task: string;
   readonly agents: readonly AgentId[];
-  readonly driver: AgentId;
-  readonly turn: AgentId;
   readonly status: SessionStatus;
   readonly started: Timestamp;
   readonly grants: Readonly<Record<GrantId, Grant>>;
@@ -121,6 +142,30 @@ export type SessionState = {
    * mirrors (auth needs the preimage); slice 3 has no reset path. */
   readonly userChannelTokenHash?: string;
 };
+
+/** The classic driver/navigator session — byte-identical to pre-peer. */
+export type PairSession = SessionBase & {
+  readonly topology: 'pair';
+  readonly driver: AgentId;
+  readonly turn: AgentId;
+  readonly initiator?: never;
+  readonly phase?: never;
+  readonly planning?: never;
+};
+
+/** Peer 1A: no driver, no standing turn — authority is phase + substate.
+ * driver/turn are `never` so impossible states are unrepresentable while
+ * pair-path reads (`state.turn`) stay type-checkable via narrowing. */
+export type PeerSession = SessionBase & {
+  readonly topology: 'peer';
+  readonly initiator: AgentId;
+  readonly phase: SessionPhase;
+  readonly planning?: PlanningState;
+  readonly driver?: never;
+  readonly turn?: never;
+};
+
+export type SessionState = PairSession | PeerSession;
 
 /** U1: the reserved user identity — outside the roster, never a
  * participant, turn holder, grant assignee, or message recipient (v1). */

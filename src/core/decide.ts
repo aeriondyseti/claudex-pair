@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { DISPLAY_PATTERN, MAX_AGENTS, SESSION_ID_PATTERN, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -28,6 +28,20 @@ function decideInner(
   envelope: CommandEnvelope,
 ): Result<Event[], ProtocolError> {
   const { command, meta } = envelope;
+  // Peer 1A command matrix (rev 4): NO driver authority exists in peer
+  // topology — the whole verb class is rejected fail-closed. Claims (the
+  // grant successor) arrive in slice 3.
+  if (state?.topology === 'peer') {
+    const rejected: Partial<Record<Command['kind'], string>> = {
+      'revoke-turn': 'Peer sessions have no turn to revoke.',
+      'join-session': "Peer admission is authorized by the user or the plan's policy, never driver-admitted — the joining agent attaches with its own credential.",
+      'kick-agent': 'Only the user removes peers (user-kick from the watch pane).',
+      'end-session': 'No agent ends a peer session — the user ends it, or a phase exit does.',
+      'issue-grant': PEER_GRANTS, 'accept-grant': PEER_GRANTS, 'complete-grant': PEER_GRANTS, 'cancel-grant': PEER_GRANTS,
+    };
+    const why = rejected[command.kind];
+    if (why !== undefined) return err(new ProtocolError('no-driver-authority', why));
+  }
   switch (command.kind) {
     case 'init-session':
       return decideInit(state, command, meta.principal, meta.at);
@@ -394,9 +408,9 @@ function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   const events: Event[] = [
     { kind: 'agent-left', agent, at: envelope.meta.at },
     { kind: 'registry-updated', version: s.registry.version + 1, change: 'left', agent, at: envelope.meta.at },
-    messageEvent(envelope, agent, s.driver, 'leave', `${agent} left the session.`),
+    messageEvent(envelope, agent, sessionAnchor(s), 'leave', `${agent} left the session.`),
   ];
-  if (s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
+  if (s.topology === 'pair' && s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
   return ok(events);
 }
 
@@ -567,6 +581,9 @@ function decideInit(
       );
     }
   }
+  if (command.topology !== undefined && command.topology !== 'pair' && command.topology !== 'peer') {
+    return err(new ProtocolError('invalid-agents', `unknown topology '${String(command.topology)}' (pair | peer)`));
+  }
   // M1 round 2 (codex): session identity is an INVARIANT of every NEW
   // session — only genuinely legacy state (replayed events, old mirrors)
   // may lack it. Every ingress must mint or supply one.
@@ -597,7 +614,7 @@ function decideInit(
     );
   }
   return ok([
-    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), ...(command.meta === undefined ? {} : { meta: command.meta }) },
+    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), ...(command.meta === undefined ? {} : { meta: command.meta }), ...(command.topology === undefined ? {} : { topology: command.topology }) },
     { kind: 'registry-updated', version: 1, change: 'init', at },
   ]);
 }
@@ -623,6 +640,14 @@ function validateAgentMeta(meta: import('./types.ts').AgentMeta | undefined, age
   return undefined;
 }
 
+const PEER_GRANTS = 'Grants are pair-topology machinery; peer work authorization is claims (slice 3).';
+
+/** The union-safe notice anchor: pair notices route to the driver, peer
+ * notices to the initiator (the only standing identity a peer session has). */
+function sessionAnchor(s: SessionState): AgentId {
+  return s.topology === 'pair' ? s.driver : s.initiator;
+}
+
 function messageEvent(
   envelope: CommandEnvelope,
   from: string,
@@ -643,6 +668,17 @@ function decideSend(
   // U1: the user reads via the transcript; agents get no user inbox (v1).
   if (command.to === USER_IDENTITY) {
     return err(new ProtocolError('user-not-addressable', `'${USER_IDENTITY}' is a reserved identity and cannot receive messages (v1); the user reads the transcript via pair watch.`));
+  }
+  if (s.topology === 'peer') {
+    if (command.type === 'handoff' || command.type === 'done' || command.type === 'propose-end') {
+      return err(new ProtocolError('no-driver-authority', `'${command.type}' is pair-topology machinery; peer sessions have no driver to ${command.type === 'handoff' ? 'hand off to' : 'petition'}.`));
+    }
+    if (command.turn === 'pass') {
+      // 1A: only the admitting substate exists — there is no turn token
+      // yet. The convergence rotation lands with 1C; until then all peer
+      // traffic is -Turn keep.
+      return err(new ProtocolError('no-turn-in-phase', 'This peer phase has no turn token; send with -Turn keep.'));
+    }
   }
   const bad = assertParticipant(s, from, '-From') ?? assertParticipant(s, command.to, '-To');
   if (bad) return err(bad);

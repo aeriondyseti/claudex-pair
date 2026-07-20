@@ -42,6 +42,8 @@ export type ProtocolErrorCode =
   | 'user-auth-failed'
   | 'invalid-recipient'
   | 'registry-full'
+  | 'no-driver-authority'
+  | 'no-turn-in-phase'
   | 'invalid-session-id'
   | 'invalid-message-type'
   | 'invalid-reply-to'

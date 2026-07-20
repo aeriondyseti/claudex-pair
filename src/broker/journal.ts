@@ -145,7 +145,11 @@ function normalizeRegistry(state: SessionState | undefined): SessionState | unde
  * registry never saw, and mark records for departed agents left. Version
  * is untouched (legacy history has no versioned transitions to claim). */
 function reconcileRegistryProjection(state: SessionState | undefined): SessionState | undefined {
-  if (!state) return state;
+  // Pair only: legacy pre-M1 journals are pair by definition, and a PEER
+  // session's registry legitimately holds authorized-but-unadmitted
+  // records that agents[] does not include (1A bootstrap) — reconciling
+  // those to 'left' would corrupt the admitting substate on restart.
+  if (!state || state.topology !== 'pair') return state;
   const agents: Record<string, import('@core/types.ts').AgentRecord> = { ...state.registry.agents };
   let dirty = false;
   for (const a of state.agents) {

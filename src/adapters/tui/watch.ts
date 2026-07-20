@@ -51,9 +51,14 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
   }
   const statusColor = session.status === 'active' ? `${ESC}[32m` : ERROR;
   const navs = model.navigators.length ? model.navigators.map(paint).join(', ') : `${DIM}(none)${RESET}`;
-  lines.push(
-    ` status: ${statusColor}${session.status}${RESET}   driver: ${paint(session.driver)}   navigators: ${navs}   turn: ${color.get(session.turn) ?? ''}${BOLD}${session.turn}${RESET}`,
-  );
+  // Peer 1A: no driver/turn — show initiator + phase instead.
+  if (session.topology === 'peer') {
+    lines.push(` status: ${statusColor}${session.status}${RESET}   topology: peer   initiator: ${paint(session.initiator)}   phase: ${BOLD}${session.phase}${session.planning ? ` (${session.planning.substate})` : ''}${RESET}`);
+  } else {
+    lines.push(
+      ` status: ${statusColor}${session.status}${RESET}   driver: ${paint(session.driver)}   navigators: ${navs}   turn: ${color.get(session.turn) ?? ''}${BOLD}${session.turn}${RESET}`,
+    );
+  }
 
   for (const notice of model.notices) lines.push(` ${WARN}! ${notice}${RESET}`);
 

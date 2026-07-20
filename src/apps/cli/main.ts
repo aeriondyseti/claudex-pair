@@ -203,7 +203,7 @@ async function main(argv: string[]): Promise<number> {
     case 'propose-end': {
       const from = requireStr(flags, 'from', 'propose-end requires -From <you>').toLowerCase();
       const s = await uc.status(bindFsDeps(findRoot(rootFlag)));
-      flags.set('from', from); flags.set('to', s.session.driver); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
+      flags.set('from', from); flags.set('to', s.session.driver ?? ''); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
       return main(['send', ...flattenFlags(flags)]);
     }
     case 'revoke-turn': {

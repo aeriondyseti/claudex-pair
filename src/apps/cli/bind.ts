@@ -28,11 +28,14 @@ export function bindFsDeps(root: string): Deps {
     const grantList = await grants.list();
     const grantMap: Record<string, Grant> = {};
     for (const g of grantList) grantMap[g.id] = fromDiskGrant(g);
+    if (disk.topology === 'peer') throw new Error('Peer sessions require the broker (agent-attach identity); the fs path cannot host one.');
     return {
+      topology: 'pair',
       task: disk.task,
       agents: disk.agents,
-      driver: disk.driver,
-      turn: disk.turn,
+      // Legacy pair session.json always carries these.
+      driver: disk.driver!,
+      turn: disk.turn!,
       status: disk.status,
       started: disk.started,
       grants: grantMap,
@@ -92,7 +95,7 @@ export function bindFsDeps(root: string): Deps {
         case 'agent-left':
         case 'agent-kicked':
           session.agents = session.agents.filter((a) => a !== event.agent);
-          session.navigators = session.navigators.filter((a) => a !== event.agent);
+          session.navigators = (session.navigators ?? []).filter((a) => a !== event.agent);
           removed.add(event.agent);
           await mailboxFs.claimAll(event.agent);
           sessionDirty = true;

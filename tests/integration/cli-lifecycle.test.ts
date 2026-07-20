@@ -28,7 +28,7 @@ function makeFakeGateway(log: Log) {
   const logCalls: (number | undefined)[] = [];
 
   const session = {
-    task: 't', status: 'active', started: 's',
+    topology: 'pair' as const, task: 't', status: 'active', started: 's',
     agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', grants: {}, registry: { version: 1, agents: {} },
   };
   const status: StatusDto = {

@@ -10,6 +10,7 @@ import { decide, replay, type CommandEnvelope, type SessionState } from '../../s
  */
 
 const base: SessionState = {
+  topology: 'pair',
   task: 'w2c',
   agents: ['claude', 'codex'],
   driver: 'claude',

@@ -19,6 +19,7 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 const base: SessionState = {
+  topology: 'pair',
   task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude',
   status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} },
 };

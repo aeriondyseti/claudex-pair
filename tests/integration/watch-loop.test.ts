@@ -12,7 +12,7 @@ import type { TerminalHandlers, TerminalSession } from '../../src/apps/cli/term.
  * reattach can never be torn down by the dying pump's stale 'lost'.
  */
 
-const sessionState = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} } } as const;
+const sessionState = { topology: 'pair' as const, task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'codex', status: 'active', started: 's', grants: {}, registry: { version: 1, agents: {} } } as const;
 
 const snapshotAt = (seq: number): ObserverSnapshotDto => ({
   seq,

@@ -7,6 +7,7 @@ import { renderWatchFrame } from './watch.ts';
 import type { WatchViewModel } from './viewmodel.ts';
 
 const session: SessionState = {
+  topology: 'pair',
   task: 'make watch truthful',
   agents: ['claude', 'codex'],
   driver: 'claude',

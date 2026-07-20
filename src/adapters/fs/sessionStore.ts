@@ -59,8 +59,13 @@ export class FsSessionStore {
     const target = join(this.pairDir, 'session.json');
     const temp = join(this.pairDir, 'session.json.tmp');
     const disk: DiskSession = {
-      task: session.task, agents: [...session.agents], driver: session.driver,
-      navigators: [...session.navigators], turn: session.turn,
+      task: session.task, agents: [...session.agents],
+      ...(session.driver === undefined ? {} : { driver: session.driver }),
+      ...(session.navigators === undefined ? {} : { navigators: [...session.navigators] }),
+      ...(session.turn === undefined ? {} : { turn: session.turn }),
+      ...(session.topology === undefined ? {} : { topology: session.topology }),
+      ...(session.initiator === undefined ? {} : { initiator: session.initiator }),
+      ...(session.phase === undefined ? {} : { phase: session.phase }),
       status: session.status, started: session.started,
       ...(session.sessionId === undefined ? {} : { sessionId: session.sessionId }),
       ...(session.registry === undefined ? {} : { registry: session.registry }),

@@ -39,7 +39,7 @@ export async function runBrokerCli(
     if (command === 'propose-end') {
       required(flags, 'from', 'propose-end requires -From <you>');
       const status = await gateway.status();
-      flags.set('to', status.session.driver); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
+      flags.set('to', status.session.driver ?? ''); flags.set('type', 'propose-end'); flags.set('turn', 'keep'); // peer: decide rejects with no-driver-authority
       return await runBrokerCli('send', flags, positionals, root, gatewayFactory);
     }
     if (command === 'init') {
@@ -57,7 +57,9 @@ export async function runBrokerCli(
       const driver = (str(flags, 'driver') ?? 'claude').toLowerCase();
       // M1: session identity is minted HERE, once, at init (deferred from item 7).
       const sessionId = randomUUID();
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, ...(Object.keys(meta).length ? { meta } : {}) });
+      // Peer 1A: -Topology peer opens the admitting bootstrap.
+      const topology = (str(flags, 'topology') ?? 'pair').toLowerCase() as 'pair' | 'peer';
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, topology, ...(Object.keys(meta).length ? { meta } : {}) });
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);

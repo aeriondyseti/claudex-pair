@@ -1,4 +1,4 @@
-import type { AgentMeta, AgentId, GrantId, MessageId, MessageType, Timestamp, TurnMode } from './types.ts';
+import type { AgentMeta, AgentId, GrantId, MessageId, MessageType, Timestamp, TurnMode, Topology } from './types.ts';
 
 /**
  * Ids, time, and the authenticated principal are produced at the edges and
@@ -11,7 +11,7 @@ export type CommandMeta = {
 };
 
 export type Command =
-  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>> }
+  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
   // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
   // message answers. Advisory metadata in the core; the broker derives the
   // awaiting-set from it. Never affects turn semantics.

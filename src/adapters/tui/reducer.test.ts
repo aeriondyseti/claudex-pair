@@ -8,6 +8,7 @@ import { reduceWatch } from './reducer.ts';
 import type { WatchViewModel } from './viewmodel.ts';
 
 const active: SessionState = {
+  topology: 'pair',
   task: 'event loop', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude',
   status: 'active', started: '2026-07-14 19:00:00', grants: {}, registry: { version: 1, agents: {} },
 };

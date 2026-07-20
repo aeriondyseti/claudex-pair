@@ -3,9 +3,14 @@ import type { AgentId, Grant, GrantScope, GrantState, MessageId, MessageType, Re
 export type DiskSession = {
   task: string;
   agents: AgentId[];
-  driver: AgentId;
-  navigators: AgentId[];
-  turn: AgentId;
+  /** pair topology only (legacy files always have them). */
+  driver?: AgentId;
+  navigators?: AgentId[];
+  turn?: AgentId;
+  /** Peer 1A: absent means pair (legacy). */
+  topology?: 'pair' | 'peer';
+  initiator?: AgentId;
+  phase?: string;
   status: 'active' | 'paused' | 'completed';
   started: Timestamp;
   /** M1: session identity (absent on legacy sessions). */
