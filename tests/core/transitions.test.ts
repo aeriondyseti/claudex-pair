@@ -63,6 +63,7 @@ function buildCommand(raw: Row['command']): { command: Record<string, unknown>; 
   switch (command['kind']) {
     case 'init-session':
       command['task'] ??= 'work';
+      command['sessionId'] ??= 'session-tt-0001'; // M1 round 2: init invariant
       break;
     case 'send-message':
       command['type'] ??= 'info';

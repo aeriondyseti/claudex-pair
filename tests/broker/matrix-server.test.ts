@@ -135,7 +135,7 @@ function makeCore(root: string) {
 
 async function seedSession(core: BrokerCore, reqPrefix: string): Promise<void> {
   const init = await core.execute(`${reqPrefix}-init`, 'test-client', 'claude', {
-    command: { kind: 'init-session', task: 'matrix', agents: ['claude', 'codex'], driver: 'claude' },
+    command: { kind: 'init-session', task: 'matrix', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-m-0001' },
   });
   expect(init.ok).toBeTrue();
 }

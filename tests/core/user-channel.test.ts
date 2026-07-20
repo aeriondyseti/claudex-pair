@@ -15,14 +15,14 @@ const env = (command: unknown, principal: string, id = 'm1'): CommandEnvelope =>
   ({ command, meta: { id, at: '2026-07-14 20:30:00', principal } }) as CommandEnvelope;
 
 function activeSession(): SessionState {
-  const init = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude' }, 'claude'));
+  const init = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-c-0001' }, 'claude'));
   if (!init.ok) throw init.error;
   return replay(init.value)!;
 }
 
 describe('reserved user identity', () => {
   test('init with user in the roster is rejected', () => {
-    const r = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'user'], driver: 'claude' }, 'claude'));
+    const r = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'user'], driver: 'claude', sessionId: 'session-c-0002' }, 'claude'));
     expect(r.ok).toBeFalse();
     if (!r.ok) expect(r.error.code).toBe('reserved-identity');
   });

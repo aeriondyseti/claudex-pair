@@ -38,7 +38,7 @@ export type PairMessage = {
   sent: Timestamp;
   /** Item 7: serialized as `reply_to:` (optional, backward compatible). */
   replyTo?: MessageId;
-  /** M1: serialized as `session:` (optional, backward compatible). */
+  /** M1: serialized as `session_id:` (optional, backward compatible). */
   sessionId?: string;
   body: string;
 };

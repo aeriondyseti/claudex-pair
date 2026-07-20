@@ -52,8 +52,11 @@ describe('M1: init builds the registry', () => {
       expect(d.ok).toBeFalse();
       return d.ok ? '' : (d.error as { code?: string }).code;
     };
-    const base = { kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude' };
+    const base = { kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-v-0001' };
     expect(err({ ...base, sessionId: 'a b c' })).toBe('invalid-session-id');
+    const { sessionId: _sid, ...noId } = base;
+    expect(err(noId)).toBe('invalid-session-id'); // round 2: identity is an INVARIANT of new sessions
+    expect(err({ ...base, meta: { codex: { display: 'Codex', unexpected: 'accepted' } } })).toBe('invalid-agents'); // forged runtime shape (init)
     expect(err({ ...base, meta: { codex: { display: 'evil\u0000name' } } })).toBe('invalid-agents');
     expect(err({ ...base, meta: { codex: { cliType: 'Not Valid!' } } })).toBe('invalid-agents');
     expect(err({ ...base, meta: { stranger: { display: 'x' } } })).toBe('invalid-agents');
@@ -61,7 +64,7 @@ describe('M1: init builds the registry', () => {
 
   test('the M1 bound is enforced at init, fail-closed', () => {
     const nine = Array.from({ length: MAX_AGENTS + 1 }, (_, i) => `agent${i}`);
-    const d = decide(undefined, env({ kind: 'init-session', task: 't', agents: nine, driver: 'agent0' }, 'agent0', 'i2'));
+    const d = decide(undefined, env({ kind: 'init-session', task: 't', agents: nine, driver: 'agent0', sessionId: 'session-v-0002' }, 'agent0', 'i2'));
     expect(d.ok).toBeFalse();
     if (!d.ok) expect((d.error as { code?: string }).code).toBe('invalid-agents');
   });
@@ -114,6 +117,22 @@ describe('M1: membership changes version the registry', () => {
     expect(s.registry.agents['codex']).toMatchObject({ role: 'tester', status: 'active' });
     const d = decide(s, env({ kind: 'join-session', agent: 'agy', meta: { role: 'BAD ROLE' } }, 'claude', 'j7'));
     expect(d.ok).toBeFalse();
+    const forged = decide(s, env({ kind: 'join-session', agent: 'agy', meta: { display: 'ok', unexpected: 'accepted' } }, 'claude', 'j8'));
+    expect(forged.ok).toBeFalse(); // round 2: forged runtime shape (join)
+    if (!forged.ok) expect((forged.error as { code?: string }).code).toBe('invalid-agents');
+  });
+
+  test('EVERY message-sent class carries the session id (one shared binding path)', () => {
+    let s = replay(initEvents())!;
+    const bound = (events: Event[]) => events.filter((e) => e.kind === 'message-sent').map((e) => (e as { sessionId?: string }).sessionId);
+    // Lifecycle notice class (join welcome).
+    expect(bound(run(s, { kind: 'join-session', agent: 'agy' }, 'claude', 'nb1'))).toEqual(['session-0001']);
+    // Privileged-action notice class (user pause broadcast).
+    s = applyAll(s, [{ kind: 'user-channel-registered', tokenHash: 'h', at: AT } as Event]);
+    const paused = run(s, { kind: 'user-pause-session', reason: '', groupId: 'g1', noticeIdBase: 'n1' }, 'user', 'nb2');
+    const pausedBindings = bound(paused);
+    expect(pausedBindings.length).toBeGreaterThan(0);
+    expect(new Set(pausedBindings)).toEqual(new Set(['session-0001']));
   });
 
   test('the registry-updated event is CANONICAL: its version becomes the state version verbatim', () => {

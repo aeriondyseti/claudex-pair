@@ -20,7 +20,7 @@ async function freshJournal(): Promise<{ journal: Journal; pairDir: string }> {
 }
 
 async function commitInit(journal: Journal, clientId = 'c1', reqId = 'r1') {
-  const e = env({ kind: 'init-session', task: 't', agents: ['claude', 'codex', 'agy'], driver: 'claude' }, 'claude', 'm1');
+  const e = env({ kind: 'init-session', task: 't', agents: ['claude', 'codex', 'agy'], driver: 'claude', sessionId: 'session-j-0001' }, 'claude', 'm1');
   const decided = decide(journal.sessionState, e);
   if (!decided.ok) throw decided.error;
   return journal.commit(e, decided.value, { ok: true, seq: 1 }, { clientId, reqId });

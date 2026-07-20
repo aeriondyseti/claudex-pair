@@ -12,7 +12,7 @@ describe('end-session fan-out', () => {
   test('every done message has a unique id in an n-agent session', () => {
     const env = (command: unknown, principal: string): CommandEnvelope =>
       ({ command, meta: { id: 'm-end', at: 't', principal } }) as CommandEnvelope;
-    const init = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex', 'agy'], driver: 'claude' }, 'claude'));
+    const init = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex', 'agy'], driver: 'claude', sessionId: 'session-e-0001' }, 'claude'));
     if (!init.ok) throw new Error('init failed');
     const state = replay(init.value);
     const ended = decide(state, env({ kind: 'end-session', summary: 's' }, 'claude'));

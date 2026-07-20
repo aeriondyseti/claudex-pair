@@ -78,7 +78,7 @@ describe('user-channel over the real wire', () => {
     const claudeGw = gatewayFor('cli-claude');
     await claudeGw.execute({
       as: 'claude',
-      command: { kind: 'init-session', task: 'wire broadcast', agents: ['claude', 'codex'], driver: 'claude' },
+      command: { kind: 'init-session', task: 'wire broadcast', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' },
       identity: { clientId: 'cli-claude', reqId: 'init-1' },
     });
 
@@ -204,7 +204,7 @@ describe('slice-4a step 7: real-wire proofs', () => {
       return gateway;
     };
     const claudeGw = gatewayCounting('cli-claude', { n: 0 });
-    await claudeGw.execute({ as: 'claude', command: { kind: 'init-session', task: 'FA8', agents: ['claude', 'codex'], driver: 'claude' }, identity: { clientId: 'cli-claude', reqId: 'init-1' } });
+    await claudeGw.execute({ as: 'claude', command: { kind: 'init-session', task: 'FA8', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' }, identity: { clientId: 'cli-claude', reqId: 'init-1' } });
     const seeded = await claudeGw.execute({ as: 'claude', command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'seed' }, identity: { clientId: 'cli-claude', reqId: 'seed-1' } });
     const seededFile = seeded.receipt.messageFiles[0]!;
     const seededDeliveryId = `${seeded.events.find((e) => e.kind === 'message-sent')!.id}:codex`;
@@ -267,7 +267,7 @@ describe('slice-4a step 7: real-wire proofs', () => {
   test('F-A11 wire: committed end whose response is LOST replays the recorded outcome on a fresh authenticated connection', async () => {
     const { clientFor } = await harness(23, new Set(['end-lost']));
     const claude = clientFor('cli-claude');
-    expect((await claude.execute('claude', { command: { kind: 'init-session', task: 'FA11', agents: ['claude', 'codex'], driver: 'claude' } }, 'init-1')).ok).toBeTrue();
+    expect((await claude.execute('claude', { command: { kind: 'init-session', task: 'FA11', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } }, 'init-1')).ok).toBeTrue();
 
     // Attach + fire the end whose response the wire will DROP (committed).
     const user1 = clientFor('cli-user');

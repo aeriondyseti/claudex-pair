@@ -10,7 +10,20 @@ import { DISPLAY_PATTERN, MAX_AGENTS, SESSION_ID_PATTERN, MESSAGE_ID_PATTERN, ME
  * `state` is undefined only for init-session (no session yet, or the caller
  * loaded a completed one and is re-initializing).
  */
-export function decide(
+/** M1 round 2 (codex): ONE shared session-binding path - every
+ * message-sent of every class (sends, grant/lifecycle notices, user
+ * broadcasts, privileged-action notices) leaves decide carrying the
+ * session id. Absent only for genuinely legacy state. */
+export function decide(state: SessionState | undefined, envelope: CommandEnvelope): Result<Event[], ProtocolError> {
+  const result = decideInner(state, envelope);
+  if (!result.ok) return result;
+  const init = result.value.find((e) => e.kind === 'session-initialized');
+  const sessionId = state?.sessionId ?? (init?.kind === 'session-initialized' ? init.sessionId : undefined);
+  if (sessionId === undefined) return result;
+  return ok(result.value.map((e) => (e.kind === 'message-sent' && e.sessionId === undefined ? { ...e, sessionId } : e)));
+}
+
+function decideInner(
   state: SessionState | undefined,
   envelope: CommandEnvelope,
 ): Result<Event[], ProtocolError> {
@@ -554,8 +567,11 @@ function decideInit(
       );
     }
   }
-  if (command.sessionId !== undefined && !SESSION_ID_PATTERN.test(command.sessionId)) {
-    return err(new ProtocolError('invalid-session-id', 'sessionId must be 8-64 chars of letters, digits, and dashes.'));
+  // M1 round 2 (codex): session identity is an INVARIANT of every NEW
+  // session — only genuinely legacy state (replayed events, old mirrors)
+  // may lack it. Every ingress must mint or supply one.
+  if (command.sessionId === undefined || !SESSION_ID_PATTERN.test(command.sessionId)) {
+    return err(new ProtocolError('invalid-session-id', 'init requires a sessionId of 8-64 letters/digits/dashes - the CLI mints one; direct callers must supply their own.'));
   }
   for (const [id, meta] of Object.entries(command.meta ?? {})) {
     if (!agents.includes(id)) return err(new ProtocolError('invalid-agents', `meta declared for unknown agent '${id}'`));
@@ -589,6 +605,13 @@ function decideInit(
 /** M1: bounded, control-safe per-agent config validation (fail-closed). */
 function validateAgentMeta(meta: import('./types.ts').AgentMeta | undefined, agent: string): ProtocolError | undefined {
   if (!meta) return undefined;
+  // Round 2: unknown keys are rejected, not ignored - transport casts
+  // arbitrary JSON into this shape (fail-closed like MessageType).
+  for (const key of Object.keys(meta)) {
+    if (key !== 'display' && key !== 'cliType' && key !== 'role') {
+      return new ProtocolError('invalid-agents', `unknown meta property '${key}' for '${agent}' (allowed: display, cliType, role)`);
+    }
+  }
   if (meta.display !== undefined && !DISPLAY_PATTERN.test(meta.display)) {
     return new ProtocolError('invalid-agents', `display for '${agent}' must be 1-64 printable characters (control codes rejected)`);
   }
@@ -659,10 +682,7 @@ function decideSend(
   }
   const events: Event[] = [
     { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at,
-      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
-      // M1 session binding: conversational messages carry the session id;
-      // system notices (messageEvent) derive theirs from the transcript (v1).
-      ...(s.sessionId === undefined ? {} : { sessionId: s.sessionId }) },
+      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }) },
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });

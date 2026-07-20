@@ -39,7 +39,7 @@ async function seeded(root: string): Promise<BrokerCore> {
   const core = makeCore(root);
   await core.recover();
   const init = await core.execute('init', 'client-a', 'claude', {
-    command: { kind: 'init-session', task: 'user-channel', agents: ['claude', 'codex'], driver: 'claude' },
+    command: { kind: 'init-session', task: 'user-channel', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' },
   });
   expect(init.ok).toBeTrue();
   return core;

@@ -52,6 +52,6 @@ describe('fs binding: registry persistence + header projection', () => {
     const pending = await deps.mailbox.pending('codex');
     const stored = pending.find((m) => m.header.id === 'a1')!;
     expect(stored.header.sessionId).toBe('session-fs-1');
-    expect(stored.raw).toContain('session: session-fs-1');
+    expect(stored.raw).toContain('session_id: session-fs-1');
   });
 });

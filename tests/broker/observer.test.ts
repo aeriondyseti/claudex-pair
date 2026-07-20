@@ -48,7 +48,7 @@ async function seeded(root: string, config: Partial<typeof DEFAULT_CONFIG> = {})
   const core = makeCore(root, config);
   await core.recover();
   const init = await core.execute('init', 'client-a', 'claude', {
-    command: { kind: 'init-session', task: 'observe-me', agents: ['claude', 'codex'], driver: 'claude' },
+    command: { kind: 'init-session', task: 'observe-me', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' },
   });
   expect(init.ok).toBeTrue();
   return core;
@@ -214,7 +214,7 @@ describe('observer activity stream', () => {
       { onStopped: () => undefined, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
     );
     await core.recover();
-    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'slow-mirrors', agents: ['claude', 'codex'], driver: 'claude' } });
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'slow-mirrors', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } });
     const got: ObserverPushWire[] = [];
     await observe(core, 'watcher', got);
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
@@ -299,7 +299,7 @@ describe('transcript ring cap (codex review round 2)', () => {
       { onStopped: () => undefined, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
     );
     await core.recover();
-    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'cap', agents: ['claude', 'codex'], driver: 'claude' } });
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'cap', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } });
     for (let i = 0; i < 210; i++) {
       const r = await core.execute(`send-${i}`, 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: `q${i}` } });
       expect(r.ok).toBeTrue();
@@ -329,7 +329,7 @@ describe('transcript ring cap (codex review round 2)', () => {
       { onStopped: () => undefined, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
     );
     await core.recover();
-    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'trim', agents: ['claude', 'codex'], driver: 'claude' } });
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'trim', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } });
     for (let i = 0; i < 210; i++) {
       await core.execute(`send-${i}`, 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: `q${i}` } });
     }
@@ -353,7 +353,7 @@ describe('observer idle semantics', () => {
       { onStopped: (reason) => { if (reason === 'idle') stoppedIdle += 1; }, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
     );
     await core.recover();
-    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'idle', agents: ['claude', 'codex'], driver: 'claude' } });
+    await core.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'idle', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } });
     // Observer-only connection: must NOT count as busyness.
     core.onConnection('watch-conn', 'open');
     const watchSink: ObserverSink = { id: 'watch-conn', sendObserver: async () => undefined };
@@ -373,7 +373,7 @@ describe('observer idle semantics', () => {
       { onStopped: (reason) => { if (reason === 'idle') stoppedIdle2 += 1; }, pid: process.pid, epoch: 3, endpoint: 'test-endpoint', heartbeatAt: () => systemClock.now() },
     );
     await core2.recover();
-    await core2.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'busy', agents: ['claude', 'codex'], driver: 'claude' } });
+    await core2.execute('init', 'client-a', 'claude', { command: { kind: 'init-session', task: 'busy', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-t-0001' } });
     core2.onConnection('sub-conn', 'open');
     await core2.subscribe('sub', { id: 'sub-conn', sendDelivery: async () => undefined, sendError: async () => undefined }, 'codex', 0);
     core2.startIdleMonitor();

@@ -24,13 +24,16 @@ export function view(session: SessionState): SessionView {
   return { session, navigators: navigators(session), openGrants: openGrants(session) };
 }
 
-export async function initSession(deps: Deps, args: { task: string; agents: readonly AgentId[]; driver: AgentId }) {
+export async function initSession(deps: Deps, args: { task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string }) {
   const existing = await deps.store.load();
   const r = await executeWithState(deps, existing, args.driver, {
     kind: 'init-session',
     task: args.task,
     agents: args.agents,
     driver: args.driver,
+    // M1 round 2: session identity is an init invariant — every ingress
+    // mints one when the caller does not supply it.
+    sessionId: args.sessionId ?? `session-${deps.ids.messageId()}`,
   });
   return r;
 }

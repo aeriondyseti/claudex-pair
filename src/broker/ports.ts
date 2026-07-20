@@ -21,7 +21,7 @@ export type MirrorMessage = {
   sent: string;
   /** Item 7: serialized as `reply_to:` (optional, backward compatible). */
   replyTo?: string;
-  /** M1: serialized as `session:` (optional, backward compatible). */
+  /** M1: serialized as `session_id:` (optional, backward compatible). */
   sessionId?: string;
   body: string;
 };

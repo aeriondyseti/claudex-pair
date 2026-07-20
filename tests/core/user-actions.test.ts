@@ -16,7 +16,7 @@ const env = (command: unknown, principal: string, id = 'm1'): CommandEnvelope =>
 const base = { groupId: 'req-1', noticeIdBase: 'm1-s9' };
 
 function session(agents: string[] = ['claude', 'codex'], driver = 'claude'): SessionState {
-  const init = decide(undefined, env({ kind: 'init-session', task: 't', agents, driver }, driver));
+  const init = decide(undefined, env({ kind: 'init-session', task: 't', agents, driver, sessionId: 'session-u-0001' }, driver));
   if (!init.ok) throw init.error;
   return replay(init.value)!;
 }
@@ -236,7 +236,7 @@ describe('slice 4b: the paused-status matrix (F-A5/A6/A9)', () => {
   });
 
   test('init rejects over a PAUSED session exactly as over active (paused is live)', () => {
-    const r = decide(paused(), env({ kind: 'init-session', task: 't2', agents: ['claude', 'codex'], driver: 'claude' }, 'claude', 'i2'));
+    const r = decide(paused(), env({ kind: 'init-session', task: 't2', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-u-0002' }, 'claude', 'i2'));
     expect(r.ok).toBeFalse();
     if (!r.ok) expect(r.error.code).toBe('session-exists');
   });
