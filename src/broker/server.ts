@@ -39,7 +39,7 @@ export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 
  * internal shape, constructed by the authenticated user-connection handler
  * (transport gate, U1-SLICE3-DESIGN.md). */
 const COMMAND_KINDS = new Set([
-  'propose',
+  'propose', 'draft-amend',
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
@@ -131,7 +131,7 @@ export class BrokerCore {
   async recover(): Promise<'clean' | 'rebuilt' | 'conflict'> {
     await this.#journal.recover();
     try {
-      return await this.#mirrors.reconcile(this.#journal.sessionState, this.#journal.openDeliveries(), this.#journal.headSeq);
+      return await this.#mirrors.reconcile(this.#journal.sessionState, this.#journal.openDeliveries(), this.#journal.headSeq, this.#journal.planningArtifacts());
     } catch (error) {
       if (error instanceof MirrorConflictError) {
         this.#conflict = error;
@@ -283,8 +283,9 @@ export class BrokerCore {
     const command = commandFrom(payload);
     if (!command) return err(reqId, 'bad-command', 'execute payload must be {command: {kind: <known-kind>, ...}}');
     // Peer 1B: exact UTF-8 content accounting is stamped at the transport
-    // boundary (pure decide never computes crypto).
-    const contentMeta = command.kind === 'propose'
+    // boundary (pure decide never computes crypto). 1B-b: draft-amend
+    // carries content the same way propose does.
+    const contentMeta = command.kind === 'propose' || command.kind === 'draft-amend'
       ? { contentHash: sha256Hex(command.content), contentBytes: Buffer.byteLength(command.content, 'utf8') }
       : {};
     const envelope: CommandEnvelope = {
@@ -474,7 +475,7 @@ export class BrokerCore {
 
   async #afterCommit(state: SessionState, events: readonly Event[], seq: number, deliveries: OpenDelivery[], voided: OpenDelivery[] = []): Promise<void> {
     try {
-      await this.#mirrors.applyEvents(state, events, seq);
+      await this.#mirrors.applyEvents(state, events, seq, this.#journal.planningArtifacts());
       // Voided mail lands in the archive, never a removed agent's inbox (F18).
       for (const delivery of voided) await this.#mirrors.applyAck(delivery, seq);
     } catch {

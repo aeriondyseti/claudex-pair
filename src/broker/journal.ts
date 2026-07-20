@@ -433,6 +433,12 @@ export class Journal {
         // discriminant sticks forever (rev 4 #5).
         this.sealed_.clear();
         this.artifacts_.phase = 'discarded';
+      } else if (event.kind === 'draft-amended') {
+        // 1B-b: the durable content carrier — the journal's artifacts_
+        // becomes the authoritative body home (verifyArtifactIntegrity
+        // hash-checks it below, and cross-checks revisionLog vs state).
+        this.artifacts_.draft = { revision: event.revision, hash: event.hash, author: event.author, at: event.at, body: event.content };
+        this.artifacts_.revisionLog = [...this.artifacts_.revisionLog, { revision: event.revision, hash: event.hash, author: event.author, at: event.at }];
       }
     }
     for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {

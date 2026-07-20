@@ -66,6 +66,11 @@ export type Command =
    * the wire in the command but is journaled ONLY in the record's sealed
    * field; meta.contentHash/contentBytes are broker-stamped. */
   | { kind: 'propose'; content: string }
+  /** 1B-b: converging-substate draft amendment — holder-only, optimistic
+   * concurrency via baseRevision (the revision the amender last read).
+   * content is validated in decide (grammar/bounds); meta.contentHash/
+   * contentBytes are broker-stamped, same as propose. */
+  | { kind: 'draft-amend'; content: string; baseRevision: number }
   /** Round 2 #8: complete a durable attention item (loud TOFU etc.) —
    * without this the instruction can never be satisfied. */
   | { kind: 'user-clear-attention'; id: string; groupId: string; noticeIdBase: string }

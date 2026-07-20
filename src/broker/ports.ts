@@ -2,7 +2,7 @@ import type { AwaitingEntry } from '@core/awaiting.ts';
 import type { Event } from '@core/events.ts';
 import type { SessionState } from '@core/types.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
-import type { OpenDelivery } from './journal.ts';
+import type { OpenDelivery, PlanningArtifacts } from './journal.ts';
 
 /**
  * Broker-owned ports (depcruise: src/broker never imports adapters — the
@@ -45,9 +45,12 @@ export class MirrorConflictError extends Error {
  */
 export interface MirrorStore {
   applyInit(state: SessionState): Promise<{ gitignoreUpdated: boolean }>;
-  applyEvents(state: SessionState, events: readonly Event[], seq: number): Promise<void>;
+  /** 1B-b: `artifacts` is the durable planning-artifact view (draft body +
+   * revealed proposal bodies) — the phases/ mirror files are derived from
+   * it, never from state alone (state drops finding/draft bodies). */
+  applyEvents(state: SessionState, events: readonly Event[], seq: number, artifacts?: PlanningArtifacts): Promise<void>;
   applyAck(delivery: OpenDelivery, seq: number): Promise<void>;
-  reconcile(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number): Promise<'clean' | 'rebuilt'>;
+  reconcile(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number, artifacts?: PlanningArtifacts): Promise<'clean' | 'rebuilt'>;
   archived(last?: number): Promise<readonly StoredMessage[]>;
 }
 

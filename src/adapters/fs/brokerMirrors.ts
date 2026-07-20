@@ -5,6 +5,7 @@ import type { Event } from '@core/events.ts';
 import type { SessionState } from '@core/types.ts';
 import type { StoredMessage } from '@app/ports/index.ts';
 import { MirrorConflictError, type MirrorStore, type OpenDelivery } from '@broker/ports.ts';
+import type { PlanningArtifacts } from '@broker/journal.ts';
 import { FsGrantStore } from './grantStore.ts';
 import { FsMailbox, serializeMessage, messageFilename } from './mailbox.ts';
 import { FsSessionStore } from './sessionStore.ts';
@@ -53,6 +54,22 @@ function userChannelContent(state: SessionState | undefined): string | undefined
   }, null, 2)}\n`;
 }
 
+/** 1B-b: `.pair/phases/planning/` — informational mirror of the revealed
+ * proposal bodies + the living draft, derived from PlanningArtifacts (the
+ * durable content home), never from SessionState alone (state drops
+ * bodies). `phase: 'revealed'` is a durable discriminant that never
+ * reverts, so these files persist once written (design rev 4 #5). */
+const PHASES_RELDIR = 'phases/planning';
+function phasesExpected(artifacts: PlanningArtifacts | undefined): Map<string, string> | undefined {
+  if (!artifacts || artifacts.phase !== 'revealed') return undefined;
+  const files = new Map<string, string>();
+  files.set(`${PHASES_RELDIR}/draft.md`, artifacts.draft?.body ?? '');
+  for (const [author, p] of Object.entries(artifacts.proposals)) {
+    files.set(`${PHASES_RELDIR}/proposals/${author}.md`, p.body);
+  }
+  return files;
+}
+
 export class FsMirrors implements MirrorStore {
   readonly pairDir: string;
   #sessions: FsSessionStore;
@@ -90,8 +107,10 @@ export class FsMirrors implements MirrorStore {
     return result;
   }
 
-  /** Apply one committed txn's events to the mirror files (post-ack). */
-  async applyEvents(state: SessionState, events: readonly Event[], seq: number): Promise<void> {
+  /** Apply one committed txn's events to the mirror files (post-ack).
+   * `artifacts` is the post-commit PlanningArtifacts view (1B-b) — the
+   * ONLY source for revealed proposal bodies and the draft body. */
+  async applyEvents(state: SessionState, events: readonly Event[], seq: number, artifacts?: PlanningArtifacts): Promise<void> {
     for (const event of events) {
       switch (event.kind) {
         case 'session-initialized':
@@ -99,6 +118,16 @@ export class FsMirrors implements MirrorStore {
           // reach here without applyInit — normalize the user-channel mirror
           // per the NEW state regardless (codex combined audit).
           await this.#writeUserChannel(state);
+          break;
+        case 'barrier-revealed':
+          // The reveal is the FIRST moment proposal bodies + the empty
+          // (revision 0) draft become mirror-visible.
+          await this.#writePhases(artifacts);
+          break;
+        case 'draft-amended':
+          // Lightweight: the event itself carries the new body — no need
+          // to re-derive it from the artifacts param.
+          await this.#writeDraft(event.content);
           break;
         case 'message-sent':
           await this.#mailbox.publish({
@@ -171,6 +200,52 @@ export class FsMirrors implements MirrorStore {
     await rename(tmp, path);
   }
 
+  /** 1B-b: write the draft body exactly (no added newline — MIRROR pins
+   * assert byte-exact content incl. CRLF). `undefined` removes the file
+   * (pre-reveal / not yet amended, per phasesExpected's gate). */
+  async #writeDraft(body: string | undefined): Promise<void> {
+    const dir = join(this.pairDir, ...PHASES_RELDIR.split('/'));
+    const path = join(dir, 'draft.md');
+    if (body === undefined) {
+      await rm(path, { force: true });
+      return;
+    }
+    await mkdir(dir, { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, body, 'utf8');
+    await rename(tmp, path);
+  }
+
+  /** 1B-b: write one revealed proposal's exact body to proposals/<author>.md. */
+  async #writeProposal(author: string, body: string): Promise<void> {
+    const dir = join(this.pairDir, ...PHASES_RELDIR.split('/'), 'proposals');
+    const path = join(dir, `${author}.md`);
+    await mkdir(dir, { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, body, 'utf8');
+    await rename(tmp, path);
+  }
+
+  /** 1B-b: full (re)derivation of `.pair/phases/` from PlanningArtifacts —
+   * used by rebuild and by reconcile's state-driven repair. Clears the
+   * whole tree first so a stale/extra file (author who is no longer
+   * expected, leftover from a prior revision) can never survive. Removes
+   * the tree entirely when the durable discriminant is not 'revealed'. */
+  async #writePhases(artifacts: PlanningArtifacts | undefined): Promise<void> {
+    const phasesDir = join(this.pairDir, 'phases');
+    if (!artifacts || artifacts.phase !== 'revealed') {
+      await rm(phasesDir, { recursive: true, force: true });
+      return;
+    }
+    const proposalsDir = join(this.pairDir, ...PHASES_RELDIR.split('/'), 'proposals');
+    await rm(proposalsDir, { recursive: true, force: true });
+    await mkdir(proposalsDir, { recursive: true });
+    for (const [author, p] of Object.entries(artifacts.proposals)) {
+      await this.#writeProposal(author, p.body);
+    }
+    await this.#writeDraft(artifacts.draft?.body ?? '');
+  }
+
   /** Broker is the single writer: mirror grants reflect post-commit state verbatim. */
   async #writeGrantAbsolute(grantId: string, state: SessionState): Promise<void> {
     const grant = state.grants[grantId];
@@ -203,10 +278,10 @@ export class FsMirrors implements MirrorStore {
    * Recovery reconcile (F8): behind-head → unconditional rebuild; at parity,
    * hash mismatch → conflict.
    */
-  async reconcile(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number): Promise<'clean' | 'rebuilt'> {
+  async reconcile(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number, artifacts?: PlanningArtifacts): Promise<'clean' | 'rebuilt'> {
     const manifest = await this.readManifest();
     if (!manifest || manifest.mirroredSeq < headSeq) {
-      await this.rebuild(state, openDeliveries, headSeq);
+      await this.rebuild(state, openDeliveries, headSeq, artifacts);
       return 'rebuilt';
     }
     if (manifest.mirroredSeq > headSeq) {
@@ -214,16 +289,17 @@ export class FsMirrors implements MirrorStore {
       throw new MirrorConflictError(`manifest at seq ${manifest.mirroredSeq}, journal head ${headSeq}`);
     }
     const current = await this.hashMirrorFiles();
-    // user-channel.json is INFORMATIONAL (design §2/§7): tampering with or
-    // deleting it must never put the broker into a global read-only
-    // conflict — it is repaired from journal state below, after the
-    // authoritative set is judged. Auth never consults it.
-    const authoritative = ([path]: [string, string]) => path !== USER_CHANNEL_MIRROR && path !== AGENTS_MIRROR;
+    // user-channel.json / phases/* are INFORMATIONAL (design §2/§7, 1B-b):
+    // tampering with or deleting them must never put the broker into a
+    // global read-only conflict — they are repaired from journal state
+    // below, after the authoritative set is judged. Auth never consults them.
+    const isPhasesPath = (path: string) => path.startsWith('phases/');
+    const authoritative = ([path]: [string, string]) => path !== USER_CHANNEL_MIRROR && path !== AGENTS_MIRROR && !isPhasesPath(path);
     const diverged = Object.entries(manifest.files)
       .filter(authoritative)
       .filter(([path, hash]) => current[path] !== hash)
       .map(([path]) => path);
-    const added = Object.keys(current).filter((p) => p !== USER_CHANNEL_MIRROR && p !== AGENTS_MIRROR && !(p in manifest.files));
+    const added = Object.keys(current).filter((p) => p !== USER_CHANNEL_MIRROR && p !== AGENTS_MIRROR && !isPhasesPath(p) && !(p in manifest.files));
     if (diverged.length || added.length) {
       throw new MirrorConflictError([...diverged.map((p) => `changed: ${p}`), ...added.map((p) => `added: ${p}`)].join(', '));
     }
@@ -245,6 +321,18 @@ export class FsMirrors implements MirrorStore {
       await this.#writeAgents(state); // M1: create, repair, or remove
       repaired = true;
     }
+    // 1B-b: mirror the same state-driven repair for phases/* — expected
+    // content derives from `artifacts` (draft body + each proposal body).
+    const expectedPhases = phasesExpected(artifacts);
+    const currentPhasePaths = Object.keys(current).filter(isPhasesPath);
+    const phasesOk = expectedPhases === undefined
+      ? currentPhasePaths.length === 0
+      : currentPhasePaths.length === expectedPhases.size
+        && [...expectedPhases].every(([path, content]) => current[path] === createHash('sha256').update(content).digest('hex'));
+    if (!phasesOk) {
+      await this.#writePhases(artifacts); // create, repair, or remove
+      repaired = true;
+    }
     if (repaired) {
       await this.writeManifest(headSeq);
       return 'rebuilt';
@@ -252,8 +340,8 @@ export class FsMirrors implements MirrorStore {
     return 'clean';
   }
 
-  /** Full rebuild from journal state: session.json, grants, inbox (open deliveries). */
-  async rebuild(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number): Promise<void> {
+  /** Full rebuild from journal state: session.json, grants, inbox (open deliveries), phases. */
+  async rebuild(state: SessionState | undefined, openDeliveries: readonly OpenDelivery[], headSeq: number, artifacts?: PlanningArtifacts): Promise<void> {
     if (state) {
       await mkdir(this.pairDir, { recursive: true });
       try {
@@ -269,6 +357,7 @@ export class FsMirrors implements MirrorStore {
     // remove a stale mirror — no recovered session means no binding.
     await this.#writeUserChannel(state);
     await this.#writeAgents(state);
+    await this.#writePhases(artifacts);
     for (const agent of state?.agents ?? []) {
       const dir = join(this.pairDir, 'inbox', agent);
       await rm(dir, { recursive: true, force: true });
@@ -319,7 +408,10 @@ export class FsMirrors implements MirrorStore {
     // Covered so drift is DETECTED, but exempt from authoritative conflict:
     // reconcile repairs it from journal state instead (informational file).
     await addFile(USER_CHANNEL_MIRROR);
-    for (const sub of ['inbox', 'grants']) {
+    // 1B-b: 'phases' walked so drift (tamper/deletion) is DETECTED, but
+    // reconcile exempts it from authoritative conflict — it is
+    // informational, repaired from PlanningArtifacts like user-channel.json.
+    for (const sub of ['inbox', 'grants', 'phases']) {
       let entries: import('node:fs').Dirent[] = [];
       try {
         entries = await readdir(join(this.pairDir, sub), { withFileTypes: true, recursive: true });

@@ -112,6 +112,12 @@ export const EMPTY_DRAFT_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 export const PROPOSAL_MAX_BYTES = 65_536;
 export const PROPOSALS_TOTAL_MAX_BYTES = 524_288;
 
+/** 1B-b: convergence draft bounds. DRAFT_REVISIONS_MAX bounds revisionLog
+ * growth — draft-history-exhausted is a PURE rejection (commits nothing)
+ * once reached, telling the human the convergence has likely livelocked. */
+export const DRAFT_MAX_BYTES = 131_072;
+export const DRAFT_REVISIONS_MAX = 256;
+
 /** 1B text grammar: NUL and C0/C1 controls are rejected EXCEPT \n \t \r
  * (CR accepted verbatim, no normalization — Windows CRLF passes; rev 4 #4).
  * Under this grammar JSON escaping is at most 2x. */

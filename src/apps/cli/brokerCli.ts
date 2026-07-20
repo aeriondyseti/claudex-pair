@@ -117,6 +117,21 @@ export async function runBrokerCli(
       out(`Proposal sealed (${sub?.kind === 'proposal-submitted' ? `${sub.bytes} bytes, sha256 ${sub.contentHash}` : 'committed'}).${revealed ? ' Your submission CLOSED the barrier — proposals are revealed; read them with: pair artifacts' : ' It stays blind until every opened member submits or is ruled.'}`);
       return 0;
     }
+    if (command === 'draft') {
+      // 1B-b: the living draft — holder-only, optimistic-concurrency
+      // amendment. -BaseRevision must be the revision you last read;
+      // stale-draft-revision rejects otherwise (re-read with: pair artifacts).
+      const as = required(flags, 'as', 'draft requires -As <your own agent name>').toLowerCase();
+      const baseRevisionRaw = required(flags, 'baserevision', 'draft requires -BaseRevision <n> (the draft revision you last read)');
+      const baseRevision = Number(baseRevisionRaw);
+      if (!Number.isInteger(baseRevision) || baseRevision < 0) throw new Error('-BaseRevision must be a non-negative integer');
+      const r = await execute(gateway, as, { kind: 'draft-amend', content: await bodyFrom(flags), baseRevision });
+      const amended = r.events.find((e) => e.kind === 'draft-amended');
+      out(amended?.kind === 'draft-amended'
+        ? `Draft amended to revision ${amended.revision} (sha256 ${amended.hash}).`
+        : 'Draft amended.');
+      return 0;
+    }
     if (command === 'artifacts') {
       if (gateway.planningArtifacts === undefined) throw new Error('artifacts requires the broker gateway.');
       renderArtifacts(await gateway.planningArtifacts());

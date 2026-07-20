@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { CommandEnvelope } from '../../src/core/commands.ts';
 import { decide } from '../../src/core/decide.ts';
 import { evolve, replay } from '../../src/core/evolve.ts';
-import type { SessionState } from '../../src/core/types.ts';
+import { DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, type SessionState } from '../../src/core/types.ts';
 
 /** Peer 1A-1: discriminated state, peer init bootstrap shape, and the
  * no-driver-authority command matrix (rev 4 approved design). Pair
@@ -256,3 +256,123 @@ describe('peer 1B-a: propose matrix, collecting rulings, reveal shapes (pure cor
 
 const userEnvB = (command: unknown, id: string): CommandEnvelope =>
   ({ command, meta: { id, at: '2026-07-20 17:00:00', principal: 'user' } }) as CommandEnvelope;
+
+describe('peer 1B-b: draft-amend matrix (pure core)', () => {
+  const CAT = '2026-07-20 18:00:00';
+  const cenv = (command: unknown, principal: string, id: string, extra: Record<string, unknown> = {}): CommandEnvelope =>
+    ({ command, meta: { id, at: CAT, principal, ...extra } }) as CommandEnvelope;
+
+  /** peer state IN COLLECTING: init + both members attached (barrier open). */
+  function collecting(): SessionState {
+    const init = decide(undefined, env({ kind: 'init-session', task: 'p', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-d-0001', topology: 'peer' }, 'claude', 'di'));
+    if (!init.ok) throw init.error;
+    let s = replay(init.value)!;
+    for (const e of [
+      { kind: 'registry-updated', version: s.registry.version + 1, change: 'joined', agent: 'codex', at: CAT },
+      { kind: 'agent-admitted', agent: 'codex', at: CAT },
+      { kind: 'admission-completed', at: CAT },
+      { kind: 'barrier-opened', members: ['claude', 'codex'], registryVersion: s.registry.version + 1, at: CAT },
+    ]) s = evolve(s, e as Parameters<typeof evolve>[1])!;
+    if (s.topology !== 'peer' || s.planning?.substate !== 'collecting') throw new Error('harness shape');
+    return s;
+  }
+
+  /** CONVERGING state: barrier reveals over ['claude', 'codex'] -> holder becomes 'claude'. */
+  function converging(): SessionState {
+    const revealed = evolve(collecting(), { kind: 'barrier-revealed', electorate: ['claude', 'codex'], at: CAT })!;
+    if (revealed.topology !== 'peer' || revealed.planning?.substate !== 'converging') throw new Error('expected converging');
+    return revealed;
+  }
+
+  const meta = (content: string) => ({ contentHash: 'h'.repeat(64), contentBytes: Buffer.byteLength(content, 'utf8') });
+  const draftCmd = (content: string, baseRevision: number) => ({ kind: 'draft-amend', content, baseRevision });
+  const code = (r: ReturnType<typeof decide>) => (r.ok ? '' : (r.error as { code?: string }).code);
+  const applyDecided = (s: SessionState, events: Parameters<typeof replay>[0]): SessionState =>
+    events.reduce<SessionState | undefined>((acc, e) => (acc ? (evolve(acc, e) ?? acc) : acc), s)!;
+
+  test('draft-amend rejection matrix is typed and in spec order', () => {
+    // not-peer-topology: no peer machinery at all.
+    const pairInit = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-d-0002' }, 'claude', 'pi'));
+    const pair = replay((pairInit as { value: Parameters<typeof replay>[0] }).value)!;
+    expect(code(decide(pair, cenv(draftCmd('x', 0), 'claude', 'nt1', meta('x'))))).toBe('not-peer-topology');
+
+    // phase-unavailable: wrong substate (collecting, not converging).
+    expect(code(decide(collecting(), cenv(draftCmd('x', 0), 'claude', 'pu1', meta('x'))))).toBe('phase-unavailable');
+
+    // phase-unavailable: convergence-blocked also rejects (all-departed reveal).
+    let departed = evolve(collecting(), { kind: 'registry-updated', version: 90, change: 'left', agent: 'claude', at: CAT })!;
+    departed = evolve(departed, { kind: 'registry-updated', version: 91, change: 'left', agent: 'codex', at: CAT })!;
+    const blocked = evolve(departed, { kind: 'barrier-revealed', electorate: ['claude', 'codex'], at: CAT })!;
+    if (blocked.topology !== 'peer' || blocked.planning?.substate !== 'convergence-blocked') throw new Error('expected blocked');
+    expect(code(decide(blocked, cenv(draftCmd('x', 0), 'claude', 'pu2', meta('x'))))).toBe('phase-unavailable');
+
+    const s = converging();
+    if (s.topology !== 'peer' || s.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s.planning.rotation.holder).toBe('claude');
+
+    // not-convergence-holder: a non-holder member.
+    expect(code(decide(s, cenv(draftCmd('x', 0), 'codex', 'nh1', meta('x'))))).toBe('not-convergence-holder');
+    // not-convergence-holder: an observer never authorized into the electorate.
+    expect(code(decide(s, cenv(draftCmd('x', 0), 'gemini', 'nh2', meta('x'))))).toBe('not-convergence-holder');
+
+    // blank-content.
+    expect(code(decide(s, cenv(draftCmd('', 0), 'claude', 'bl1', meta(''))))).toBe('blank-content');
+    expect(code(decide(s, cenv(draftCmd('   \n\t ', 0), 'claude', 'bl2', meta(' '))))).toBe('blank-content');
+
+    // control-characters.
+    expect(code(decide(s, cenv(draftCmd('evil ', 0), 'claude', 'ct1', meta('evil'))))).toBe('control-characters');
+    expect(code(decide(s, cenv(draftCmd('esc', 0), 'claude', 'ct2', meta('esc'))))).toBe('control-characters');
+
+    // blank-content (defensive): meta accounting missing entirely.
+    expect(code(decide(s, cenv(draftCmd('valid body', 0), 'claude', 'mm1')))).toBe('blank-content');
+
+    // draft-too-large.
+    expect(code(decide(s, cenv(draftCmd('big', 0), 'claude', 'ov1', { contentHash: 'h'.repeat(64), contentBytes: DRAFT_MAX_BYTES + 1 })))).toBe('draft-too-large');
+
+    // stale-draft-revision: current revision is 0, baseRevision claims 5.
+    expect(code(decide(s, cenv(draftCmd('x', 5), 'claude', 'sr1', meta('x'))))).toBe('stale-draft-revision');
+
+    // draft-history-exhausted: drive revisionLog to DRAFT_REVISIONS_MAX via
+    // synthetic draft-amended evolves, then a correctly-based amend still rejects.
+    let exhausted: SessionState | undefined = s;
+    for (let rev = 1; rev <= DRAFT_REVISIONS_MAX; rev++) {
+      const cur = exhausted;
+      if (!cur || cur.topology !== 'peer' || cur.planning?.substate !== 'converging') throw new Error('shape');
+      if (cur.planning.revisionLog.length >= DRAFT_REVISIONS_MAX) break;
+      exhausted = evolve(cur, { kind: 'draft-amended', revision: rev, hash: 'f'.repeat(64), author: 'claude', content: `r${rev}`, bytes: 2, at: CAT });
+    }
+    if (!exhausted || exhausted.topology !== 'peer' || exhausted.planning?.substate !== 'converging') throw new Error('shape');
+    expect(exhausted.planning.revisionLog.length).toBe(DRAFT_REVISIONS_MAX);
+    const currentRevision = exhausted.planning.draft.revision;
+    expect(code(decide(exhausted, cenv(draftCmd('one more', currentRevision), 'claude', 'he1', meta('one more'))))).toBe('draft-history-exhausted');
+  });
+
+  test('happy path: successive holder amends advance revision/hash/author; a replayed old baseRevision goes stale', () => {
+    let s = converging();
+    const c1 = 'first draft body\r\n';
+    const m1 = meta(c1);
+    const d1 = decide(s, cenv(draftCmd(c1, 0), 'claude', 'a1', m1));
+    expect(d1.ok).toBeTrue();
+    if (!d1.ok) return;
+    expect(d1.value).toEqual([{ kind: 'draft-amended', revision: 1, hash: m1.contentHash, author: 'claude', content: c1, bytes: m1.contentBytes, at: CAT }]);
+    s = applyDecided(s, d1.value);
+    if (s.topology !== 'peer' || s.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s.planning.draft).toMatchObject({ revision: 1, hash: m1.contentHash, author: 'claude', at: CAT });
+    expect(s.planning.revisionLog).toHaveLength(2); // revision 0 (reveal) + revision 1
+
+    const c2 = 'second draft body';
+    const m2 = meta(c2);
+    const d2 = decide(s, cenv(draftCmd(c2, 1), 'claude', 'a2', m2));
+    expect(d2.ok).toBeTrue();
+    if (!d2.ok) return;
+    expect(d2.value).toEqual([{ kind: 'draft-amended', revision: 2, hash: m2.contentHash, author: 'claude', content: c2, bytes: m2.contentBytes, at: CAT }]);
+    s = applyDecided(s, d2.value);
+    if (s.topology !== 'peer' || s.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s.planning.draft).toMatchObject({ revision: 2, hash: m2.contentHash, author: 'claude' });
+    expect(s.planning.revisionLog).toHaveLength(3);
+    expect(s.planning.revisionLog.map((r) => r.revision)).toEqual([0, 1, 2]);
+
+    // A replayed old baseRevision (0) is now stale.
+    expect(code(decide(s, cenv(draftCmd('late resubmit', 0), 'claude', 'a3', meta('late resubmit'))))).toBe('stale-draft-revision');
+  });
+});

@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BrokerCore, DEFAULT_CONFIG } from '../../src/broker/server.ts';
+import { CorruptJournalError } from '../../src/broker/journal.ts';
 import { FsMirrors, fsMessageCodec } from '../../src/adapters/fs/brokerMirrors.ts';
 import { systemClock, systemIds } from '../../src/adapters/clock/index.ts';
 import type { PeerSession } from '../../src/core/types.ts';
@@ -47,6 +48,15 @@ const session = async (core: BrokerCore): Promise<PeerSession> => {
 };
 const propose = (core: BrokerCore, agent: string, content: string, reqId: string) =>
   core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'propose', content } }, `conn-${agent}`);
+const draftAmend = (core: BrokerCore, agent: string, content: string, baseRevision: number, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'draft-amend', content, baseRevision } }, `conn-${agent}`);
+/** Bring both members through collecting to converging via both proposals. */
+async function convergingCore(root: string) {
+  const core = await collectingCore(root);
+  expect((await propose(core, 'claude', BODY.claude, 'p-1')).ok).toBeTrue();
+  expect((await propose(core, 'codex', BODY.codex, 'p-2')).ok).toBeTrue();
+  return core;
+}
 
 describe('sealed submission + secrecy', () => {
   test('the body lives ONLY in record.sealed; events/outcome/status/artifacts-query stay blind; CRLF hashes byte-exact', async () => {
@@ -179,5 +189,80 @@ describe('Ruling A + artifact lifecycle discriminant', () => {
     expect(await reopened.recover()).not.toBe('conflict');
     const q3 = await reopened.query('qa-6', 'planning-artifacts');
     expect((q3 as { data?: { phase?: string } }).data?.phase).toBe('discarded'); // survives restart
+  });
+});
+
+describe('peer 1B-b: draft through the broker', () => {
+  const DRAFT_BODY = 'DRAFT v1:\r\nsecond line survives CRLF\r\n';
+
+  test('holder amend is readable byte-exact; a non-holder amend rejects; a restart preserves the draft', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    const s0 = await session(core);
+    if (s0.planning?.substate !== 'converging') throw new Error('expected converging');
+    expect(s0.planning.rotation.holder).toBe('claude');
+
+    const amend = await draftAmend(core, 'claude', DRAFT_BODY, 0, 'd-1');
+    expect(amend.ok).toBeTrue();
+    const events = (amend as { events?: { kind: string; revision?: number; author?: string }[] }).events ?? [];
+    expect(events).toEqual([expect.objectContaining({ kind: 'draft-amended', revision: 1, author: 'claude' })]);
+
+    const q = await core.query('qa-d1', 'planning-artifacts');
+    const data = (q as { data?: { draft?: { revision: number; author: string | null; body: string }; revisionLog?: unknown[] } }).data;
+    expect(data?.draft?.revision).toBe(1);
+    expect(data?.draft?.author).toBe('claude');
+    expect(data?.draft?.body).toBe(DRAFT_BODY); // byte-exact incl. CRLF
+    expect(data?.revisionLog).toHaveLength(2); // revision 0 (reveal) + revision 1
+
+    // A second amend from the non-holder is rejected — the draft is untouched.
+    const rejected = await draftAmend(core, 'codex', 'nope, not mine to amend', 1, 'd-2');
+    expect((rejected as { error?: { code?: string } }).error?.code).toBe('not-convergence-holder');
+    const qAfterReject = await core.query('qa-d2', 'planning-artifacts');
+    expect((qAfterReject as { data?: { draft?: { revision: number } } }).data?.draft?.revision).toBe(1);
+
+    await core.quiesce();
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    const q2 = await reopened.query('qa-d3', 'planning-artifacts');
+    const data2 = (q2 as { data?: { draft?: { revision: number; body: string } } }).data;
+    expect(data2?.draft?.revision).toBe(1);
+    expect(data2?.draft?.body).toBe(DRAFT_BODY);
+  });
+
+  test('TAMPER: a mutated planningArtifacts.revisionLog in the snapshot fails recovery closed', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    expect((await draftAmend(core, 'claude', DRAFT_BODY, 0, 'd-1')).ok).toBeTrue();
+    await core.quiesce();
+    await core.journal.snapshot(); // force snapshot.json to exist for the tamper
+
+    const snapshotPath = join(root, '.pair', 'journal', 'snapshot.json');
+    const snapshot = JSON.parse(await readFile(snapshotPath, 'utf8')) as { planningArtifacts?: { revisionLog?: unknown[] } };
+    const revisionLog = snapshot.planningArtifacts?.revisionLog;
+    expect(revisionLog?.length).toBeGreaterThan(0);
+    snapshot.planningArtifacts!.revisionLog = revisionLog!.slice(0, -1); // drop the last entry
+    await writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
+
+    const reopened = makeCore(root);
+    await expect(reopened.recover()).rejects.toThrow(CorruptJournalError);
+  });
+
+  test('MIRROR: phases/planning/draft.md + proposals/<author>.md are byte-exact and self-heal on reconcile', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    expect((await draftAmend(core, 'claude', DRAFT_BODY, 0, 'd-1')).ok).toBeTrue();
+    await core.quiesce();
+
+    const draftPath = join(root, '.pair', 'phases', 'planning', 'draft.md');
+    const claudeProposalPath = join(root, '.pair', 'phases', 'planning', 'proposals', 'claude.md');
+    const codexProposalPath = join(root, '.pair', 'phases', 'planning', 'proposals', 'codex.md');
+    expect(await readFile(draftPath, 'utf8')).toBe(DRAFT_BODY);
+    expect(await readFile(claudeProposalPath, 'utf8')).toBe(BODY.claude);
+    expect(await readFile(codexProposalPath, 'utf8')).toBe(BODY.codex);
+
+    await rm(draftPath, { force: true });
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).toBe('rebuilt');
+    expect(await readFile(draftPath, 'utf8')).toBe(DRAFT_BODY); // restored byte-exact
   });
 });

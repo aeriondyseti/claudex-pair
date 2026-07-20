@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -108,6 +108,8 @@ function decideInner(
       return withLive(state, (s) => decideUserClearAttention(s, command, envelope));
     case 'propose':
       return withActive(state, (s) => decidePropose(s, command, envelope));
+    case 'draft-amend':
+      return withActive(state, (s) => decideDraftAmend(s, command, envelope));
   }
 }
 
@@ -281,6 +283,51 @@ function decidePropose(
     return err(new ProtocolError('proposals-exhausted', `Cumulative sealed bytes would reach ${cumulative}; the bound is ${PROPOSALS_TOTAL_MAX_BYTES}.`));
   }
   return ok([{ kind: 'proposal-submitted', author: from, contentHash, bytes, at: envelope.meta.at }]);
+}
+
+/** 1B-b: the living draft (converging substate only). Holder-only,
+ * optimistic-concurrency amendment — baseRevision must match the CURRENT
+ * draft revision (stale-draft-revision otherwise). draft-history-exhausted
+ * is a PURE rejection (design rev 4 Ruling A semantics: commits nothing)
+ * once revisionLog hits DRAFT_REVISIONS_MAX, signalling a likely livelock. */
+function decideDraftAmend(
+  s: SessionState,
+  command: Extract<Command, { kind: 'draft-amend' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const peer = requirePeer(s, 'draft-amend');
+  if (peer instanceof ProtocolError) return err(peer);
+  // convergence-blocked also rejects here (no rotation.holder to check).
+  if (peer.planning?.substate !== 'converging') {
+    return err(new ProtocolError('phase-unavailable', 'the draft is amendable only while converging'));
+  }
+  const planning = peer.planning;
+  const principal = envelope.meta.principal;
+  if (principal !== planning.rotation.holder) {
+    return err(new ProtocolError('not-convergence-holder', `Only the convergence holder ('${planning.rotation.holder}') may amend the draft.`));
+  }
+  if (!command.content.trim()) {
+    return err(new ProtocolError('blank-content', 'A draft amendment cannot be blank.'));
+  }
+  const ctl = findControlCharacter(command.content);
+  if (ctl >= 0) {
+    return err(new ProtocolError('control-characters', `Control character at offset ${ctl} — allowed: \n, \t, \r only.`));
+  }
+  const bytes = envelope.meta.contentBytes;
+  const contentHash = envelope.meta.contentHash;
+  if (bytes === undefined || contentHash === undefined) {
+    return err(new ProtocolError('blank-content', 'Internal: content accounting missing (the broker stamps it).'));
+  }
+  if (bytes > DRAFT_MAX_BYTES) {
+    return err(new ProtocolError('draft-too-large', `Draft is ${bytes} bytes; the bound is ${DRAFT_MAX_BYTES}.`));
+  }
+  if (command.baseRevision !== planning.draft.revision) {
+    return err(new ProtocolError('stale-draft-revision', `baseRevision ${command.baseRevision} is stale — the current draft revision is ${planning.draft.revision}.`));
+  }
+  if (planning.revisionLog.length >= DRAFT_REVISIONS_MAX) {
+    return err(new ProtocolError('draft-history-exhausted', `The draft has reached ${DRAFT_REVISIONS_MAX} revisions — convergence has likely livelocked; a human should intervene.`));
+  }
+  return ok([{ kind: 'draft-amended', revision: command.baseRevision + 1, hash: contentHash, author: principal, content: command.content, bytes, at: envelope.meta.at }]);
 }
 
 /** 1B collecting rulings (Ruling A: an empty-electorate abstain REJECTS

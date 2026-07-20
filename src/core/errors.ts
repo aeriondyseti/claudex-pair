@@ -57,6 +57,11 @@ export type ProtocolErrorCode =
   | 'blank-content'
   | 'control-characters'
   | 'empty-electorate'
+  // 1B-b: converging draft-amend (holder-gated optimistic concurrency)
+  | 'not-convergence-holder'
+  | 'stale-draft-revision'
+  | 'draft-too-large'
+  | 'draft-history-exhausted'
   | 'no-turn-in-phase'
   | 'invalid-session-id'
   | 'invalid-message-type'

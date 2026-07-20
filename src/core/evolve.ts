@@ -175,6 +175,18 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         },
       };
     }
+    case 'draft-amended':
+      // Peer + converging ONLY (total function): anything else is a no-op —
+      // e.g. a stale replay after force-phase already left convergence.
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      return {
+        ...state,
+        planning: {
+          ...state.planning,
+          draft: { revision: event.revision, hash: event.hash, author: event.author, at: event.at },
+          revisionLog: [...state.planning.revisionLog, { revision: event.revision, hash: event.hash, author: event.author, at: event.at }],
+        },
+      };
     case 'admission-authorized': {
       if (!state || state.topology !== 'peer') return state;
       const authorized = state.authorized.includes(event.agent) ? state.authorized : [...state.authorized, event.agent];

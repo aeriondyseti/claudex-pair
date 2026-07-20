@@ -42,6 +42,10 @@ export type Event =
   | { kind: 'proposal-submitted'; author: AgentId; contentHash: string; bytes: number; at: Timestamp }
   /** 1B: the atomic reveal — electorate = openedMembers minus abstained. */
   | { kind: 'barrier-revealed'; electorate: AgentId[]; at: Timestamp }
+  /** 1B-b: a converging-substate draft amendment. content is PUBLIC (post-
+   * reveal there are no secrets) — this event is the durable content
+   * carrier the journal's artifacts_.draft.body is derived from. */
+  | { kind: 'draft-amended'; revision: number; hash: string; author: AgentId; content: string; bytes: number; at: Timestamp }
   | { kind: 'admission-authorized'; agent: AgentId; at: Timestamp }
   | { kind: 'absentee-ruled'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; at: Timestamp }
   /** Peer 1A: outcome provenance is permanent — 'forced' can never read
