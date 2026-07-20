@@ -67,3 +67,52 @@ describe('InputDecoder (frozen v1 contract)', () => {
     expect(text).toBe('héllo — ok');
   });
 });
+
+describe('bounded lone-Esc disambiguation (close-out blocker, design §5)', () => {
+  function collect(decoder: InputDecoder) {
+    const out: Emitted[] = [];
+    const handlers = {
+      onQuit: () => out.push({ kind: 'quit' as const }),
+      onText: (text: string) => out.push({ kind: 'text' as const, text }),
+      onKey: (key: string) => out.push({ kind: 'key' as const, key }),
+    };
+    return { out, handlers };
+  }
+
+  test('a standalone Esc keypress emits WITHOUT any second input: hold, then host flush resolves it', () => {
+    const decoder = new InputDecoder();
+    const { out, handlers } = collect(decoder);
+    decoder.decode(Buffer.from([0x1b]), handlers); // real Esc key: its own chunk
+    expect(out).toEqual([]); // held — could still be a CSI prefix
+    expect(decoder.pendingEscape).toBeTrue(); // the host's timer-arming signal
+    decoder.flushPending(handlers); // host timer fired, no continuation came
+    expect(out).toEqual([{ kind: 'key', key: 'escape' }]);
+    expect(decoder.pendingEscape).toBeFalse();
+    decoder.flushPending(handlers); // idempotent — nothing held
+    expect(out).toEqual([{ kind: 'key', key: 'escape' }]);
+  });
+
+  test('a split CSI stays intact: the continuation cancels ambiguity and no phantom escape is emitted', () => {
+    const decoder = new InputDecoder();
+    const { out, handlers } = collect(decoder);
+    decoder.decode(Buffer.from([0x1b]), handlers); // chunk 1: ESC
+    expect(decoder.pendingEscape).toBeTrue();
+    decoder.decode(Buffer.from('[5~'), handlers); // chunk 2: continuation arrives in time
+    expect(out).toEqual([{ kind: 'key', key: 'page-up' }]); // one key, no escape
+    expect(decoder.pendingEscape).toBeFalse();
+    decoder.flushPending(handlers); // a late/stale host timer must be harmless
+    expect(out).toEqual([{ kind: 'key', key: 'page-up' }]);
+  });
+
+  test('a partial CSI that stalls to the flush deadline is dropped, never misread as Esc or text', () => {
+    const decoder = new InputDecoder();
+    const { out, handlers } = collect(decoder);
+    decoder.decode(Buffer.from([0x1b, 0x5b, 0x35]), handlers); // ESC [ 5 — mid-sequence stall
+    expect(decoder.pendingEscape).toBeTrue();
+    decoder.flushPending(handlers);
+    expect(out).toEqual([]); // garbage discarded — consumed-and-ignored
+    expect(decoder.pendingEscape).toBeFalse();
+    decoder.decode(Buffer.from('ok'), handlers); // stream continues cleanly
+    expect(out).toEqual([{ kind: 'text', text: 'ok' }]);
+  });
+});

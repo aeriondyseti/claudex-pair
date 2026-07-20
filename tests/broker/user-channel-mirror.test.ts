@@ -46,13 +46,42 @@ describe('user-channel informational mirror', () => {
     expect(await mirrors.reconcile(registered, [], 2)).toBe('clean');
   });
 
-  test('an external edit at manifest parity is reported as tamper', async () => {
+  test('tamper or deletion at parity SELF-HEALS from journal state — never a global conflict (design §2/§7)', async () => {
     const dir = await root();
     const mirrors = new FsMirrors(dir);
     await mirrors.applyInit(base);
     await mirrors.applyEvents(registered, [{ kind: 'user-channel-registered', tokenHash: registered.userChannelTokenHash!, at: 'now' }], 2);
+    const path = join(dir, '.pair', 'user-channel.json');
 
-    await writeFile(join(dir, '.pair', 'user-channel.json'), '{"registered":false,"forged":true}\n', 'utf8');
+    // Tamper → repaired/normalized, not MirrorConflictError.
+    await writeFile(path, '{"registered":false,"forged":true}\n', 'utf8');
+    expect(await mirrors.reconcile(registered, [], 2)).toBe('rebuilt');
+    const repaired = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    expect(repaired['registered']).toBeTrue();
+    expect(repaired['forged']).toBeUndefined();
+    expect(await mirrors.reconcile(registered, [], 2)).toBe('clean'); // repair converges
+
+    // Deletion → recreated.
+    await rm(path, { force: true });
+    expect(await mirrors.reconcile(registered, [], 2)).toBe('rebuilt');
+    expect(existsSync(path)).toBeTrue();
+
+    // Spurious file on an UNREGISTERED session → removed.
+    const dir2 = await root();
+    const mirrors2 = new FsMirrors(dir2);
+    await mirrors2.applyInit(base);
+    await mirrors2.applyEvents(base, [{ kind: 'turn-passed', to: 'codex' }], 2);
+    await writeFile(join(dir2, '.pair', 'user-channel.json'), '{"registered":true}\n', 'utf8');
+    expect(await mirrors2.reconcile(base, [], 2)).toBe('rebuilt');
+    expect(existsSync(join(dir2, '.pair', 'user-channel.json'))).toBeFalse();
+  });
+
+  test('authoritative-set tamper still conflicts — the exemption is exactly one informational file', async () => {
+    const dir = await root();
+    const mirrors = new FsMirrors(dir);
+    await mirrors.applyInit(base);
+    await mirrors.applyEvents(registered, [{ kind: 'user-channel-registered', tokenHash: registered.userChannelTokenHash!, at: 'now' }], 2);
+    await writeFile(join(dir, '.pair', 'session.json'), '{"forged":true}\n', 'utf8');
     await expect(mirrors.reconcile(registered, [], 2)).rejects.toThrow(MirrorConflictError);
   });
 

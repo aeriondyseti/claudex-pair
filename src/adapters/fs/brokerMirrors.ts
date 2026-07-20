@@ -29,6 +29,8 @@ import type { DiskSession, PairMessage } from './types.ts';
 
 type Manifest = { mirroredSeq: number; files: Record<string, string> };
 
+const USER_CHANNEL_MIRROR = 'user-channel.json';
+
 export class FsMirrors implements MirrorStore {
   readonly pairDir: string;
   #sessions: FsSessionStore;
@@ -103,9 +105,9 @@ export class FsMirrors implements MirrorStore {
    * (hashMirrorFiles) so an external edit is tamper, and removed on rebuild
    * when the recovered state carries no binding.
    */
-  async #writeUserChannel(state: SessionState): Promise<void> {
-    const path = join(this.pairDir, 'user-channel.json');
-    if (!state.userChannelTokenHash) {
+  async #writeUserChannel(state: SessionState | undefined): Promise<void> {
+    const path = join(this.pairDir, USER_CHANNEL_MIRROR);
+    if (!state?.userChannelTokenHash) {
       await rm(path, { force: true });
       return;
     }
@@ -161,12 +163,23 @@ export class FsMirrors implements MirrorStore {
       throw new MirrorConflictError(`manifest at seq ${manifest.mirroredSeq}, journal head ${headSeq}`);
     }
     const current = await this.hashMirrorFiles();
+    // user-channel.json is INFORMATIONAL (design §2/§7): tampering with or
+    // deleting it must never put the broker into a global read-only
+    // conflict — it is repaired from journal state below, after the
+    // authoritative set is judged. Auth never consults it.
+    const authoritative = ([path]: [string, string]) => path !== USER_CHANNEL_MIRROR;
     const diverged = Object.entries(manifest.files)
+      .filter(authoritative)
       .filter(([path, hash]) => current[path] !== hash)
       .map(([path]) => path);
-    const added = Object.keys(current).filter((p) => !(p in manifest.files));
+    const added = Object.keys(current).filter((p) => p !== USER_CHANNEL_MIRROR && !(p in manifest.files));
     if (diverged.length || added.length) {
       throw new MirrorConflictError([...diverged.map((p) => `changed: ${p}`), ...added.map((p) => `added: ${p}`)].join(', '));
+    }
+    if (current[USER_CHANNEL_MIRROR] !== manifest.files[USER_CHANNEL_MIRROR]) {
+      await this.#writeUserChannel(state); // normalize: recreate, repair, or remove
+      await this.writeManifest(headSeq);
+      return 'rebuilt';
     }
     return 'clean';
   }
@@ -227,7 +240,9 @@ export class FsMirrors implements MirrorStore {
       }
     };
     await addFile('session.json');
-    await addFile('user-channel.json'); // close-out #7: covered = tamper-detectable
+    // Covered so drift is DETECTED, but exempt from authoritative conflict:
+    // reconcile repairs it from journal state instead (informational file).
+    await addFile(USER_CHANNEL_MIRROR);
     for (const sub of ['inbox', 'grants']) {
       let entries: import('node:fs').Dirent[] = [];
       try {

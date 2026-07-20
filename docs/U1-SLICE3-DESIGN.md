@@ -1,7 +1,7 @@
 # U1 slice 3 — advisory user channel (design, pre-code)
 
-Status: REV 3 — codex design-review rounds 1+2 applied (2026-07-14).
-Draft until codex approves. Builds on slices 1+2 (broker observer,
+Status: REV 4 — APPROVED (codex, 2026-07-14); implementation shipped
+through the slice-3 close-out (2026-07-20). Builds on slices 1+2 (broker observer,
 watch event loop). Constraints inherited from [ENHANCEMENTS.md](ENHANCEMENTS.md)
 U1 and [TUI-UPGRADE-NOTES.md](TUI-UPGRADE-NOTES.md); user decisions frozen
 2026-07-14: **DPAPI user-scope credential**, **full v1 interaction scope**

@@ -81,6 +81,26 @@ export class InputDecoder {
     }
     flush();
   }
+
+  /** True while a chunk-ending ESC/CSI prefix is held awaiting continuation. */
+  get pendingEscape(): boolean {
+    return this.#escape.length > 0;
+  }
+
+  /**
+   * Bounded-ambiguity flush (design §5; codex close-out blocker): a real
+   * standalone Esc keypress arrives as a chunk-ending lone ESC, which decode()
+   * must hold (it could be a CSI prefix) — the HOST disambiguates by calling
+   * this after a short timer that any continuation chunk cancels. A held lone
+   * ESC is the Escape key; a held partial CSI that stalled long enough to hit
+   * the timer is garbage and is dropped (consumed-and-ignored, exactly like
+   * unknown complete sequences).
+   */
+  flushPending(handlers: Pick<TerminalHandlers, 'onQuit' | 'onText' | 'onKey'>): void {
+    const held = this.#escape;
+    this.#escape = Buffer.alloc(0);
+    if (held.length === 1 && held[0] === 0x1b) handlers.onKey?.('escape');
+  }
 }
 
 export type TerminalSession = {
@@ -143,7 +163,19 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
   // Raw mode swallows SIGINT — Ctrl+C is decoded as quit here. Plain `q`
   // is TEXT per the frozen v1 input model (chord-only quit).
   const decoder = new InputDecoder();
-  const onData = (chunk: Buffer | string) => decoder.decode(chunk, handlers);
+  // Lone-Esc disambiguation window: long enough for a split CSI's
+  // continuation bytes to arrive (same wire, sub-millisecond), short enough
+  // that a human Esc press feels immediate.
+  const ESC_FLUSH_MS = 40;
+  let escTimer: ReturnType<typeof setTimeout> | undefined;
+  const onData = (chunk: Buffer | string) => {
+    if (escTimer) { clearTimeout(escTimer); escTimer = undefined; } // continuation cancels
+    decoder.decode(chunk, handlers);
+    if (decoder.pendingEscape) {
+      escTimer = setTimeout(() => { escTimer = undefined; decoder.flushPending(handlers); }, ESC_FLUSH_MS);
+      escTimer.unref?.();
+    }
+  };
   const onResize = () => handlers.onResize(width());
   const onSignal = () => handlers.onQuit();
 
@@ -151,6 +183,7 @@ export function openTerminal(handlers: TerminalHandlers, options: { altScreen?: 
   const close = () => {
     if (closed) return;
     closed = true;
+    if (escTimer) { clearTimeout(escTimer); escTimer = undefined; }
     stdout.off('resize', onResize);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);

@@ -198,3 +198,37 @@ describe('user-send', () => {
     if (status.ok) expect((status.data as { session: { turn: string } }).session.turn).toBe('codex');
   });
 });
+
+describe('user-channel mirror resilience (close-out #7 guard)', () => {
+  test('delete or tamper user-channel.json, restart: journal restores it, valid token attaches, wrong token still user-auth-failed', async () => {
+    const { rm: rmFile, writeFile, readFile } = await import('node:fs/promises');
+    const root = await tempRoot();
+    const core = await seeded(root);
+    const token = 'a'.repeat(64);
+    expect((await core.userAttach('bind-1', sink('c1'), 'user-client', token)).ok).toBeTrue();
+    const path = join(root, '.pair', 'user-channel.json');
+
+    // DELETION, then restart: recover repairs from the journal — no conflict,
+    // no read-only degradation, auth unaffected in both directions.
+    await rmFile(path, { force: true });
+    const afterDelete = makeCore(root);
+    expect(await afterDelete.recover()).not.toBe('conflict');
+    expect((await readFile(path, 'utf8')).includes('"registered": true')).toBeTrue();
+    expect((await afterDelete.userAttach('ad-ok', sink('c2'), 'user-client', token)).ok).toBeTrue();
+    const wrongAfterDelete = await afterDelete.userAttach('ad-bad', sink('c3'), 'user-client', 'b'.repeat(64));
+    expect(wrongAfterDelete.ok).toBeFalse();
+    if (!wrongAfterDelete.ok) expect(wrongAfterDelete.error.code).toBe('user-auth-failed');
+
+    // TAMPER, then restart: normalized from journal state, same guarantees.
+    await writeFile(path, '{"registered":false,"forged":true}\n', 'utf8');
+    const afterTamper = makeCore(root);
+    expect(await afterTamper.recover()).not.toBe('conflict');
+    const healed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    expect(healed['registered']).toBeTrue();
+    expect(healed['forged']).toBeUndefined();
+    expect((await afterTamper.userAttach('at-ok', sink('c4'), 'user-client', token)).ok).toBeTrue();
+    const wrongAfterTamper = await afterTamper.userAttach('at-bad', sink('c5'), 'user-client', 'b'.repeat(64));
+    expect(wrongAfterTamper.ok).toBeFalse();
+    if (!wrongAfterTamper.ok) expect(wrongAfterTamper.error.code).toBe('user-auth-failed');
+  });
+});
