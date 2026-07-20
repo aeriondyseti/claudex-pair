@@ -112,6 +112,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
   let everAttached = false; // no model yet → banner feedback during retries
   let pumpGeneration = 0;
   let attaching = false; // single-flight
+  let recovering = false; // submit-recovery owns attachment while true
   let closed = false;
 
   const ticker = setInterval(() => queue.push({ kind: 'tick', now: systemClock.now() }), AGE_TICK_MS);
@@ -122,79 +123,84 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
    * while the broker is absent. Failed attempts post 'reattaching' events;
    * success posts the attach event and starts the pump.
    */
+  /** Session adoption shared by the attach loop and submit recovery: emits
+   * the attach + channel events and arms the push pump for THIS session. */
+  const adoptSession = (next: ObserverSession | UserObserverSession, degraded: boolean): void => {
+    session = next;
+    spawnAllowed = false; // success — background reattaches are connect-only
+    everAttached = true;
+    queue.push(attachEvent(next.snapshot, next.snapshot.broker.endpoint, systemClock.now()));
+    if (degraded || options.credentialError) {
+      // A credential-error event is already queued (auth-degrade, or the
+      // local bootstrap error pushed before the first attach) and the
+      // reducer applies it as deferred state at attach — pushing
+      // registered/unregistered here would overwrite that loud guidance
+      // (close-out #2).
+    } else if (options.userToken && next.snapshot.userChannel) {
+      queue.push({ kind: 'user-channel', state: next.snapshot.userChannel.registered ? 'registered' : 'unregistered' });
+    } else {
+      // No token on this host (non-TTY exclusion, or no credential): the
+      // channel is unavailable HERE regardless of any broker-side binding —
+      // a composer affordance on a host that cannot input or send would be
+      // a lie (close-out #7 proof surface).
+      queue.push({ kind: 'user-channel', state: 'unavailable' });
+    }
+    // Pump generation guards a torn-down session's late callbacks: only the
+    // CURRENT pump may signal connection loss.
+    const generation = ++pumpGeneration;
+    const pushes = next.pushes;
+    void (async () => {
+      try {
+        for await (const push of pushes) queue.push(decodePush(push));
+      } catch {
+        if (generation === pumpGeneration && !closed) queue.push({ kind: 'connection', state: 'lost' });
+      }
+    })();
+  };
+
+  /** Authenticated attach with loud degrade on foreign binding. */
+  const attachOnce = async (spawn: boolean): Promise<{ next: ObserverSession | UserObserverSession; degraded: boolean }> => {
+    if (options.userToken && gateway.userAttach) {
+      try {
+        return { next: await gateway.userAttach(options.userToken, spawn), degraded: false };
+      } catch (error) {
+        if (error instanceof BrokerWireError && error.code === 'user-auth-failed') {
+          queue.push({ kind: 'user-channel', state: 'credential-error', detail: `${error.message} This pane is read-only.` });
+          return { next: await gateway.observe(spawn), degraded: true };
+        }
+        throw error;
+      }
+    }
+    return { next: await gateway.observe(spawn), degraded: false };
+  };
+
   const startAttach = (): void => {
     if (attaching || closed) return;
     attaching = true;
     void (async () => {
-      let degraded = false; // auth-failed on the attempt that succeeded
       try {
         for (;;) {
-          if (closed) return;
-          degraded = false;
+          if (closed || recovering || session) return; // recovery/success owns attachment
           try {
-            // U1: attach authenticated when a token is present; an auth
-            // failure (foreign binding) degrades LOUDLY to read-only.
-            let next: ObserverSession | UserObserverSession;
-            if (options.userToken && gateway.userAttach) {
-              try {
-                next = await gateway.userAttach(options.userToken, spawnAllowed);
-              } catch (error) {
-                if (error instanceof BrokerWireError && error.code === 'user-auth-failed') {
-                  degraded = true;
-                  queue.push({ kind: 'user-channel', state: 'credential-error', detail: `${error.message} This pane is read-only.` });
-                  next = await gateway.observe(spawnAllowed);
-                } else throw error;
-              }
-            } else {
-              next = await gateway.observe(spawnAllowed);
-            }
-            if (closed) {
-              await next.close();
+            const { next, degraded } = await attachOnce(spawnAllowed);
+            if (closed || recovering || session) {
+              await next.close(); // a competing path won while we handshook
               return;
             }
-            session = next;
-            spawnAllowed = false; // success — reattaches are connect-only
-            everAttached = true;
-            break;
+            adoptSession(next, degraded);
+            return;
           } catch (error) {
             if (closed) return;
             if (error instanceof BrokerWireError && error.code === 'session-not-active') {
               queue.fail(new NoBrokerSessionError(error.message)); // → fs fallback in runWatch
               return;
             }
-            await gateway.close();
+            if (!recovering) await gateway.close(); // never yank recovery's fresh client
             queue.push({ kind: 'connection', state: 'reattaching' });
             if (!everAttached) banner.draw(`pair watch: broker unreachable (${message(error)}) — retrying every ${reattachDelayMs / 1000}s. Ctrl+C to quit.`);
             await systemClock.sleep(reattachDelayMs);
           }
         }
-        queue.push(attachEvent(session!.snapshot, session!.snapshot.broker.endpoint, systemClock.now()));
-        if (degraded || options.credentialError) {
-          // A credential-error event is already queued (auth-degrade above,
-          // or the local bootstrap error pushed before the first attach) and
-          // the reducer applies it as deferred state at attach — pushing
-          // registered/unregistered here would overwrite that loud guidance
-          // (close-out #2).
-        } else if (options.userToken && session!.snapshot.userChannel) {
-          queue.push({ kind: 'user-channel', state: session!.snapshot.userChannel.registered ? 'registered' : 'unregistered' });
-        } else {
-          // No token on this host (non-TTY exclusion, or no credential): the
-          // channel is unavailable HERE regardless of any broker-side
-          // binding — a composer affordance on a host that cannot input or
-          // send would be a lie (close-out #7 proof surface).
-          queue.push({ kind: 'user-channel', state: 'unavailable' });
-        }
-        // Pump generation guards a torn-down session's late callbacks: only
-        // the CURRENT pump may signal connection loss.
-        const generation = pumpGeneration;
-        const pushes = session!.pushes;
-        void (async () => {
-          try {
-            for await (const push of pushes) queue.push(decodePush(push));
-          } catch {
-            if (generation === pumpGeneration && !closed) queue.push({ kind: 'connection', state: 'lost' });
-          }
-        })();
       } finally {
         attaching = false;
       }
@@ -206,19 +212,54 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
     // else renders (frozen contract — never observable broker-side).
     if (options.credentialError) queue.push({ kind: 'user-channel', state: 'credential-error', detail: options.credentialError });
     startAttach();
-    return await consumeEvents(queue, reduce, state, {
-      render: frameSink(write),
-      submit: (effect) => {
-        const current = session;
-        if (!current || !('send' in current)) {
-          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: 'user channel not attached' });
+    /**
+     * Submit with the design §5 idle-contract recovery: observers never pin
+     * or spawn the broker, so an idle-exit predictably strands the channel —
+     * but a user SUBMIT is active user work and MAY respawn (the one
+     * exception). On a dead/unattached session: authenticated reattach with
+     * spawn allowed, then retry the IMMUTABLE {reqId,target,body} exactly
+     * once — reqId reuse keeps it dedup-safe if the first attempt actually
+     * committed (codex re-read blocker 20260720-105928-798).
+     */
+    const submitViaSession = async (effect: Extract<WatchEffect, { kind: 'submit' }>): Promise<void> => {
+      const current = session;
+      if (!current || !('send' in current)) throw new Error('user channel not attached');
+      await current.send(effect.reqId, effect.target, effect.body);
+    };
+    const submitWithRecovery = async (effect: Extract<WatchEffect, { kind: 'submit' }>): Promise<void> => {
+      try {
+        await submitViaSession(effect);
+        queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+        return;
+      } catch (first) {
+        if (!options.userToken || !gateway.userAttach || closed || recovering) {
+          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: message(first) });
           return;
         }
-        void current.send(effect.reqId, effect.target, effect.body)
-          .then(() => queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true }))
-          .catch((error: unknown) => queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: error instanceof Error ? error.message : String(error) }));
-      },
+        recovering = true; // background loop yields; its catch won't close our client
+        try {
+          pumpGeneration++; // silence the dying session's pump
+          await session?.close();
+          session = undefined;
+          await gateway.close();
+          const next = await gateway.userAttach(options.userToken, true); // spawn: active user work
+          if (closed) { await next.close(); return; }
+          adoptSession(next, false);
+          await submitViaSession(effect); // the single retry, payload immutable
+          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+        } catch (second) {
+          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: message(second) });
+        } finally {
+          recovering = false;
+          if (!session && !closed) startAttach(); // recovery failed — resume the background loop
+        }
+      }
+    };
+    return await consumeEvents(queue, reduce, state, {
+      render: frameSink(write),
+      submit: (effect) => void submitWithRecovery(effect),
       reattach: async () => {
+        if (recovering) return; // recovery owns attachment; it re-arms on failure
         // Invalidate BEFORE the intentional close: the dying pump's error
         // callback must never enqueue a stale 'lost' that would tear down
         // the session we are about to attach (codex live review).

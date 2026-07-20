@@ -213,6 +213,68 @@ describe('watch event loop host', () => {
     expect(await loop).toBe(0);
   }, 10_000);
 
+  test('submit recovery (design §5 idle contract): dead broker → user submit respawns via authenticated reattach → exactly ONE committed send with the immutable reqId', async () => {
+    const userChannel = { registered: true, authenticated: true };
+    const sessionA = fakeSession(1);
+    (sessionA.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
+    const sends: { reqId: string; target: string; body: string }[] = [];
+    const sessionB = fakeSession(1);
+    (sessionB.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
+    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); } };
+    const userSessionB = { ...sessionB.session, send: async (reqId: string, target: string, body: string) => void sends.push({ reqId, target, body }) };
+
+    const attachCalls: boolean[] = []; // spawn flag per userAttach call
+    let brokerAlive = true;
+    const gateway: ObserverGatewayLike = {
+      observe: async () => { throw new Error('observe must not be used when a token is present'); },
+      userAttach: async (_token, spawn) => {
+        attachCalls.push(spawn === true);
+        if (attachCalls.length === 1) return userSessionA; // initial attach (spawn allowed)
+        if (!spawn && !brokerAlive) throw new Error('ECONNREFUSED'); // background connect-only vs dead broker
+        brokerAlive = true; // spawn=true resurrects it (the recovery path)
+        return userSessionB;
+      },
+      close: async () => undefined,
+    };
+
+    let handlers: TerminalHandlers | undefined;
+    const term = {
+      factory: (h: TerminalHandlers) => { handlers = h; return { interactive: true, width: () => 80, close: () => undefined }; },
+    };
+    const seen: WatchEvent[] = [];
+    const spy: WatchReducer = (state, event) => { seen.push(event); return reduceWatch(state, event); };
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2, userToken: 'u'.repeat(64) }, spy, {
+      gateway, terminal: term.factory, reattachDelayMs: 25, write: () => undefined,
+    });
+
+    // Attach A, composer registered.
+    await until(() => seen.some((e) => e.kind === 'user-channel' && e.state === 'registered'));
+    // Broker idle-exits: A's stream dies silently.
+    brokerAlive = false;
+    await sessionA.session.close();
+    await until(() => seen.some((e) => e.kind === 'connection' && e.state === 'lost'));
+    await until(() => attachCalls.some((spawn) => !spawn)); // background loop is retrying connect-only
+
+    // The user types and submits into the dead channel.
+    handlers!.onText!('ship it');
+    handlers!.onKey?.('submit');
+    await until(() => seen.some((e) => e.kind === 'submit-result' && e.ok));
+
+    expect(sends.length).toBe(1); // exactly one committed send
+    expect(sends[0]!.body).toBe('ship it');
+    const submitEvent = seen.find((e): e is Extract<WatchEvent, { kind: 'key'; key: 'submit' }> => e.kind === 'key' && e.key === 'submit')!;
+    expect(sends[0]!.reqId).toBe(submitEvent.reqId); // immutable payload, reqId reused verbatim
+    expect(attachCalls[0]).toBeTrue(); // initial attach may spawn
+    expect(attachCalls[attachCalls.length - 1]).toBeTrue(); // the RECOVERY attach spawned
+    expect(attachCalls.slice(1, -1).every((spawn) => !spawn)).toBeTrue(); // background stayed connect-only throughout
+    // The recovered session re-attached authenticated: a fresh attach event
+    // and a registered channel event followed the recovery.
+    expect(seen.filter((e) => e.kind === 'attach').length).toBeGreaterThanOrEqual(2);
+
+    handlers!.onQuit();
+    expect(await loop).toBe(0);
+  }, 10_000);
+
   test('non-TTY exclusion proof (close-out #7): zero credential activity, zero user-attach, no send path — even with a registered broker binding', async () => {
     const { mkdtemp, mkdir, rm } = await import('node:fs/promises');
     const { join } = await import('node:path');
