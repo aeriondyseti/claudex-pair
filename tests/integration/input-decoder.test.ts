@@ -69,7 +69,7 @@ describe('InputDecoder (frozen v1 contract)', () => {
 });
 
 describe('bounded lone-Esc disambiguation (close-out blocker, design §5)', () => {
-  function collect(decoder: InputDecoder) {
+  function collect() {
     const out: Emitted[] = [];
     const handlers = {
       onQuit: () => out.push({ kind: 'quit' as const }),
@@ -81,7 +81,7 @@ describe('bounded lone-Esc disambiguation (close-out blocker, design §5)', () =
 
   test('a standalone Esc keypress emits WITHOUT any second input: hold, then host flush resolves it', () => {
     const decoder = new InputDecoder();
-    const { out, handlers } = collect(decoder);
+    const { out, handlers } = collect();
     decoder.decode(Buffer.from([0x1b]), handlers); // real Esc key: its own chunk
     expect(out).toEqual([]); // held — could still be a CSI prefix
     expect(decoder.pendingEscape).toBeTrue(); // the host's timer-arming signal
@@ -94,7 +94,7 @@ describe('bounded lone-Esc disambiguation (close-out blocker, design §5)', () =
 
   test('a split CSI stays intact: the continuation cancels ambiguity and no phantom escape is emitted', () => {
     const decoder = new InputDecoder();
-    const { out, handlers } = collect(decoder);
+    const { out, handlers } = collect();
     decoder.decode(Buffer.from([0x1b]), handlers); // chunk 1: ESC
     expect(decoder.pendingEscape).toBeTrue();
     decoder.decode(Buffer.from('[5~'), handlers); // chunk 2: continuation arrives in time
@@ -106,7 +106,7 @@ describe('bounded lone-Esc disambiguation (close-out blocker, design §5)', () =
 
   test('a partial CSI that stalls to the flush deadline is dropped, never misread as Esc or text', () => {
     const decoder = new InputDecoder();
-    const { out, handlers } = collect(decoder);
+    const { out, handlers } = collect();
     decoder.decode(Buffer.from([0x1b, 0x5b, 0x35]), handlers); // ESC [ 5 — mid-sequence stall
     expect(decoder.pendingEscape).toBeTrue();
     decoder.flushPending(handlers);
