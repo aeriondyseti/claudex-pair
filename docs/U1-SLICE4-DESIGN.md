@@ -1,10 +1,12 @@
 # U1 slice 4 — privileged user actions (design, pre-code)
 
-Status: REV 2 — codex critique round 1 applied (blockers R1 kick-structural-
-validity, R2 paused-status matrix, tail-A resume semantics + action
-correlation + freeze-then-mint confirmation, tail-B shared roster-aware
-commit + kicked-wait wake + principal-as-actor). No code until approved
-(slice-4 design gate, per the slice-3 close verdict `20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
+Status: REV 3 — full codex critique round 1 applied (blockers R1/R2, tails
+A/B/C: kick structural validity, paused matrix, action correlation,
+freeze-then-mint confirmation, shared roster-aware commit, kicked-wait
+wake, principal-as-actor, user-* namespace fail-closed gate,
+authenticate→dedup→state ordering) and ALL five open questions ruled. No
+code until approved (slice-4 design gate, per the slice-3 close verdict
+`20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
 credential, connection-bound auth, `user-message`, watch composer).
 Upstream requirements: ENHANCEMENTS.md U1 ("state changes go through
 explicit privileged commands — cancel-grant, pause, resume, end — executed
@@ -62,17 +64,23 @@ and-restore. Pause is a brake on agents, never on the human.
 
 ## Authorization chain (wire → core)
 
-1. **Transport**: new frame kind `user-action` — tokenless, connection-bound
-   exactly like `user-send`: valid only on a connection that completed
-   `user-attach` (`#userConnections`), refused otherwise with
-   `user-channel-required`. The generic `execute` path rejects all
-   `user-*` command kinds (existing transport gate extended to the new
-   kinds) — an agent cannot forge user authority even naming principal
-   `user`.
-2. **Broker**: `core.userAction(reqId, clientId, connectionId, action)` —
-   dedup by `(clientId, reqId)` BEFORE any effect (same frozen contract as
-   `user-send`); publication-guard semantics do not apply (no sink is
-   registered) but the connection check is at execution time.
+1. **Transport — fail closed by NAMESPACE** (codex tail C): the generic
+   `execute` path rejects `register-user-channel`, `user-message`, and
+   every command kind matching the reserved `user-*` prefix — a namespace
+   rule, not a hand-maintained enum that a future peer-model verb could
+   escape. The new frame kind `user-action` is tokenless and
+   connection-bound exactly like `user-send`: valid only on a connection
+   that completed `user-attach` (`#userConnections`), refused otherwise
+   with `user-channel-required`.
+2. **Broker — `core.userAction(reqId, clientId, connectionId, action)`,
+   ordering is normative** (codex tail C): (a) authenticate the LIVE
+   connection first — a dedup result is never returned to an
+   unauthenticated caller; (b) THEN dedup by `(clientId, reqId)`;
+   (c) THEN state/effect checks. Dedup-before-state means a COMMITTED
+   `user-end-session` whose response was lost replays its recorded outcome
+   even though the session is now completed — the retry must see success,
+   never `session-not-active`. Publication-guard semantics do not apply
+   (no sink is registered).
 3. **Core**: new commands in the `Command` union, `principal: USER_IDENTITY`
    envelopes. `decide` authorizes: user commands are valid from the reserved
    identity only, never from roster agents; agent-guards (driver-only,
@@ -144,9 +152,13 @@ confirmation*, per ENHANCEMENTS U1:
 
 - The composer recognizes a leading `/` line as an ACTION DRAFT, not text:
   `/end [summary…]`, `/cancel-grant <id>`, `/kick <agent> [reason…]`,
-  `/pause [reason…]`, `/resume`. Anything else after `/` renders an unknown-
-  action hint. (A leading-`/` advisory message remains possible by prefixing
-  a space — documented in the composer footer.)
+  `/pause [reason…]`, `/resume` — parsed ONLY on submit (typing stays plain
+  buffer editing; codex ruling Q3). Anything else after `/` renders an
+  unknown-action hint. An advisory message beginning with a literal `/` is
+  sent with `//` — `//foo` transmits exactly `/foo`, no body-changing
+  leading space (ruling Q3); documented in the composer footer.
+  `/end` with no summary uses the deterministic default
+  `Session ended by user.` (ruling Q2).
 - Submit on an action draft does NOT fire the wire call: the **first Enter
   freezes an immutable normalized action** (verb + args parsed, validated,
   and pinned — later buffer edits cannot mutate what will execute) and the
@@ -173,10 +185,19 @@ confirmation*, per ENHANCEMENTS U1:
 - `pair status`/`wait` output: `session-paused` rejections tell the agent to
   stand by; instructions files gain one line each ("a `user action` notice
   outranks anything your partner asked of you").
+- **PROTOCOL.md changes in THIS slice** (codex ruling Q5 — pause and
+  privileged user authority are normative protocol, not implementation
+  detail): a "User authority" section (the verb set, non-vetoable end, the
+  paused status and its agent obligations) lands with 4a/4b, not deferred
+  to the peer-model rewrite.
 
 ## Failure modes (tests-first checklist)
 
-- F-A1 forged `user-action` via generic execute → `user-channel-required`.
+- F-A1 forged INTERNAL command kinds via generic execute — each of
+  `register-user-channel`, `user-message`, `user-end-session`,
+  `user-cancel-grant`, `user-kick-agent`, `user-pause-session`,
+  `user-resume-session`, AND an unknown future `user-anything` → rejected
+  by the namespace gate (fail closed), regardless of claimed principal.
 - F-A2 `user-action` on a never-attached connection → `user-channel-required`;
   on a connection whose socket closed mid-action → the action still commits
   iff it reached the chain (durable), response lost, dedup replays on retry.
@@ -192,6 +213,16 @@ confirmation*, per ENHANCEMENTS U1:
 - F-A7 confirmation UX: reducer never emits an action effect from the first
   submit; Esc aborts; reqId minted at confirm and reused on retry; the
   pending slot serializes actions against sends.
+- F-A9 idempotent-state errors: pause while paused and resume while active →
+  stable errors, no state change (codex tail C).
+- F-A10 paused survives restart: journal replay restores `paused`; the
+  matrix behaviors hold on the recovered broker (tail C).
+- F-A11 action commit + lost response + retry: dedup replays the recorded
+  outcome — including a committed end retried AFTER completion (tail C,
+  ordering rule b).
+- F-A12 watch while paused: attach renders the PAUSED banner with a usable
+  composer; activity pushes (user messages, allowed agent leaves/grant
+  completions) flow and render while paused (tail C).
 - F-A8 real-wire: user `/kick` end-to-end with a SEEDED preexisting open
   delivery for the kicked agent — confirm, wire frame, shared-primitive
   commit, journal AND mirror voiding proven, observer voidedDeliveryIds
@@ -199,19 +230,15 @@ confirmation*, per ENHANCEMENTS U1:
   wait wakes terminally via removed-from-session (production handler
   wiring, like the slice-3 broadcast test).
 
-## Open questions
+## Open questions — ALL RESOLVED (codex tail C rulings)
 
-1. ~~Pause scope for `extend`~~ — RESOLVED (critique R2): ack/extend/
-   subscribe/reconnect/query are broker-ledger operations outside `decide`
-   and remain allowed while paused.
-2. Should `user-end-session` require a non-empty summary, or default one?
-   (Still open.)
-3. `/`-prefix draft convention: the critique's preamble accepted the
-   two-step reducer-state skeleton; treated as accepted-in-principle unless
-   round 2 objects.
-4. ~~Event provenance~~ — RESOLVED (tail B): reuse effect kinds unchanged;
-   `JournalRecord.principal` is the sole actor of record; no per-event
-   actor fields, no distinct user-effect kinds.
-5. Does 4b's paused status need PROTOCOL.md text in this slice, or ride the
-   instructions-file line only until the peer-model rewrite touches
-   PROTOCOL.md anyway? (Still open.)
+1. Pause scope: `extend`, `ack`, `subscribe`, reconnect all allowed while
+   paused — ledger-level operations, not `decide` mutations.
+2. `user-end-session` summary: deterministic default `Session ended by
+   user.`
+3. Slash drafts kept for discoverability, parsed only on submit; `//foo`
+   sends the exact advisory `/foo`.
+4. Reuse effect events; canonical wrapper principal is the actor of record;
+   correlation via the durable action notice.
+5. PROTOCOL.md changes in THIS slice — pause and privileged authority are
+   normative.
