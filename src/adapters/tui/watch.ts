@@ -1,4 +1,4 @@
-import { derivePresence, formatAge } from './derive.ts';
+import { ageSeconds, deriveAwaiting, derivePresence, formatAge } from './derive.ts';
 import type { ComposerState } from './events.ts';
 import type { TranscriptEntry } from './viewmodel.ts';
 import type { WatchViewModel } from './viewmodel.ts';
@@ -115,6 +115,11 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
       }
       lines.push(`   ${line}`);
     }
+  }
+  // Item 7: who owes whom (asks without replies, voided excluded).
+  for (const a of deriveAwaiting(model.transcript)) {
+    const age = ageSeconds(model.now, a.sentAt);
+    lines.push(` ${DIM}awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId}${age === undefined ? '' : ` (${formatAge(age)} ago)`}${RESET}`);
   }
   if (model.session.status === 'paused') {
     lines.push('', ` ${WARN}${BOLD}⏸ SESSION PAUSED by the user — agents are braked; /resume to continue.${RESET}`);
