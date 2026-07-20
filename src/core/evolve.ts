@@ -163,6 +163,7 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         draft: { revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at },
         revisionLog: [{ revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at }],
         findings: {},
+        agenda: [],
       };
       if (holderIndex === -1) {
         return { ...state, planning: { substate: 'convergence-blocked', rotation: { electorate, starterIndex: 0, round: 0, remaining: electorate }, ...common } };
@@ -281,7 +282,8 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       // retains the unserved suffix; all-departed rollover advances the frozen
       // starter). ConvergenceCommon carries over unchanged.
       if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
-      const { substate: _s, rotation, ...common } = state.planning;
+      // 1C: entering blocked VOIDS any open ballot — drop it from `common`.
+      const { substate: _s, rotation, ballot: _ballot, ...common } = state.planning;
       const outcome = advanceRotation(rotation, state.registry);
       return { ...state, planning: { substate: 'convergence-blocked', rotation: { electorate: rotation.electorate, starterIndex: outcome.starterIndex, round: outcome.round, remaining: outcome.remaining }, ...common } };
     }
@@ -303,6 +305,39 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       }
       return { ...state, planning: { substate: 'converging', rotation: rot, ...common } };
     }
+    case 'question-called':
+      // 1C: open the ballot on the converging arm (snapshot electorate,
+      // frozen revision hash + validated task block).
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      return { ...state, planning: { ...state.planning, ballot: { revisionHash: event.revisionHash, revision: event.revision, electorate: [...event.electorate], votes: {}, calledBy: event.calledBy, at: event.at, taskBlock: event.taskBlock } } };
+    case 'vote-cast': {
+      // 1C: record one vote on the open ballot (total no-op otherwise).
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging' || !state.planning.ballot) return state;
+      const ballot = state.planning.ballot;
+      const vote = event.approve ? { vote: 'approve' as const } : { vote: 'reject' as const, reasons: event.reasons ?? '' };
+      return { ...state, planning: { ...state.planning, ballot: { ...ballot, votes: { ...ballot.votes, [event.voter]: vote } } } };
+    }
+    case 'ballot-closed': {
+      // 1C: reject or void — clear the open ballot (agenda append rides its
+      // own agenda-recorded event).
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'converging') return state;
+      const { ballot: _closed, ...rest } = state.planning;
+      return { ...state, planning: rest };
+    }
+    case 'ballot-passed':
+      // 1C: retain the frozen plan on the session — the paired phase-transition
+      // (next event) drops planning while `plan` persists via ...rest.
+      return state && state.topology === 'peer'
+        ? { ...state, plan: { revision: event.revision, hash: event.hash, taskBlock: event.taskBlock, at: event.at } }
+        : state;
+    case 'agenda-recorded':
+      // 1C: append mandatory next-round agenda items (addressed:false). Agenda
+      // lives on ConvergenceCommon (converging or blocked).
+      if (!state || state.topology !== 'peer' || (state.planning?.substate !== 'converging' && state.planning?.substate !== 'convergence-blocked')) return state;
+      return { ...state, planning: { ...state.planning, agenda: [...state.planning.agenda, ...event.items.map((it) => ({ id: it.id, reason: it.reason, from: it.from, at: it.at, addressed: false }))] } };
+    case 'agenda-addressed':
+      if (!state || state.topology !== 'peer' || (state.planning?.substate !== 'converging' && state.planning?.substate !== 'convergence-blocked')) return state;
+      return { ...state, planning: { ...state.planning, agenda: state.planning.agenda.map((a) => (a.id === event.agendaId ? { ...a, addressed: true } : a)) } };
   }
 }
 

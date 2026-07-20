@@ -2,7 +2,8 @@ import type { CommandEnvelope, Command, CommandMeta, GrantScopeInput } from './c
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
 import { advanceRotation } from './rotation.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
+import { validatePlanTaskBlock } from './plan.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -121,6 +122,12 @@ function decideInner(
       return withActive(state, (s) => decideAmendCritique(s, command, envelope));
     case 'yield-turn':
       return withActive(state, (s) => decideYield(s, envelope));
+    case 'call-question':
+      return withActive(state, (s) => decideCallQuestion(s, envelope));
+    case 'vote':
+      return withActive(state, (s) => decideVote(s, command, envelope));
+    case 'address-agenda':
+      return withActive(state, (s) => decideAddressAgenda(s, command, envelope));
   }
 }
 
@@ -338,7 +345,13 @@ function decideDraftAmend(
   if (planning.revisionLog.length >= DRAFT_REVISIONS_MAX) {
     return err(new ProtocolError('draft-history-exhausted', `The draft has reached ${DRAFT_REVISIONS_MAX} revisions — convergence has likely livelocked; a human should intervene.`));
   }
-  return ok([{ kind: 'draft-amended', revision: command.baseRevision + 1, hash: contentHash, author: principal, content: command.content, bytes, at: envelope.meta.at }]);
+  const events: Event[] = [{ kind: 'draft-amended', revision: command.baseRevision + 1, hash: contentHash, author: principal, content: command.content, bytes, at: envelope.meta.at }];
+  // 1C revision binding: an amendment moves the target, so any open ballot is
+  // voided in the SAME txn (votes bound to the old revision hash are stale).
+  if (planning.ballot) {
+    events.push({ kind: 'ballot-closed', outcome: 'voided', at: envelope.meta.at });
+  }
+  return ok(events);
 }
 
 /** 1B-c: the converging peer + electorate gate shared by every finding verb.
@@ -577,6 +590,160 @@ function decideYield(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   return ok([{ kind: 'convergence-halted', at: envelope.meta.at }]);
 }
 
+/** 1C settled-findings gate (§1c / 1B design). A finding gates the question
+ * IFF its severity is HIGH|MED and it is NOT settled. Settled predicate
+ * (EXACT): resolved|conceded|withdrawn -> settled; 'answered' -> settled IFF
+ * the AUTHOR is departed (registry status 'left'); 'open' -> unsettled always.
+ * LOW never gates. */
+function isFindingSettled(f: Finding, registry: Registry): boolean {
+  if (f.lifecycle === 'resolved' || f.lifecycle === 'conceded' || f.lifecycle === 'withdrawn') return true;
+  if (f.lifecycle === 'answered') return registry.agents[f.author]?.status === 'left';
+  return false; // open
+}
+
+/** 1C (§1c/§1d): call the question on the current draft. Any ELECTORATE
+ * member, converging, no open ballot. Gates IN ORDER: not-in-electorate,
+ * ballot-open, findings-unsettled (HIGH|MED), agenda-unaddressed, then the
+ * task-block validation from the broker-stamped meta.draftBody. The ballot
+ * snapshots the CURRENT rotation electorate and binds the CURRENT draft hash. */
+function decideCallQuestion(s: SessionState, envelope: CommandEnvelope): Result<Event[], ProtocolError> {
+  const gate = requireConverging(s, 'call-question');
+  if (gate instanceof ProtocolError) return err(gate);
+  const { peer, planning } = gate;
+  const principal = envelope.meta.principal;
+  if (!planning.rotation.electorate.includes(principal)) {
+    return err(new ProtocolError('not-in-electorate', `'${principal}' is not in the barrier electorate — only electorate members may call the question.`));
+  }
+  if (planning.ballot) {
+    return err(new ProtocolError('ballot-open', 'A ballot is already open — wait for it to close, or amend the draft to void it.'));
+  }
+  const unsettled = Object.values(planning.findings)
+    .filter((f) => (f.severity === 'HIGH' || f.severity === 'MED') && !isFindingSettled(f, peer.registry))
+    .map((f) => f.id);
+  if (unsettled.length > 0) {
+    return err(new ProtocolError('findings-unsettled', `The question cannot be called while HIGH/MED findings are unsettled: ${unsettled.join(', ')}.`));
+  }
+  const pending = planning.agenda.filter((a) => !a.addressed).map((a) => a.id);
+  if (pending.length > 0) {
+    return err(new ProtocolError('agenda-unaddressed', `The prior round's agenda is not fully addressed: ${pending.join(', ')} — address each (pair address-agenda) before re-calling.`));
+  }
+  // Task-block validation from the broker-stamped CURRENT draft body. A
+  // caller cannot forge it (transport-boundary stamp like contentHash).
+  const draftBody = envelope.meta.draftBody;
+  if (draftBody === undefined) {
+    return err(new ProtocolError('invalid-task-block', 'Internal: the draft body is missing (the broker stamps it).'));
+  }
+  const validated = validatePlanTaskBlock(draftBody);
+  if (!validated.ok) {
+    return err(new ProtocolError('invalid-task-block', validated.error));
+  }
+  return ok([{
+    kind: 'question-called',
+    revision: planning.draft.revision,
+    revisionHash: planning.draft.hash,
+    electorate: [...planning.rotation.electorate],
+    taskBlock: validated.value,
+    calledBy: principal,
+    at: envelope.meta.at,
+  }]);
+}
+
+/** 1C (§1c): each vote-cast additionally PROJECTS one @broker archive notice
+ * per current agent — derived, never load-bearing (WAL is authoritative).
+ * Deterministic ids `${meta.id}-v${i}`. */
+function voteNotice(envelope: CommandEnvelope, to: AgentId, index: number, body: string): Extract<Event, { kind: 'message-sent' }> {
+  return { kind: 'message-sent', id: `${envelope.meta.id}-v${index}`, from: BROKER_SENDER, to, type: 'info', turn: 'keep', body, at: envelope.meta.at, provenance: 'broker' };
+}
+
+/** 1C (§1c): cast a ballot vote. Gates IN ORDER: no-open-ballot,
+ * not-in-electorate, already-voted, stale-ballot-revision, then reject
+ * discipline (vote-reject-without-reason). A reject CLOSES the ballot
+ * (unanimity impossible) and records the mandatory next-round agenda; the
+ * final approve atomically passes the ballot AND transitions the phase. Every
+ * vote projects @broker archive notices to all current agents. */
+function decideVote(
+  s: SessionState,
+  command: Extract<Command, { kind: 'vote' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const gate = requireConverging(s, 'vote');
+  if (gate instanceof ProtocolError) return err(gate);
+  const { peer, planning } = gate;
+  const ballot = planning.ballot;
+  if (!ballot) {
+    return err(new ProtocolError('no-open-ballot', 'There is no open ballot — call the question first (pair call-question).'));
+  }
+  const voter = envelope.meta.principal;
+  if (!ballot.electorate.includes(voter)) {
+    return err(new ProtocolError('not-in-electorate', `'${voter}' is not in this ballot's frozen electorate (${ballot.electorate.join(', ')}).`));
+  }
+  if (ballot.votes[voter] !== undefined) {
+    return err(new ProtocolError('already-voted', `'${voter}' has already voted on this ballot — votes are final until the ballot closes.`));
+  }
+  if (command.revisionHash !== ballot.revisionHash) {
+    return err(new ProtocolError('stale-ballot-revision', `Vote carries revision hash '${command.revisionHash}' but the ballot is bound to '${ballot.revisionHash}' — re-read the draft and re-vote.`));
+  }
+  const reasons = command.reasons?.trim() ?? '';
+  if (!command.approve && reasons.length === 0) {
+    return err(new ProtocolError('vote-reject-without-reason', 'A reject vote MUST carry non-blank reasons — they become the next round\'s mandatory agenda.'));
+  }
+  const events: Event[] = [{
+    kind: 'vote-cast', voter, approve: command.approve, ...(command.approve ? {} : { reasons }), at: envelope.meta.at,
+  }];
+  if (!command.approve) {
+    // Reject closes the ballot immediately and records the agenda; the round
+    // cap pages the human (never auto-acts) when hit.
+    events.push({ kind: 'ballot-closed', outcome: 'rejected', at: envelope.meta.at });
+    events.push({ kind: 'agenda-recorded', items: [{ id: `${envelope.meta.id}-a0`, reason: reasons, from: voter, at: envelope.meta.at }], at: envelope.meta.at });
+    if (planning.rotation.round >= ROUND_CAP) {
+      events.push({ kind: 'attention-raised', id: `round-cap-${envelope.meta.id}`, category: 'round-cap', detail: `convergence exceeded the round cap (round ${planning.rotation.round}) — arbitrate, re-scope, or force the phase`, at: envelope.meta.at });
+    }
+  } else {
+    const approvers = new Set([...Object.keys(ballot.votes), voter]);
+    const unanimous = ballot.electorate.every((m) => approvers.has(m));
+    if (unanimous) {
+      // The FINAL approving vote atomically passes the ballot AND transitions
+      // planning -> provisioning (there is NO separate plan-freeze command).
+      events.push({ kind: 'ballot-passed', revision: ballot.revision, hash: ballot.revisionHash, taskBlock: ballot.taskBlock, at: envelope.meta.at });
+      events.push({ kind: 'phase-transition', from: 'planning', to: 'provisioning', outcome: 'ballot-passed', at: envelope.meta.at });
+    }
+  }
+  const prefix = ballot.revisionHash.slice(0, 12);
+  const summary = `${voter} voted ${command.approve ? 'approve' : 'reject'} on revision ${prefix}`;
+  peer.agents.forEach((agent, i) => events.push(voteNotice(envelope, agent, i, summary)));
+  return ok(events);
+}
+
+/** 1C (§1c): mark a next-round agenda item addressed (any electorate member),
+ * optionally linking the finding that addressed it. call-question stays
+ * refused until every agenda item is addressed. */
+function decideAddressAgenda(
+  s: SessionState,
+  command: Extract<Command, { kind: 'address-agenda' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const gate = requireConverging(s, 'address-agenda');
+  if (gate instanceof ProtocolError) return err(gate);
+  const { planning } = gate;
+  const principal = envelope.meta.principal;
+  if (!planning.rotation.electorate.includes(principal)) {
+    return err(new ProtocolError('not-in-electorate', `'${principal}' is not in the barrier electorate — only electorate members may address agenda items.`));
+  }
+  if (!planning.agenda.some((a) => a.id === command.agendaId)) {
+    return err(new ProtocolError('unknown-agenda-item', `No agenda item '${command.agendaId}' (see: pair status).`));
+  }
+  if (command.findingId !== undefined && planning.findings[command.findingId] === undefined) {
+    return err(new ProtocolError('unknown-finding', `No finding '${command.findingId}' to link to agenda item '${command.agendaId}'.`));
+  }
+  return ok([{
+    kind: 'agenda-addressed',
+    agendaId: command.agendaId,
+    ...(command.findingId === undefined ? {} : { findingId: command.findingId }),
+    ...(command.note === undefined ? {} : { note: command.note }),
+    at: envelope.meta.at,
+  }]);
+}
+
 /** 1B collecting rulings (Ruling A: an empty-electorate abstain REJECTS
  * with no mutation — no event, no attention, no dedup record). */
 function decideCollectingRuling(
@@ -810,6 +977,7 @@ function decideUserKick(
   appendAdmittingCompletion(s, command.agent, events, envelope.meta.at);
   if (s.topology === 'peer') {
     appendFindingsDepartureAttention(s, command.agent, events, command.noticeIdBase, envelope.meta.at);
+    appendBallotStallAttention(s, command.agent, events, command.noticeIdBase, envelope.meta.at);
     appendConvergenceHolderDeparture(s, command.agent, events, envelope.meta.at);
   }
   return ok(events);
@@ -957,6 +1125,7 @@ function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[]
   if (s.topology === 'pair' && s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
   if (s.topology === 'peer') {
     appendFindingsDepartureAttention(s, agent, events, envelope.meta.id, envelope.meta.at);
+    appendBallotStallAttention(s, agent, events, envelope.meta.id, envelope.meta.at);
     appendConvergenceHolderDeparture(s, agent, events, envelope.meta.at);
   }
   return ok(events);
@@ -977,6 +1146,18 @@ function appendFindingsDepartureAttention(s: SessionState, agent: AgentId, event
   const more = blocked.length - shown.length;
   const detail = `${blocked.length} finding${blocked.length === 1 ? '' : 's'} blocked by ${agent}'s departure: ${shown.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
   events.push({ kind: 'attention-raised', id: `fblock-${agent}-${idSeed}`, category: 'findings-blocked', detail, at });
+}
+
+/** 1C: a leave/kick of an OPEN ballot's electorate member stalls the vote —
+ * unanimity cannot complete without a rejoin+vote (or a user force-phase).
+ * Raise a durable attention item; the ballot REMAINS open (fixed-electorate
+ * ruling — a post-call departure is an abstention that pages, never a silent
+ * shrink). */
+function appendBallotStallAttention(s: SessionState, agent: AgentId, events: Event[], idSeed: string, at: string): void {
+  if (s.topology !== 'peer' || s.planning?.substate !== 'converging') return;
+  const ballot = s.planning.ballot;
+  if (!ballot || !ballot.electorate.includes(agent)) return;
+  events.push({ kind: 'attention-raised', id: `ballot-stall-${agent}-${idSeed}`, category: 'ballot-stalled', detail: `${agent} left with a ballot open — unanimity cannot complete until they rejoin and vote, or the user forces the phase.`, at });
 }
 
 /** 1B-c: when the departing agent HELD the convergence turn, the same txn

@@ -42,6 +42,7 @@ export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 
 const COMMAND_KINDS = new Set([
   'propose', 'draft-amend',
   'critique', 'respond-critique', 'confirm-critique', 'amend-critique', 'yield-turn',
+  'call-question', 'vote', 'address-agenda',
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
@@ -300,9 +301,15 @@ export class BrokerCore {
     const contentMeta = typeof contentText === 'string'
       ? { contentHash: sha256Hex(contentText), contentBytes: Buffer.byteLength(contentText, 'utf8') }
       : {};
+    // 1C: call-question carries NO block payload — the broker stamps the
+    // CURRENT draft body from the journal (transport-boundary stamp, exactly
+    // like contentHash) so a caller cannot forge the normative task block.
+    const draftBodyMeta = command.kind === 'call-question'
+      ? { draftBody: this.#journal.planningArtifacts().draft?.body ?? '' }
+      : {};
     const envelope: CommandEnvelope = {
       command,
-      meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as, ...contentMeta },
+      meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as, ...contentMeta, ...draftBodyMeta },
     };
     // Peer 1A bootstrap: peer init carries the INITIATOR credential at the
     // transport edge (payload, never envelope/journal) and performs an

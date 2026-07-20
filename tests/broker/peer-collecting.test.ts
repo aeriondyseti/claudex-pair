@@ -56,6 +56,12 @@ const respondCritique = (core: BrokerCore, agent: string, findingId: string, dis
   core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'respond-critique', findingId, disposition, text } }, `conn-${agent}`);
 const confirmCritique = (core: BrokerCore, agent: string, findingId: string, verdict: string, text: string, reqId: string) =>
   core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'confirm-critique', findingId, verdict, text } }, `conn-${agent}`);
+const callQuestion = (core: BrokerCore, agent: string, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'call-question' } }, `conn-${agent}`);
+const castVote = (core: BrokerCore, agent: string, approve: boolean, revisionHash: string, reqId: string, reasons?: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'vote', approve, revisionHash, ...(reasons === undefined ? {} : { reasons }) } }, `conn-${agent}`);
+const addressAgenda = (core: BrokerCore, agent: string, agendaId: string, reqId: string) =>
+  core.execute(reqId, `client-${agent}`, agent, { command: { kind: 'address-agenda', agendaId } }, `conn-${agent}`);
 /** Bring both members through collecting to converging via both proposals. */
 async function convergingCore(root: string) {
   const core = await collectingCore(root);
@@ -368,5 +374,103 @@ describe('peer 1B-c: findings + yield + departure through the broker', () => {
     expect(((d as { events?: { kind: string; category?: string }[] }).events ?? []).some((e) => e.kind === 'attention-raised' && e.category === 'findings-blocked')).toBeTrue();
     const s = await session(core);
     expect(s.attention.some((a) => a.category === 'findings-blocked')).toBeTrue();
+  });
+});
+
+describe('peer 1C: the ballot / round automaton through the broker', () => {
+  const PLAN_BLOCK = {
+    plan: { wip_cap: 1, verification: { fast_gate: 'bun test', full_suite: 'bun run check' } },
+    tasks: [
+      { id: 't1', title: 'Core', class: 'production', description: 'build it', acceptance: ['works'], deps: [] },
+      { id: 't2', title: 'Verify', class: 'assist', merges: false, description: 'test it', acceptance: ['passes'], deps: ['t1'] },
+    ],
+  };
+  const PLAN_DRAFT = `# Plan\r\nprose and rationale.\r\n\r\n\`\`\`json\n${JSON.stringify(PLAN_BLOCK, null, 2)}\n\`\`\`\r\n`;
+  const calledHash = (r: unknown): string => {
+    const called = ((r as { events?: { kind: string; revisionHash?: string }[] }).events ?? []).find((e) => e.kind === 'question-called');
+    if (!called?.revisionHash) throw new Error('no question-called event');
+    return called.revisionHash;
+  };
+
+  test('full happy path: draft with a valid json block -> call-question -> unanimous approve -> provisioning + frozen plan; artifacts stay revealed; vote notices ride @broker; restart preserves the plan', async () => {
+    const root = await tempRoot();
+    const core = await convergingCore(root);
+    expect((await draftAmend(core, 'claude', PLAN_DRAFT, 0, 'd-1')).ok).toBeTrue();
+
+    const called = await callQuestion(core, 'claude', 'cq-1');
+    expect(called.ok).toBeTrue();
+    const hash = calledHash(called);
+    const q = ((called as { events?: { kind: string; electorate?: string[] }[] }).events ?? []).find((e) => e.kind === 'question-called');
+    expect(q).toMatchObject({ electorate: ['claude', 'codex'] });
+
+    expect((await castVote(core, 'claude', true, hash, 'vt-1')).ok).toBeTrue(); // non-final
+    const s1 = await session(core);
+    if (s1.planning?.substate !== 'converging') throw new Error('still converging until unanimous');
+
+    const final = await castVote(core, 'codex', true, hash, 'vt-2'); // final
+    expect(final.ok).toBeTrue();
+    const kinds = ((final as { events?: { kind: string }[] }).events ?? []).map((e) => e.kind);
+    expect(kinds).toContain('ballot-passed');
+    expect(kinds).toContain('phase-transition');
+    // Vote records project as derived @broker archive notices.
+    expect(((final as { events?: { kind: string; from?: string }[] }).events ?? []).some((e) => e.kind === 'message-sent' && e.from === '@broker')).toBeTrue();
+
+    const s2 = await session(core);
+    expect(s2.phase).toBe('provisioning');
+    expect(s2.planning).toBeUndefined();
+    expect(s2.plan).toBeDefined();
+    expect(s2.plan?.hash).toBe(hash);
+    expect(s2.plan?.taskBlock.tasks.map((t) => t.id)).toEqual(['t1', 't2']);
+
+    // The planning artifacts stay 'revealed' — the plan is carried on the session.
+    const qa = await core.query('qa-c1', 'planning-artifacts');
+    expect((qa as { data?: { phase?: string } }).data?.phase).toBe('revealed');
+
+    // Restart: the frozen plan survives recovery.
+    await core.quiesce();
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    const s3 = await session(reopened);
+    expect(s3.phase).toBe('provisioning');
+    expect(s3.plan?.hash).toBe(hash);
+    expect(s3.plan?.taskBlock.tasks.map((t) => t.id)).toEqual(['t1', 't2']);
+  });
+
+  test('a reject closes the ballot; the recorded agenda blocks a re-call until it is addressed', async () => {
+    const core = await convergingCore(await tempRoot());
+    expect((await draftAmend(core, 'claude', PLAN_DRAFT, 0, 'd-1')).ok).toBeTrue();
+    const hash = calledHash(await callQuestion(core, 'claude', 'cq-1'));
+
+    const rej = await castVote(core, 'codex', false, hash, 'vt-1', 'the task ordering is wrong');
+    expect(rej.ok).toBeTrue();
+    const recorded = ((rej as { events?: { kind: string; items?: { id: string }[] }[] }).events ?? []).find((e) => e.kind === 'agenda-recorded');
+    const agendaId = recorded?.items?.[0]?.id;
+    expect(agendaId).toBeDefined();
+    const sRej = await session(core);
+    if (sRej.planning?.substate !== 'converging') throw new Error('shape');
+    expect(sRej.planning.ballot).toBeUndefined(); // ballot closed
+    expect(sRej.planning.agenda.filter((a) => !a.addressed)).toHaveLength(1);
+
+    // A re-call is refused until the agenda is addressed.
+    const blocked = await callQuestion(core, 'claude', 'cq-2');
+    expect((blocked as { error?: { code?: string } }).error?.code).toBe('agenda-unaddressed');
+
+    expect((await addressAgenda(core, 'claude', agendaId!, 'aa-1')).ok).toBeTrue();
+    const reopenBallot = await callQuestion(core, 'claude', 'cq-3');
+    expect(reopenBallot.ok).toBeTrue();
+    const s2 = await session(core);
+    if (s2.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s2.planning.ballot).toBeDefined();
+  });
+
+  test('call-question with an unparseable task block is rejected invalid-task-block (nothing committed)', async () => {
+    const core = await convergingCore(await tempRoot());
+    // A draft with NO json fence — the normative task block cannot be extracted.
+    expect((await draftAmend(core, 'claude', 'just prose, no fenced block\r\n', 0, 'd-1')).ok).toBeTrue();
+    const r = await callQuestion(core, 'claude', 'cq-1');
+    expect((r as { error?: { code?: string } }).error?.code).toBe('invalid-task-block');
+    const s = await session(core);
+    if (s.planning?.substate !== 'converging') throw new Error('shape');
+    expect(s.planning.ballot).toBeUndefined();
   });
 });

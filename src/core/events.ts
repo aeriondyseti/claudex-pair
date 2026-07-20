@@ -51,7 +51,7 @@ export type Event =
   /** Peer 1A: outcome provenance is permanent — 'forced' can never read
    * as 'ballot-passed' (codex rev 3). */
   | { kind: 'phase-transition'; from: import('./types.ts').SessionPhase; to: import('./types.ts').SessionPhase; outcome: 'forced' | 'ballot-passed'; reason?: string; at: Timestamp }
-  | { kind: 'attention-raised'; id: string; category: 'tofu-bind' | 'findings-blocked'; detail: string; at: Timestamp }
+  | { kind: 'attention-raised'; id: string; category: 'tofu-bind' | 'findings-blocked' | 'ballot-stalled' | 'round-cap'; detail: string; at: Timestamp }
   /** 1B-c: a finding is filed against a draft revision or a rival proposal
    * (converging only). text is PUBLIC post-reveal — the durable carrier the
    * artifacts findingTexts entry derives from; bytes/textHash are broker-
@@ -76,6 +76,24 @@ export type Event =
   /** 1B-c: an electorate member rejoined a blocked convergence — blocked ->
    * converging, seating the rejoiner (or the round-completion starter). */
   | { kind: 'convergence-resumed'; holder: AgentId; at: Timestamp }
+  /** 1C (§1c): the question is called — evolve opens the ballot on the
+   * converging arm, snapshotting the electorate and freezing the revision
+   * hash + validated task block. */
+  | { kind: 'question-called'; revision: number; revisionHash: string; electorate: readonly AgentId[]; taskBlock: import('./types.ts').PlanTaskBlock; calledBy: AgentId; at: Timestamp }
+  /** 1C: one vote recorded on the open ballot. */
+  | { kind: 'vote-cast'; voter: AgentId; approve: boolean; reasons?: string; at: Timestamp }
+  /** 1C: the ballot closes without passing — 'rejected' (a reject vote) or
+   * 'voided' (a draft amendment while open). evolve clears the ballot. */
+  | { kind: 'ballot-closed'; outcome: 'rejected' | 'voided'; at: Timestamp }
+  /** 1C: the FINAL approving vote — atomically paired with a phase-transition
+   * (planning -> provisioning, outcome ballot-passed). evolve stores the
+   * frozen plan on the session BEFORE phase-transition drops planning. */
+  | { kind: 'ballot-passed'; revision: number; hash: string; taskBlock: import('./types.ts').PlanTaskBlock; at: Timestamp }
+  /** 1C: a rejected ballot's reasons become the next round's mandatory
+   * agenda (evolve appends items with addressed:false). */
+  | { kind: 'agenda-recorded'; items: readonly { id: string; reason: string; from: AgentId; at: Timestamp }[]; at: Timestamp }
+  /** 1C: an agenda item is marked addressed (optionally linking a finding). */
+  | { kind: 'agenda-addressed'; agendaId: string; findingId?: string; note?: string; at: Timestamp }
   | { kind: 'attention-cleared'; id: string; at: Timestamp }
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
   | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client' | 'broker'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }

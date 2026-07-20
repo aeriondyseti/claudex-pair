@@ -96,7 +96,12 @@ export const AGENT_CREDENTIAL_PATTERN = /^[0-9a-f]{64}$/;
  * answered findings can no longer progress. */
 export type AttentionItem = {
   readonly id: string;
-  readonly category: 'tofu-bind' | 'findings-blocked';
+  /** 1C adds 'ballot-stalled' (a ballot-electorate member left/was kicked
+   * while a ballot was open — unanimity cannot complete without a rejoin,
+   * a vote, or a user force) and 'round-cap' (a ballot closed rejected at
+   * or beyond ROUND_CAP — the convergence is livelocked; the human must
+   * arbitrate, re-scope, or force the phase). */
+  readonly category: 'tofu-bind' | 'findings-blocked' | 'ballot-stalled' | 'round-cap';
   readonly detail: string;
   readonly at: Timestamp;
 };
@@ -128,6 +133,12 @@ export const FINDING_TEXT_MAX = 4_096;
 export const FINDINGS_MAX = 128;
 export const REASONS_MAX = 16;
 export const FINDINGS_TEXT_TOTAL_MAX = 2_097_152;
+
+/** 1C: the ballot livelock guard (PEER-MODEL §1c). A ballot that closes
+ * rejected at or beyond this many completed rotation rounds pages the human
+ * (attention category 'round-cap'); call-question itself is never blocked by
+ * the cap — the cap PAGES, it never auto-acts. */
+export const ROUND_CAP = 3;
 
 /** 1B text grammar: NUL and C0/C1 controls are rejected EXCEPT \n \t \r
  * (CR accepted verbatim, no normalization — Windows CRLF passes; rev 4 #4).
@@ -189,7 +200,7 @@ export type PlanningState =
       readonly abstained: readonly AgentId[];
       readonly deadlineAt?: Timestamp;
     }
-  | ({ readonly substate: 'converging'; readonly rotation: Rotation } & ConvergenceCommon)
+  | ({ readonly substate: 'converging'; readonly rotation: Rotation; readonly ballot?: Ballot } & ConvergenceCommon)
   | ({ readonly substate: 'convergence-blocked'; readonly rotation: BlockedRotation } & ConvergenceCommon)
   | { readonly substate: 'balloting' };
 
@@ -232,11 +243,76 @@ export type Finding = {
   readonly history: readonly FindingHistoryEntry[];
 };
 
+/** 1C (§1d): the machine-readable normative task block — the SECOND coupled
+ * part of the draft (the first is the prose design). The broker extracts it
+ * from the draft body's first ```json fence at call-question time and pure
+ * decide validates it (validatePlanTaskBlock). A production task may not set
+ * `merges` (only 'assist' tasks may); deps reference existing task ids with
+ * no self-reference and no cycles. */
+export type PlanTask = {
+  readonly id: string;
+  readonly title: string;
+  readonly class: 'production' | 'assist';
+  readonly merges?: boolean;
+  readonly description: string;
+  readonly acceptance: readonly string[];
+  readonly deps: readonly string[];
+  readonly affinity?: readonly string[];
+  readonly size?: 'S' | 'M' | 'L';
+};
+export type PlanTaskBlock = {
+  readonly plan: {
+    readonly wip_cap: number;
+    readonly verification: {
+      readonly fast_gate: string;
+      readonly full_suite?: string;
+      readonly cadence?: string;
+    };
+  };
+  readonly tasks: readonly PlanTask[];
+};
+
+/** 1C (§1c): the open vote. Votes bind to the draft revision HASH frozen at
+ * call time; the electorate is the rotation electorate snapshotted at the
+ * call (post-call joins/leaves never alter it — fixed-electorate ruling).
+ * A reject closes the ballot immediately (unanimity impossible); a draft
+ * amendment voids it. Lives ONLY on the converging arm — entering blocked
+ * voids any open ballot. */
+export type Ballot = {
+  readonly revisionHash: string;
+  readonly revision: number;
+  readonly electorate: readonly AgentId[];
+  readonly votes: Readonly<Record<AgentId, { readonly vote: 'approve' } | { readonly vote: 'reject'; readonly reasons: string }>>;
+  readonly calledBy: AgentId;
+  readonly at: Timestamp;
+  readonly taskBlock: PlanTaskBlock;
+};
+
+/** 1C: a rejected ballot's reasons become the MANDATORY agenda of the next
+ * round — call-question is refused ('agenda-unaddressed') until every item
+ * is addressed (address-agenda). Deterministic, auditable. Lives on
+ * ConvergenceCommon so it survives a halt/resume (blocked -> converging). */
+export type AgendaItem = {
+  readonly id: string;
+  readonly reason: string;
+  readonly from: AgentId;
+  readonly at: Timestamp;
+  readonly addressed: boolean;
+};
+
+/** 1C: the frozen plan retained on the peer session after a passing ballot
+ * (the paired phase-transition drops the planning substate; this persists as
+ * a top-level PeerSession field). */
+export type FrozenPlan = { readonly revision: number; readonly hash: string; readonly taskBlock: PlanTaskBlock; readonly at: Timestamp };
+
 export type ConvergenceCommon = {
   readonly barrier: BarrierFact;
   readonly draft: { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp };
   readonly revisionLog: readonly { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp }[];
   readonly findings: Readonly<Record<string, Finding>>;
+  /** 1C: the next-round mandatory agenda (empty until a ballot closes
+   * rejected). Carried through convergence-halted/resumed. */
+  readonly agenda: readonly AgendaItem[];
 };
 
 type SessionBase = {
@@ -282,6 +358,10 @@ export type PeerSession = SessionBase & {
    * invitee stays here (authorized pending observer). */
   readonly authorized: readonly AgentId[];
   readonly planning?: PlanningState;
+  /** 1C: the plan frozen by a passing ballot — set by evolve on ballot-passed
+   * and retained after the paired phase-transition drops `planning`. Absent
+   * until a ballot passes (or forever if the phase is forced). */
+  readonly plan?: FrozenPlan;
   /** Durable human-attention queue (peer 1A; codex guardrail: never
    * depend on a live watch connection for visibility). */
   readonly attention: readonly AttentionItem[];

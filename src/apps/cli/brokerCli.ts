@@ -203,6 +203,50 @@ export async function runBrokerCli(
           : 'Turn yielded.');
       return 0;
     }
+    if (command === 'call-question') {
+      // 1C (§1c): call the question on the current draft. Any electorate
+      // member; the broker extracts + validates the normative task block from
+      // the current draft body (no block payload crosses the wire).
+      const as = required(flags, 'as', 'call-question requires -As <your own agent name>').toLowerCase();
+      const r = await execute(gateway, as, { kind: 'call-question' });
+      const called = r.events.find((e) => e.kind === 'question-called');
+      out(called?.kind === 'question-called'
+        ? `Question called on revision ${called.revision} (hash ${called.revisionHash}). Electorate: ${called.electorate.join(', ')}. Cast votes with: pair vote -As <you> -Approve|-Reject -RevisionHash ${called.revisionHash}`
+        : 'Question called.');
+      return 0;
+    }
+    if (command === 'vote') {
+      // 1C (§1c): cast a ballot vote. A reject MUST carry -Reasons (they
+      // become the next round's mandatory agenda). -RevisionHash pins the
+      // ballot you read.
+      const as = required(flags, 'as', 'vote requires -As <your own agent name>').toLowerCase();
+      const approve = has(flags, 'approve');
+      const reject = has(flags, 'reject');
+      if (approve === reject) throw new Error('vote requires exactly one of -Approve or -Reject');
+      const revisionHash = required(flags, 'revisionhash', 'vote requires -RevisionHash <hash> (the revision you voted on)');
+      const reasons = str(flags, 'reasons');
+      const r = await execute(gateway, as, { kind: 'vote', approve, revisionHash, ...(reasons ? { reasons } : {}) });
+      const passed = r.events.some((e) => e.kind === 'ballot-passed');
+      const closed = r.events.find((e) => e.kind === 'ballot-closed');
+      out(passed
+        ? 'Vote recorded — the ballot PASSED unanimously; the phase advanced to provisioning.'
+        : closed?.kind === 'ballot-closed' && closed.outcome === 'rejected'
+          ? 'Vote recorded — your reject CLOSED the ballot; your reasons are now the next round\'s mandatory agenda.'
+          : 'Vote recorded; the ballot remains open until every electorate member votes.');
+      return 0;
+    }
+    if (command === 'address-agenda') {
+      // 1C (§1c): mark a next-round agenda item addressed (any electorate
+      // member), optionally linking the finding that addressed it.
+      const as = required(flags, 'as', 'address-agenda requires -As <your own agent name>').toLowerCase();
+      const agendaId = required(flags, 'id', 'address-agenda requires -Id <agendaId>');
+      const finding = str(flags, 'finding');
+      const note = str(flags, 'note');
+      const r = await execute(gateway, as, { kind: 'address-agenda', agendaId, ...(finding ? { findingId: finding } : {}), ...(note ? { note } : {}) });
+      const ev = r.events.find((e) => e.kind === 'agenda-addressed');
+      out(ev?.kind === 'agenda-addressed' ? `Agenda item ${agendaId} marked addressed.` : 'Agenda item addressed.');
+      return 0;
+    }
     if (command === 'artifacts') {
       if (gateway.planningArtifacts === undefined) throw new Error('artifacts requires the broker gateway.');
       renderArtifacts(await gateway.planningArtifacts());
@@ -344,9 +388,17 @@ function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
   if (s.session.topology === 'peer') {
     const planning = s.session.planning;
     if (planning?.substate === 'admitting') out(`Admitting: ${planning.admitted.length}/${planning.authorizedExpected.length} attached (${planning.authorizedExpected.filter((a) => !planning.admitted.includes(a)).join(', ') || 'none'} outstanding)${planning.deadlineAt ? `; deadline ${planning.deadlineAt}` : ''}`);
-    else if (planning?.substate === 'converging') { out(`Phase:     ${s.session.phase} (converging)   Turn: ${planning.rotation.holder} (round ${planning.rotation.round})`); out(`Findings:  ${renderFindingsSummary(planning.findings)}`); }
+    else if (planning?.substate === 'converging') {
+      out(`Phase:     ${s.session.phase} (converging)   Turn: ${planning.rotation.holder} (round ${planning.rotation.round})`);
+      out(`Findings:  ${renderFindingsSummary(planning.findings)}`);
+      // 1C: open ballot + unaddressed agenda visibility.
+      if (planning.ballot) out(`Ballot:    OPEN on revision ${planning.ballot.revision} (${Object.keys(planning.ballot.votes).length}/${planning.ballot.electorate.length} voted; hash ${planning.ballot.revisionHash})`);
+      const unaddressed = planning.agenda.filter((a) => !a.addressed).length;
+      if (planning.agenda.length) out(`Agenda:    ${unaddressed} unaddressed / ${planning.agenda.length} total (call-question is blocked until all are addressed)`);
+    }
     else if (planning?.substate === 'convergence-blocked') { out(`Phase:     ${s.session.phase}   CONVERGENCE BLOCKED (no live member in the rotation — a member must rejoin, or the user forces the phase)`); out(`Findings:  ${renderFindingsSummary(planning.findings)}`); }
     else out(`Phase:     ${s.session.phase}${planning ? ` (${planning.substate})` : ''}`);
+    if (s.session.plan) out(`Plan:      FROZEN at revision ${s.session.plan.revision} (hash ${s.session.plan.hash}) — ${s.session.plan.taskBlock.tasks.length} tasks`);
     for (const item of s.session.attention) out(`ATTENTION [${item.id}] (${item.category}) ${item.detail} — clear with /clear-attention ${item.id} (${item.at})`);
   } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); if (s.session.topology !== 'peer') out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }

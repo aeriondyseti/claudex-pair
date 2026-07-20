@@ -12,6 +12,12 @@ export type CommandMeta = {
    * commands (propose, draft-amend) — pure decide never computes crypto. */
   readonly contentHash?: string;
   readonly contentBytes?: number;
+  /** 1C: broker-stamped CURRENT draft body for call-question (transport-
+   * boundary stamping like contentHash — the broker reads
+   * journal.planningArtifacts().draft.body so a caller cannot forge the
+   * normative task block). Pure decide parses/validates it (JSON.parse is
+   * pure). */
+  readonly draftBody?: string;
 };
 
 export type Command =
@@ -83,6 +89,18 @@ export type Command =
   | { kind: 'amend-critique'; findingId: string; action: 'withdraw' | 'set-agreement'; agreement?: import('./types.ts').Finding['agreement']; text?: string }
   /** 1B-c: the convergence holder passes the turn (must-respond gate first). */
   | { kind: 'yield-turn' }
+  /** 1C (§1c): call the question on the current draft — any electorate
+   * member, converging, no open ballot. Carries NO block payload: the
+   * broker stamps meta.draftBody from the journal and decide validates the
+   * normative task block from it (a caller cannot forge it). */
+  | { kind: 'call-question' }
+  /** 1C: cast a ballot vote. approve+no reasons, or reject+non-blank reasons
+   * ('vote-reject-without-reason'). revisionHash must equal the ballot's
+   * frozen hash ('stale-ballot-revision'). */
+  | { kind: 'vote'; approve: boolean; reasons?: string; revisionHash: string }
+  /** 1C: mark a next-round agenda item addressed (any electorate member),
+   * optionally linking the finding that addressed it. */
+  | { kind: 'address-agenda'; agendaId: string; findingId?: string; note?: string }
   /** Round 2 #8: complete a durable attention item (loud TOFU etc.) —
    * without this the instruction can never be satisfied. */
   | { kind: 'user-clear-attention'; id: string; groupId: string; noticeIdBase: string }
