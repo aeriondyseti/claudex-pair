@@ -316,6 +316,71 @@ describe('subscription reconnect', () => {
     await subscription.close();
   }, 15_000);
 
+  test('D2 late catch: op rejects AFTER the onClose reconnect already swapped the client — retry rides the winner, exactly one rediscovery', async () => {
+    // The real wire cannot reach this window deterministically: IpcClient
+    // rejects pending requests BEFORE notifying close listeners, so a socket
+    // death always lands the catch before the swap. The race exists for late
+    // rejections from other sources (write callbacks, runtime timing), so it
+    // is pinned here at the connector seam with scripted clients.
+    type Scripted = {
+      client: IpcClient; fireClose: () => void; acks: string[];
+      subscribes: () => number; rejectDeferredAck: (e: Error) => void;
+    };
+    const scripted = (deferFirstAck: boolean): Scripted => {
+      const closes = new Set<(e: Error) => void>();
+      const acks: string[] = [];
+      let subs = 0;
+      let deferredReject: ((e: Error) => void) | undefined;
+      const stub = {
+        clientId: 'late-client', connected: true,
+        onDelivery: () => () => {}, onObserverPush: () => () => {},
+        onClose: (l: (e: Error) => void) => { closes.add(l); return () => closes.delete(l); },
+        subscribe: async () => { subs += 1; return { reqId: 'r', ok: true }; },
+        ack: (id: string) => {
+          if (deferFirstAck && !deferredReject) return new Promise((_, reject) => { deferredReject = reject as (e: Error) => void; });
+          acks.push(id); return Promise.resolve({ reqId: 'r', ok: true });
+        },
+        extend: async () => ({ reqId: 'r', ok: true }),
+        close: () => {},
+      };
+      return {
+        client: stub as unknown as IpcClient,
+        fireClose: () => { for (const l of [...closes]) l(new Error('IPC connection closed')); },
+        acks, subscribes: () => subs,
+        rejectDeferredAck: (e) => { if (!deferredReject) throw new Error('no deferred ack'); deferredReject(e); },
+      };
+    };
+
+    const clientA = scripted(true);   // first ack call hangs until the test rejects it
+    const clientB = scripted(false);
+    let rediscoveries = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'late-client',
+        connect: async () => clientA.client,
+        rediscover: async () => { rediscoveries += 1; return clientB.client; },
+      },
+      { maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    expect(clientA.subscribes()).toBe(1);
+
+    const acking = subscription.ack('m10:codex'); // op pinned to A, hanging
+    clientA.fireClose();                          // reconnect swaps to B while the op is still pending
+    const deadline = Date.now() + 2_000;
+    while (clientB.subscribes() < 1 && Date.now() < deadline) await Bun.sleep(5);
+    expect(clientB.subscribes()).toBe(1);
+    expect(rediscoveries).toBe(1);
+
+    clientA.rejectDeferredAck(new Error('IPC connection closed')); // the LATE catch: client !== attempted
+    await acking;
+    expect(clientB.acks).toEqual(['m10:codex']); // retried directly on the winner
+    expect(rediscoveries).toBe(1);               // no second cycle, no replacement churn
+    await subscription.close();
+  }, 15_000);
+
   test('D2: reconnect exhaustion surfaces the terminal error — the ack retry never redials a stale client', async () => {
     const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-ack-exhaust-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
@@ -325,11 +390,12 @@ describe('subscription reconnect', () => {
     });
     await serverA.listen();
 
+    let rediscoveries = 0;
     const gateway = new BrokerGateway(
       {
         clientId: 'exhaust-client',
         connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 13, clientId: 'exhaust-client' }),
-        rediscover: async () => { throw new Error('broker gone for good'); },
+        rediscover: async () => { rediscoveries += 1; throw new Error('broker gone for good'); },
       },
       { maxAttempts: 2, baseDelayMs: 5, maxDelayMs: 10 },
     );
@@ -345,6 +411,7 @@ describe('subscription reconnect', () => {
     // Pre-review-fix this surfaced a raw redial failure from the stale
     // client; the terminal reconnect error is the honest outcome.
     expect(caught?.message).toBe('broker gone for good');
+    expect(rediscoveries).toBe(2); // exactly maxAttempts — the ack's catch never starts a second bounded cycle
     await subscription.close();
   }, 15_000);
 

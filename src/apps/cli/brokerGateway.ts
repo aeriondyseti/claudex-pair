@@ -187,18 +187,28 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
      * cleanly. Protocol rejections (BrokerWireError) are never retried.
      */
     const withReconnectRetry = async (op: (c: IpcClient) => Promise<ResponseFrame>): Promise<void> => {
-      try { expectOk(await op(client)); return; }
+      const attempted = client; // pin the generation this attempt ran against
+      try { expectOk(await op(attempted)); return; }
       catch (error) {
         if (error instanceof BrokerWireError) throw error;
+        // A reconnect cycle already died — never start another (codex round 3).
+        if (terminalError) throw terminalError;
         // Post-close there is nothing to reconnect to — surface the failure.
         if (!active) throw error;
-        scheduleReconnect();
-        await reconnecting;
-        // Exhausted reconnects resolve `reconnecting` after queue.fail — a
-        // retry would redial the stale client (the exact D2 symptom).
-        // Surface the terminal reconnect error instead (codex review #2).
-        if (terminalError) throw terminalError;
-        if (!active) throw error;
+        if (client === attempted) {
+          // No replacement yet: join the in-flight reconnect or start exactly
+          // one. The client check and scheduleReconnect are in the same
+          // synchronous block, so a completing reconnect cannot interleave.
+          scheduleReconnect();
+          await reconnecting;
+          // Exhausted reconnects resolve `reconnecting` after queue.fail — a
+          // retry would redial the stale client (the exact D2 symptom).
+          if (terminalError) throw terminalError;
+          if (!active) throw error;
+        }
+        // Either the joined reconnect swapped the client, or a replacement had
+        // already won before the stale op rejected — retry on the winner
+        // without spending a second rediscovery.
         expectOk(await op(client));
       }
     };
