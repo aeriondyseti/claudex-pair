@@ -170,10 +170,30 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
 
     try { await attach(client); }
     catch (error) { queue.fail(error); throw error; }
+    /**
+     * D2 (2026-07-20): a transport failure mid-ack/extend must rediscover,
+     * never redial — IpcClient's endpoint is fixed at construction, so its
+     * implicit redial after a broker restart hits the DEAD epoch's pipe
+     * (`connect ENOENT ...-eN`), crashing the CLI after the message already
+     * printed and orphaning the delivery for redelivery. Recovery: run the
+     * standard reconnect (bounded backoff, lease rediscovery), then retry
+     * once on the swapped client. Broker-side ack is lease-agnostic and
+     * idempotent (broker/server.ts ack), so a post-restart ack closes
+     * cleanly. Protocol rejections (BrokerWireError) are never retried.
+     */
+    const withReconnectRetry = async (op: (c: IpcClient) => Promise<ResponseFrame>): Promise<void> => {
+      try { expectOk(await op(client)); return; }
+      catch (error) {
+        if (error instanceof BrokerWireError) throw error;
+        scheduleReconnect();
+        await reconnecting;
+        expectOk(await op(client));
+      }
+    };
     return {
       deliveries: queue,
-      ack: async (id) => { expectOk(await client.ack(id)); cursor = Math.max(cursor, sequences.get(id) ?? cursor); },
-      extend: async (id) => { expectOk(await client.extend(id)); },
+      ack: async (id) => { await withReconnectRetry((c) => c.ack(id)); cursor = Math.max(cursor, sequences.get(id) ?? cursor); },
+      extend: async (id) => { await withReconnectRetry((c) => c.extend(id)); },
       close: async () => { active = false; cancelBackoff?.(); offDelivery(); offClose(); queue.close(); await reconnecting?.catch(() => {}); },
     };
   }

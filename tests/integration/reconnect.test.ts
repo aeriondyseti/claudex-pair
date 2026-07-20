@@ -249,6 +249,57 @@ describe('subscription reconnect', () => {
     expect(rediscoveries).toBe(0); // no background retries were orphaned
   }, 15_000);
 
+  test('D2: ack across a broker restart rediscovers — never redials the dead endpoint, delivery closes on the new broker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-ack-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpointA = endpointFor(root, 11);
+    const endpointB = endpointFor(root, 12);
+
+    // Broker A delivers m7 then dies before the ack arrives.
+    const serverA = server(endpointA, 11, async (_frame, send) => {
+      await send({ kind: 'delivery', deliverySeq: 7, deliveryId: 'm7:codex', message: message('m7') });
+    });
+    await serverA.listen();
+
+    // Broker B (post-restart): records acks; redelivers m7 on subscribe
+    // (open/unacked-beats-cursor), exactly like a real recovered journal.
+    const acksB: string[] = [];
+    const serverB = new IpcServer({
+      endpoint: endpointB, token: 'token', epoch: 12,
+      handler: async (frame, connection) => {
+        if (frame.kind === 'subscribe') void connection.send({ kind: 'delivery', deliverySeq: 7, deliveryId: 'm7:codex', message: message('m7') } as Parameters<typeof connection.send>[0]);
+        if (frame.kind === 'ack') acksB.push(frame.deliveryId);
+        return { reqId: (frame as { reqId: string }).reqId, ok: true };
+      },
+    });
+    cleanups.push(() => serverB.close().catch(() => undefined));
+
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'ack-client',
+        connect: async () => new IpcClient({ endpoint: endpointA, token: 'token', epoch: 11, clientId: 'ack-client' }),
+        rediscover: async () => {
+          await serverB.listen().catch(() => undefined); // respawned at the new epoch
+          return new IpcClient({ endpoint: endpointB, token: 'token', epoch: 12, clientId: 'ack-client' });
+        },
+      },
+      { maxAttempts: 5, baseDelayMs: 10, maxDelayMs: 40 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    const first = (await subscription.deliveries[Symbol.asyncIterator]().next()).value!;
+    expect(first.deliveryId).toBe('m7:codex');
+
+    await serverA.close(); // broker dies between print and ack (the bekf8jfk7 shape)
+    // Pre-fix: IpcClient redialed fixed endpointA -> connect ENOENT -> CLI
+    // crash after printing, delivery orphaned for redelivery. Post-fix: the
+    // ack reconnects through rediscovery and closes the delivery on B.
+    await subscription.ack('m7:codex');
+    expect(acksB).toEqual(['m7:codex']);
+    await subscription.close();
+  }, 15_000);
+
   test('close() during a reconnect handshake: nothing is published and the replacement socket is closed', async () => {
     const root = await mkdtemp(join(tmpdir(), 'claudex-reconnect-midhs-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

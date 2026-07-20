@@ -91,6 +91,13 @@ The CLI is written in TypeScript and is verb-for-verb compatible with the origin
   file explorer. Sessions support any agent list (`-Agents`); the conversation
   is single-turn-token, but the driver can issue **work grants**
   (`pair grant`) so several agents edit in parallel within agreed scopes —
-  see "Work grants" in [PROTOCOL.md](PROTOCOL.md). Richer topologies and the
-  coordination broker are designed in
-  [docs/ENHANCEMENTS.md](docs/ENHANCEMENTS.md) (M1–M6) and not yet built.
+  see "Work grants" in [PROTOCOL.md](PROTOCOL.md). The coordination broker
+  is the default runtime (see [docs/BROKER-SPEC.md](docs/BROKER-SPEC.md));
+  richer topologies are designed in [docs/ENHANCEMENTS.md](docs/ENHANCEMENTS.md)
+  (M1–M6) and [docs/PEER-MODEL.md](docs/PEER-MODEL.md).
+- Broker daemons spawned on demand from *inside a sandboxed agent command*
+  (e.g. Codex's Windows sandbox) die with that command — sandbox job objects
+  defeat `detached:true`. This is harmless (restarts are transparent: waits
+  reconnect with bounded backoff, acks rediscover, epochs advance) but noisy;
+  for a maximally stable broker, run one `pair` command from your own
+  terminal so the daemon spawns outside any sandbox.

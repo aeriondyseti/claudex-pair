@@ -12,9 +12,17 @@ import { has, num, str } from './args.ts';
 type Flags = Map<string, string | true>;
 const out = (text: string) => process.stdout.write(`${text}\n`);
 
-export async function runBrokerCli(command: string, flags: Flags, positionals: string[], root: string): Promise<number | undefined> {
+/** Structural gateway surface the CLI needs — lets tests inject a fake
+ * (codex regression seam, 20260720-101911-628). BrokerGateway satisfies it. */
+export type CliGateway = import('@app/ports/gateway.ts').ProtocolGateway &
+  import('@app/ports/gateway.ts').BrokerControl & { readonly clientId: string };
+
+export async function runBrokerCli(
+  command: string, flags: Flags, positionals: string[], root: string,
+  gatewayFactory: (root: string) => CliGateway = BrokerGateway.forRoot,
+): Promise<number | undefined> {
   if (command === 'watch' || command === 'help') return undefined;
-  const gateway = BrokerGateway.forRoot(root);
+  const gateway = gatewayFactory(root);
   try {
     if (command === 'broker') {
       const action = (positionals[0] ?? 'status').toLowerCase();
@@ -22,12 +30,17 @@ export async function runBrokerCli(command: string, flags: Flags, positionals: s
       if (action === 'stop') { await gateway.stop(); out('Broker stopping cleanly.'); return 0; }
       throw new Error("pair broker requires 'status' or 'stop'");
     }
-    if (command === 'ask') { flags.set('type', 'ask'); flags.set('from', str(flags, 'from') ?? str(flags, 'as') ?? ''); return runBrokerCli('send', flags, positionals, root); }
+    // INVARIANT (root-caused 2026-07-20): every promise returned from inside
+    // this try MUST be `return await`ed. A bare `return <promise>` runs the
+    // finally's gateway.close() CONCURRENTLY with the returned work, which
+    // destroys the socket under a just-armed fused/standalone wait
+    // ('IPC connection closed', codex finding 20260720-101816-882).
+    if (command === 'ask') { flags.set('type', 'ask'); flags.set('from', str(flags, 'from') ?? str(flags, 'as') ?? ''); return await runBrokerCli('send', flags, positionals, root, gatewayFactory); }
     if (command === 'propose-end') {
       required(flags, 'from', 'propose-end requires -From <you>');
       const status = await gateway.status();
       flags.set('to', status.session.driver); flags.set('type', 'propose-end'); flags.set('turn', 'keep');
-      return runBrokerCli('send', flags, positionals, root);
+      return await runBrokerCli('send', flags, positionals, root, gatewayFactory);
     }
     if (command === 'init') {
       const task = required(flags, 'task', "init requires -Task '<what the agents are building>'");
@@ -53,9 +66,9 @@ export async function runBrokerCli(command: string, flags: Flags, positionals: s
       const fuse = turn === 'pass' && type !== 'done' && !has(flags, 'nowait') && r.session.status === 'active';
       if (!fuse) { if (turn === 'pass' && r.session.status === 'active') out(`You handed over the turn. Now block on: pair wait -As ${from}`); return 0; }
       out('You handed over the turn. Waiting for the reply (-NoWait skips the fused wait).');
-      return waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true);
+      return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true);
     }
-    if (command === 'wait') return waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false);
+    if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false);
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') { const messages = await gateway.log(num(flags, 'tail', 10)); if (!messages.length) out('No archived messages yet.'); for (const m of messages) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`); return 0; }
     if (command === 'grants') { const grants = [...await gateway.grants()].sort((a, b) => a.id.localeCompare(b.id)); if (has(flags, 'json')) out(JSON.stringify(grants, null, 2)); else if (!grants.length) out('No grants in this session.'); else for (const g of grants) { out(`${g.id}  [${g.state}]  ${g.issuer} -> ${g.assignee}  ${g.scope.mode === 'worktree' ? `worktree ${g.scope.worktree}` : `files: ${g.scope.files.join(', ')}`}`); out(`    task: ${g.task}${g.result ? `\n    result: ${g.result}` : ''}`); } return 0; }
@@ -95,9 +108,9 @@ export async function runBrokerCli(command: string, flags: Flags, positionals: s
   } finally { await gateway.close(); }
 }
 
-async function execute(gateway: BrokerGateway, as: AgentId, command: Command): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() } }); }
+async function execute(gateway: CliGateway, as: AgentId, command: Command): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() } }); }
 
-async function waitBroker(gateway: BrokerGateway, as: AgentId, timeoutSec: number, fused: boolean): Promise<number> {
+async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, fused: boolean): Promise<number> {
   const status = await gateway.status();
   if (!status.session.agents.includes(as)) throw new Error(`'${as}' is not a participant in this session`);
   const subscription = await gateway.subscribe(as, 0);
