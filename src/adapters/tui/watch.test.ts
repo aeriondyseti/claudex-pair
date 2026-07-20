@@ -190,4 +190,30 @@ describe('watch renderer', () => {
     expect(credentialError).toContain('cannot silently regenerate');
     expect(credentialError).not.toContain('to:*');
   });
+
+  test('renders both credential-error guidance variants: corrupt local store and foreign binding (close-out #2)', () => {
+    // Corrupt/unreadable local store — the local bootstrap path.
+    const corruptLocal = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({
+        channel: 'credential-error',
+        channelDetail: 'user credential store unreadable (DPAPI decrypt failed) — repair or delete .pair credential state',
+      }),
+    });
+    expect(corruptLocal).toContain('USER CREDENTIAL ERROR: user credential store unreadable');
+    expect(corruptLocal).toContain('cannot silently regenerate');
+    expect(corruptLocal).not.toContain('to:*'); // no input affordance in error state
+
+    // Foreign binding — the broker-side user-auth-failed degrade path.
+    const foreignBinding = renderWatchFrame({
+      model: model(), width: 100, tail: 10,
+      composer: composer({
+        channel: 'credential-error',
+        channelDetail: 'user channel is bound to another client. This pane is read-only.',
+      }),
+    });
+    expect(foreignBinding).toContain('USER CREDENTIAL ERROR: user channel is bound to another client');
+    expect(foreignBinding).toContain('This pane is read-only.');
+    expect(foreignBinding).not.toContain('to:*');
+  });
 });

@@ -126,9 +126,11 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
     if (attaching || closed) return;
     attaching = true;
     void (async () => {
+      let degraded = false; // auth-failed on the attempt that succeeded
       try {
         for (;;) {
           if (closed) return;
+          degraded = false;
           try {
             // U1: attach authenticated when a token is present; an auth
             // failure (foreign binding) degrades LOUDLY to read-only.
@@ -138,6 +140,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
                 next = await gateway.userAttach(options.userToken, spawnAllowed);
               } catch (error) {
                 if (error instanceof BrokerWireError && error.code === 'user-auth-failed') {
+                  degraded = true;
                   queue.push({ kind: 'user-channel', state: 'credential-error', detail: `${error.message} This pane is read-only.` });
                   next = await gateway.observe(spawnAllowed);
                 } else throw error;
@@ -166,9 +169,15 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           }
         }
         queue.push(attachEvent(session!.snapshot, session!.snapshot.broker.endpoint, systemClock.now()));
-        if (session!.snapshot.userChannel) {
+        if (degraded || options.credentialError) {
+          // A credential-error event is already queued (auth-degrade above,
+          // or the local bootstrap error pushed before the first attach) and
+          // the reducer applies it as deferred state at attach — pushing
+          // registered/unregistered here would overwrite that loud guidance
+          // (close-out #2).
+        } else if (session!.snapshot.userChannel) {
           queue.push({ kind: 'user-channel', state: session!.snapshot.userChannel.registered ? 'registered' : 'unregistered' });
-        } else if (!options.userToken && !options.credentialError) {
+        } else if (!options.userToken) {
           queue.push({ kind: 'user-channel', state: 'unavailable' });
         }
         // Pump generation guards a torn-down session's late callbacks: only

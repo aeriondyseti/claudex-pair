@@ -90,6 +90,11 @@ export type WatchTuiState = {
   /** U1 slice 3 — composer state (reducer-owned; undefined until the user
    * channel is available on this host: broker mode + TTY only). */
   readonly composer: ComposerState | undefined;
+  /** U1 slice-3 close-out #2 (SEAM ADDITION, flagged for lane ratification):
+   * a user-channel event arriving BEFORE the first broker attach is deferred
+   * here — never dropped, never applied to a non-broker projection — and the
+   * next attach applies the latest deferred state. `unavailable` clears it. */
+  readonly pendingChannel: { readonly channel: 'unregistered' | 'registered' | 'credential-error'; readonly detail?: string } | undefined;
 };
 
 /** Composer/interaction state per U1-SLICE3-DESIGN.md (approved). */
@@ -122,5 +127,6 @@ export function initialWatchState(options: { width: number; tail: number; now: s
     entries: new Map(),
     liveness: undefined,
     composer: undefined,
+    pendingChannel: undefined,
   };
 }

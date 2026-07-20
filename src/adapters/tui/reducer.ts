@@ -78,7 +78,15 @@ function attach(state: WatchTuiState, snapshot: ObserverSnapshotDto, endpoint: s
     liveness: snapshot.liveness,
     composer: normalizeComposer(state.composer, snapshot.session.agents, entries, state.tail),
   };
-  return step(next, snapshot.session.status === 'active' ? ['render'] : ['render', 'exit']);
+  const effects: readonly WatchEffect[] = snapshot.session.status === 'active' ? ['render'] : ['render', 'exit'];
+  // Apply a deferred pre-attach user-channel event (close-out #2): the model
+  // is broker-sourced now, so the stash gains composer authority here — and
+  // only here. Attach's own effects win (render / render+exit ordering).
+  if (state.pendingChannel) {
+    const deferred = userChannel({ ...next, pendingChannel: undefined }, state.pendingChannel.channel, state.pendingChannel.detail);
+    return step(deferred.state, effects);
+  }
+  return step(next, effects);
 }
 
 function activity(state: WatchTuiState, value: WatchActivity): WatchStep {
@@ -198,11 +206,15 @@ function userChannel(
   detail?: string,
 ): WatchStep {
   if (channel === 'unavailable') {
-    return state.composer ? step({ ...state, composer: undefined }, state.model ? ['render'] : []) : step(state);
+    if (!state.composer && !state.pendingChannel) return step(state);
+    return step({ ...state, composer: undefined, pendingChannel: undefined }, state.model && state.composer ? ['render'] : []);
   }
   // Defense in depth: fs diagnostic projections can never acquire input
-  // authority even if a host accidentally queues a user-channel event.
-  if (!isBroker(state)) return step(state);
+  // authority — but the event is DEFERRED, not dropped (close-out #2): the
+  // stash is inert until a broker attach applies the latest deferred state.
+  if (!isBroker(state)) {
+    return step({ ...state, pendingChannel: { channel, ...(detail === undefined ? {} : { detail }) } });
+  }
   const previous = state.composer;
   const composer: ComposerState = {
     channel,
@@ -213,7 +225,7 @@ function userChannel(
     filter: previous?.filter ?? 'all',
     ...(previous?.pending === undefined ? {} : { pending: previous.pending }),
   };
-  return rendered(state, composer);
+  return rendered({ ...state, pendingChannel: undefined }, composer);
 }
 
 function activityComposer(

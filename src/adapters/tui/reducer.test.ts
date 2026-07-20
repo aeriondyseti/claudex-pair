@@ -267,6 +267,75 @@ describe('watch reducer composer', () => {
   });
 });
 
+describe('deferred pre-attach user-channel events (close-out #2)', () => {
+  const initial = () => initialWatchState({ width: 100, tail: 10, now: '2026-07-14 19:01:00' });
+
+  test('local bootstrap credential-error before attach is deferred, then applied by the attach (corrupt-local path)', () => {
+    let state = initial();
+    ({ state } = reduceWatch(state, {
+      kind: 'user-channel', state: 'credential-error',
+      detail: 'user credential store unreadable (DPAPI decrypt failed) — repair or delete it; it cannot silently regenerate',
+    }));
+    expect(state.composer).toBeUndefined(); // deferral is not authority
+    expect(state.pendingChannel).toMatchObject({ channel: 'credential-error' });
+
+    const step = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'now' });
+    expect(step.effects).toEqual(['render']);
+    expect(step.state.composer).toMatchObject({ channel: 'credential-error' });
+    expect(step.state.composer?.channelDetail).toContain('cannot silently regenerate');
+    expect(step.state.pendingChannel).toBeUndefined(); // applied exactly once
+  });
+
+  test('auth-degrade (foreign binding) before attach is deferred and applied; input stays read-only in effect terms', () => {
+    let state = initial();
+    ({ state } = reduceWatch(state, {
+      kind: 'user-channel', state: 'credential-error',
+      detail: 'user channel is bound to another client. This pane is read-only.',
+    }));
+    const step = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'now' });
+    expect(step.state.composer).toMatchObject({ channel: 'credential-error' });
+    expect(step.state.composer?.channelDetail).toContain('bound to another client');
+    // credential-error composer has no send path: submit is a no-op
+    const submit = reduceWatch(step.state, { kind: 'key', key: 'submit', reqId: 'r1' });
+    expect(submit.effects).toEqual([]);
+    expect(submit.state.composer?.pending).toBeUndefined();
+  });
+
+  test('the latest deferred event wins and unavailable clears the stash', () => {
+    let state = initial();
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'credential-error', detail: 'stale' }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' })); // later event replaces the stash
+    expect(state.pendingChannel).toMatchObject({ channel: 'registered' });
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'unavailable' }));
+    expect(state.pendingChannel).toBeUndefined();
+    const step = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'now' });
+    expect(step.state.composer).toBeUndefined(); // nothing left to apply
+  });
+
+  test('fs replace-model never applies the stash; a later broker attach does', () => {
+    let state = initial();
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'credential-error', detail: 'DPAPI failed' }));
+    const fsModel: WatchViewModel = {
+      source: { kind: 'fs-diagnostic', reason: 'broker-unreachable' }, session: active,
+      navigators: [], openGrants: [], transcript: [], presence: [], now: 'now', notices: [],
+    };
+    ({ state } = reduceWatch(state, { kind: 'replace-model', model: fsModel }));
+    expect(state.composer).toBeUndefined(); // fs never gains composer authority
+    expect(state.pendingChannel).toMatchObject({ channel: 'credential-error' }); // but the stash survives
+    const step = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'now' });
+    expect(step.state.composer).toMatchObject({ channel: 'credential-error', channelDetail: 'DPAPI failed' });
+  });
+
+  test('a post-attach user-channel event clears any stale stash', () => {
+    let state = initial();
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'credential-error', detail: 'early' }));
+    let step = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'now' });
+    step = reduceWatch(step.state, { kind: 'user-channel', state: 'registered' });
+    expect(step.state.composer).toMatchObject({ channel: 'registered' });
+    expect(step.state.pendingChannel).toBeUndefined();
+  });
+});
+
 describe('watch frame equality gate', () => {
   test('emits only changed frames', () => {
     const state = attached();
