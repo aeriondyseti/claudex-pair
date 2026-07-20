@@ -5,7 +5,7 @@ import { resolveRecipient } from '@core/queries.ts';
 import type { AgentId, MessageType, TurnMode } from '@core/types.ts';
 import type { ExecuteOutcome, StatusDto } from '@app/ports/gateway.ts';
 import { systemClock, systemIds } from '@adapters/clock/index.ts';
-import { BrokerGateway } from './brokerGateway.ts';
+import { BrokerGateway, BrokerWireError } from './brokerGateway.ts';
 import { nextDelivery, printDeliveryThenAck } from './brokerWait.ts';
 import { has, num, str } from './args.ts';
 
@@ -115,11 +115,26 @@ async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, 
   if (!status.session.agents.includes(as)) throw new Error(`'${as}' is not a participant in this session`);
   const subscription = await gateway.subscribe(as, 0);
   try {
+    return await waitOnSubscription(gateway, subscription, as, timeoutSec, fused);
+  } catch (error) {
+    // Slice 4 (design REV 6): a user kick terminates this wait — terminal
+    // wording, exit 0, NO re-arm hint, never reconnect churn.
+    if (error instanceof BrokerWireError && error.code === 'removed-from-session') {
+      out('='.repeat(66));
+      out(`YOU WERE REMOVED FROM THE SESSION by the user. Stop all work immediately; do not re-arm this wait and do not send. Report to your human.`);
+      return 0;
+    }
+    throw error;
+  } finally { await subscription.close(); }
+}
+
+async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, as: AgentId, timeoutSec: number, fused: boolean): Promise<number> {
+  {
     const delivery = await nextDelivery(subscription, timeoutSec);
     if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: pair wait -As ${as} -TimeoutSec ${timeoutSec}`); return 2; }
     await printDeliveryThenAck(delivery, subscription);
     renderTurn((await gateway.status()), as); return 0;
-  } finally { await subscription.close(); }
+  }
 }
 
 function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); } }

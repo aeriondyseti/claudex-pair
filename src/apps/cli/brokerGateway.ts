@@ -120,7 +120,7 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     let offClose = () => {};
     let cancelBackoff: (() => void) | undefined;
 
-    let removed = false; // removed-from-session latch: terminal, never reconnected
+    let removed: BrokerWireError | undefined; // removed-from-session latch: terminal, never reconnected
     const scheduleReconnect = () => {
       if (!active || reconnecting || removed) return;
       offDelivery(); offClose();
@@ -143,8 +143,11 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       // any close callback can replace it, and reconnect is suppressed.
       const offErr = next.onServerError((e) => {
         if (e.code !== 'removed-from-session') return;
-        removed = true;
-        queue.fail(new BrokerWireError(e.code, e.message));
+        removed = new BrokerWireError(e.code, e.message);
+        // PREEMPTIVE: discard buffered deliveries — a removed agent must see
+        // the terminal removal, never a normal message + re-arm guidance
+        // (codex step-4 re-read; within approved immediate-stop semantics).
+        queue.preempt(removed);
       });
       try { expectOk(await next.subscribe(as, cursor)); }
       catch (error) { offD(); offErr(); next.close(); throw error; }
@@ -197,6 +200,7 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
      * cleanly. Protocol rejections (BrokerWireError) are never retried.
      */
     const withReconnectRetry = async (op: (c: IpcClient) => Promise<ResponseFrame>): Promise<void> => {
+      if (removed) throw removed; // terminal: no wire call, no reconnect
       const attempted = client; // pin the generation this attempt ran against
       try { expectOk(await op(attempted)); return; }
       catch (error) {
@@ -278,6 +282,14 @@ class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
     const waiter = this.waiters.shift();
     if (waiter) waiter.resolve({ done: false, value });
     else this.values.push(value);
+  }
+  /** PREEMPTIVE terminal failure (slice 4, kicked-wait latch): buffered
+   * values are DISCARDED — the consumer's very next call rejects with the
+   * stored error. Only for immediate-stop semantics (removed-from-session),
+   * where delivering queued mail to a removed agent would be a lie. */
+  preempt(error: unknown) {
+    this.values.length = 0;
+    this.fail(error);
   }
   /** Terminal error is STORED: a failure with no waiter pending must still
    * reject the consumer's next call (after buffered values drain), never

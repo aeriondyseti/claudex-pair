@@ -493,3 +493,93 @@ describe('subscription reconnect', () => {
     expect(closes.length).toBe(1); // replacement socket closed, not published
   }, 15_000);
 });
+
+describe('removed-from-session preemptive latch (slice 4, codex step-4 re-read)', () => {
+  function removalServer(endpoint: string, epoch: number, opts: { bufferDeliveryFirst: boolean }) {
+    return new IpcServer({
+      endpoint, token: 'token', epoch,
+      handler: async (frame, connection) => {
+        if (frame.kind === 'subscribe') {
+          if (opts.bufferDeliveryFirst) {
+            await connection.send({ kind: 'delivery', deliverySeq: 11, deliveryId: 'm11:codex', message: message('m11') } as Parameters<typeof connection.send>[0]);
+            await connection.send({ ok: false, error: { code: 'removed-from-session', message: 'You were removed from the session.' } } as Parameters<typeof connection.send>[0]);
+          }
+          return { reqId: frame.reqId, ok: true };
+        }
+        if (frame.kind === 'ack') throw new Error('ack must never reach the wire after removal');
+        return { reqId: frame.reqId, ok: true };
+      },
+    });
+  }
+
+  test('a delivery buffered AHEAD of the removal is discarded: the consumer sees the terminal removal, never a normal message', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-removed-buffered-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 15);
+    const server = removalServer(endpoint, 15, { bufferDeliveryFirst: true });
+    await server.listen();
+    cleanups.push(() => server.close().catch(() => undefined));
+
+    let rediscoveries = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'removed-1',
+        connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 15, clientId: 'removed-1' }),
+        rediscover: async () => { rediscoveries += 1; throw new Error('must not reconnect'); },
+      },
+      { maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    let caught: Error | undefined;
+    try { await subscription.deliveries[Symbol.asyncIterator]().next(); } catch (error) { caught = error as Error; }
+    expect((caught as { code?: string })?.code).toBe('removed-from-session'); // preempted — the buffered m11 is GONE
+    await Bun.sleep(50);
+    expect(rediscoveries).toBe(0); // reconnect suppressed
+    await subscription.close();
+  }, 15_000);
+
+  test('a delivery already HANDED OFF when removal arrives: the ack rejects terminally without any wire call or reconnect', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claudex-removed-handed-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const endpoint = endpointFor(root, 16);
+    let sendRemoval: (() => Promise<void>) | undefined;
+    const server = new IpcServer({
+      endpoint, token: 'token', epoch: 16,
+      handler: async (frame, connection) => {
+        if (frame.kind === 'subscribe') {
+          await connection.send({ kind: 'delivery', deliverySeq: 12, deliveryId: 'm12:codex', message: message('m12') } as Parameters<typeof connection.send>[0]);
+          sendRemoval = () => connection.send({ ok: false, error: { code: 'removed-from-session', message: 'You were removed from the session.' } } as Parameters<typeof connection.send>[0]);
+          return { reqId: frame.reqId, ok: true };
+        }
+        if (frame.kind === 'ack') throw new Error('ack must never reach the wire after removal');
+        return { reqId: frame.reqId, ok: true };
+      },
+    });
+    await server.listen();
+    cleanups.push(() => server.close().catch(() => undefined));
+
+    let rediscoveries = 0;
+    const gateway = new BrokerGateway(
+      {
+        clientId: 'removed-2',
+        connect: async () => new IpcClient({ endpoint, token: 'token', epoch: 16, clientId: 'removed-2' }),
+        rediscover: async () => { rediscoveries += 1; throw new Error('must not reconnect'); },
+      },
+      { maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 10 },
+    );
+    cleanups.push(() => gateway.close());
+
+    const subscription = await gateway.subscribe('codex', 0);
+    const handed = (await subscription.deliveries[Symbol.asyncIterator]().next()).value!;
+    expect(handed.deliveryId).toBe('m12:codex'); // delivered BEFORE the removal
+    await sendRemoval!();
+    await Bun.sleep(30); // let the latch land
+    let caught: Error | undefined;
+    try { await subscription.ack('m12:codex'); } catch (error) { caught = error as Error; }
+    expect((caught as { code?: string })?.code).toBe('removed-from-session'); // pre-wire rejection
+    expect(rediscoveries).toBe(0);
+    await subscription.close();
+  }, 15_000);
+});
