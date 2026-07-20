@@ -64,6 +64,7 @@ describe('transport gate', () => {
 describe('user-attach', () => {
   test('TOFU registers through the journal (loud notices as inbox deliveries) and tags the connection', async () => {
     const core = await seeded(await tempRoot());
+    core.onConnection('user-conn', 'open');
     const response = await core.userAttach('attach-1', sink('user-conn'), 'user-client', 'a'.repeat(64));
     expect(response.ok).toBeTrue();
     if (!response.ok) return;
@@ -78,6 +79,7 @@ describe('user-attach', () => {
   test('malformed tokens are rejected before TOFU — no binding from empty/short tokens', async () => {
     const core = await seeded(await tempRoot());
     for (const bad of ['', 'short', 'Z'.repeat(64), 'a'.repeat(63)]) {
+      core.onConnection(`c-${bad.length}`, 'open');
       const r = await core.userAttach(`bad-${bad.length}`, sink(`c-${bad.length}`), 'user-client', bad);
       expect(r.ok).toBeFalse();
       if (!r.ok) expect(r.error.code).toBe('user-auth-failed');
@@ -89,6 +91,7 @@ describe('user-attach', () => {
   test('a reqId colliding with an unrelated recorded outcome fails loudly — never a silent tag (auth bypass fix)', async () => {
     const core = await seeded(await tempRoot());
     // 'init' + 'client-a' already has a recorded outcome from seeding.
+    core.onConnection('sneaky', 'open');
     const collided = await core.userAttach('init', sink('sneaky'), 'client-a', 'f'.repeat(64));
     expect(collided.ok).toBeFalse();
     if (!collided.ok) expect(collided.error.code).toBe('user-auth-failed');
@@ -101,15 +104,19 @@ describe('user-attach', () => {
   test('wrong token after binding fails constant-time; correct token attaches; binding survives restart', async () => {
     const root = await tempRoot();
     const core = await seeded(root);
+    core.onConnection('c1', 'open');
     expect((await core.userAttach('a1', sink('c1'), 'user-client', 'c'.repeat(64))).ok).toBeTrue();
+    core.onConnection('c2', 'open');
     const wrong = await core.userAttach('a2', sink('c2'), 'user-client-2', 'd'.repeat(64));
     expect(wrong.ok).toBeFalse();
     if (!wrong.ok) expect(wrong.error.code).toBe('user-auth-failed');
 
     const reopened = makeCore(root);
     await reopened.recover(); // journal-authoritative: mirrors irrelevant
+    reopened.onConnection('c3', 'open');
     const again = await reopened.userAttach('a3', sink('c3'), 'user-client-3', 'c'.repeat(64));
     expect(again.ok).toBeTrue();
+    reopened.onConnection('c4', 'open');
     const stillWrong = await reopened.userAttach('a4', sink('c4'), 'user-client-4', 'd'.repeat(64));
     expect(stillWrong.ok).toBeFalse();
   });
@@ -118,6 +125,7 @@ describe('user-attach', () => {
 describe('user-send', () => {
   test('requires a tagged connection (no token on the frame can substitute)', async () => {
     const core = await seeded(await tempRoot());
+    core.onConnection('user-conn', 'open');
     await core.userAttach('a1', sink('user-conn'), 'user-client', 'e'.repeat(64));
     const untagged = await core.userSend('s1', 'user-client', 'other-conn', '*', 'hello');
     expect(untagged.ok).toBeFalse();
@@ -127,6 +135,7 @@ describe('user-send', () => {
   test('broadcast: one txn, unique per-recipient ids, groupId===reqId + provenance projected; dedup replays before allocation', async () => {
     const core = await seeded(await tempRoot());
     const observed: ObserverPushWire[] = [];
+    core.onConnection('user-conn', 'open');
     await core.userAttach('a1', sink('user-conn', observed), 'user-client', 'e'.repeat(64));
     const first = await core.userSend('req-7', 'user-client', 'user-conn', '*', 'focus on tests');
     expect(first.ok).toBeTrue();
@@ -157,7 +166,9 @@ describe('user-send', () => {
 
   test('two clients reusing the same reqId never collide in message ids', async () => {
     const core = await seeded(await tempRoot());
+    core.onConnection('conn-1', 'open');
     await core.userAttach('a1', sink('conn-1'), 'user-client-1', 'e'.repeat(64));
+    core.onConnection('conn-2', 'open');
     await core.userAttach('a2', sink('conn-2'), 'user-client-2', 'e'.repeat(64));
     await core.userSend('shared-req', 'user-client-1', 'conn-1', '*', 'from one');
     await core.userSend('shared-req', 'user-client-2', 'conn-2', '*', 'from two');
@@ -169,6 +180,7 @@ describe('user-send', () => {
   test('restart replay of a committed user-send returns a complete outcome including session', async () => {
     const root = await tempRoot();
     const core = await seeded(root);
+    core.onConnection('conn-1', 'open');
     await core.userAttach('a1', sink('conn-1'), 'user-client', 'e'.repeat(64));
     const first = await core.userSend('req-9', 'user-client', 'conn-1', 'codex', 'persist me');
     expect(first.ok).toBeTrue();
@@ -178,6 +190,7 @@ describe('user-send', () => {
 
     const reopened = makeCore(root);
     await reopened.recover();
+    reopened.onConnection('conn-2', 'open');
     await reopened.userAttach('a2', sink('conn-2'), 'user-client-2', 'e'.repeat(64));
     // Same identity replays the journaled outcome — it must be complete.
     const replayed = await reopened.userSend('req-9', 'user-client', 'conn-2', 'codex', 'persist me');
@@ -191,6 +204,7 @@ describe('user-send', () => {
   test('turn is never mutated by a user broadcast landing mid-exchange', async () => {
     const core = await seeded(await tempRoot());
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    core.onConnection('user-conn', 'open');
     await core.userAttach('a1', sink('user-conn'), 'user-client', 'e'.repeat(64));
     await core.userSend('s1', 'user-client', 'user-conn', '*', 'carry on');
     const status = await core.query('q1', 'status');
@@ -205,6 +219,7 @@ describe('user-channel mirror resilience (close-out #7 guard)', () => {
     const root = await tempRoot();
     const core = await seeded(root);
     const token = 'a'.repeat(64);
+    core.onConnection('c1', 'open');
     expect((await core.userAttach('bind-1', sink('c1'), 'user-client', token)).ok).toBeTrue();
     const path = join(root, '.pair', 'user-channel.json');
 
@@ -214,7 +229,9 @@ describe('user-channel mirror resilience (close-out #7 guard)', () => {
     const afterDelete = makeCore(root);
     expect(await afterDelete.recover()).not.toBe('conflict');
     expect((await readFile(path, 'utf8')).includes('"registered": true')).toBeTrue();
+    afterDelete.onConnection('c2', 'open');
     expect((await afterDelete.userAttach('ad-ok', sink('c2'), 'user-client', token)).ok).toBeTrue();
+    afterDelete.onConnection('c3', 'open');
     const wrongAfterDelete = await afterDelete.userAttach('ad-bad', sink('c3'), 'user-client', 'b'.repeat(64));
     expect(wrongAfterDelete.ok).toBeFalse();
     if (!wrongAfterDelete.ok) expect(wrongAfterDelete.error.code).toBe('user-auth-failed');
@@ -226,9 +243,70 @@ describe('user-channel mirror resilience (close-out #7 guard)', () => {
     const healed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
     expect(healed['registered']).toBeTrue();
     expect(healed['forged']).toBeUndefined();
+    afterTamper.onConnection('c4', 'open');
     expect((await afterTamper.userAttach('at-ok', sink('c4'), 'user-client', token)).ok).toBeTrue();
+    afterTamper.onConnection('c5', 'open');
     const wrongAfterTamper = await afterTamper.userAttach('at-bad', sink('c5'), 'user-client', 'b'.repeat(64));
     expect(wrongAfterTamper.ok).toBeFalse();
     if (!wrongAfterTamper.ok) expect(wrongAfterTamper.error.code).toBe('user-auth-failed');
+  });
+});
+
+describe('server-boundary publication guards (codex re-read 20260720-110117-282)', () => {
+  test('userAttach close-race: socket dies during the registration commit — registration stays durable, the dead connection is NEVER auth-tagged', async () => {
+    const core = await seeded(await tempRoot());
+    const token = 'a'.repeat(64);
+    core.onConnection('race-conn', 'open');
+    // Dispatch, then close synchronously: the chain task runs in a later
+    // microtask, so the close deterministically lands mid-request — the
+    // strongest version of "socket closed during the await".
+    const attaching = core.userAttach('race-1', sink('race-conn'), 'user-client', token);
+    core.onConnection('race-conn', 'close');
+    const response = await attaching;
+    expect(response.ok).toBeFalse();
+    if (!response.ok) expect(response.error.code).toBe('connection-closed');
+
+    // The TOFU registration is durably committed (that is fine)…
+    const state = core.journal.sessionState;
+    expect(state?.userChannelTokenHash).toBeDefined();
+    // …but the dead connection holds NO auth tag: user-send is refused.
+    const send = await core.userSend('race-2', 'user-client', 'race-conn', 'codex', 'ghost');
+    expect(send.ok).toBeFalse();
+    if (!send.ok) expect(send.error.code).toBe('user-channel-required');
+    // A live reattach with the same token authenticates normally.
+    core.onConnection('live-conn', 'open');
+    expect((await core.userAttach('race-3', sink('live-conn'), 'user-client-2', token)).ok).toBeTrue();
+  });
+
+  test('subscribe close-race: a dead sink never registers, never wins delivery selection — the delivery stays open for the next live subscriber', async () => {
+    const core = await seeded(await tempRoot());
+    await core.execute('ask-1', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+
+    const deadGot: unknown[] = [];
+    core.onConnection('dead-sub', 'open');
+    const subscribing = core.subscribe('sub-race', { id: 'dead-sub', sendDelivery: async (p) => void deadGot.push(p), sendError: async () => undefined }, 'codex', 0);
+    core.onConnection('dead-sub', 'close');
+    const response = await subscribing;
+    expect(response.ok).toBeFalse();
+    if (!response.ok) expect(response.error.code).toBe('connection-closed');
+    await Bun.sleep(30);
+    expect(deadGot).toHaveLength(0); // dead sink never received the lease
+
+    // The open delivery goes to the next LIVE subscriber intact.
+    const liveGot: unknown[] = [];
+    core.onConnection('live-sub', 'open');
+    expect((await core.subscribe('sub-live', { id: 'live-sub', sendDelivery: async (p) => void liveGot.push(p), sendError: async () => undefined }, 'codex', 0)).ok).toBeTrue();
+    await Bun.sleep(30);
+    expect(liveGot).toHaveLength(1);
+  });
+
+  test('observe close-race: a dead observer never registers', async () => {
+    const core = await seeded(await tempRoot());
+    core.onConnection('dead-obs', 'open');
+    const observing = core.observe('obs-race', sink('dead-obs'));
+    core.onConnection('dead-obs', 'close');
+    const response = await observing;
+    expect(response.ok).toBeFalse();
+    if (!response.ok) expect(response.error.code).toBe('connection-closed');
   });
 });

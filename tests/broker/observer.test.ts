@@ -55,6 +55,7 @@ async function seeded(root: string, config: Partial<typeof DEFAULT_CONFIG> = {})
 }
 
 async function observe(core: BrokerCore, id: string, got: ObserverPushWire[]): Promise<ObserverSnapshotDto> {
+  core.onConnection(id, 'open');
   const response = await core.observe(`obs-${id}`, observerSink(id, got));
   expect(response.ok).toBeTrue();
   if (!response.ok) throw new Error('unreachable');
@@ -78,6 +79,7 @@ describe('observer attach', () => {
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q1' } });
     // codex consumes it (subscribe → lease → ack), then a second one stays open.
     const got: { deliveryId?: string }[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('sub1', deliverySink('codex', got), 'codex', 0);
     await Bun.sleep(50);
     await core.ack('a1', got[0]!.deliveryId!, 'client-b');
@@ -110,6 +112,7 @@ describe('observer non-interference', () => {
     await observe(core, 'watcher', []);
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     const got: { deliveryId?: string }[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('sub1', deliverySink('codex', got), 'codex', 0);
     await Bun.sleep(50);
     expect(got.length).toBe(1); // delivery reached the agent, not the observer
@@ -132,6 +135,7 @@ describe('observer activity stream', () => {
 
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     const agentGot: { deliveryId?: string }[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('sub1', deliverySink('codex', agentGot), 'codex', 0);
     await Bun.sleep(50);
     await core.ack('a1', agentGot[0]!.deliveryId!, 'client-b');
@@ -166,6 +170,7 @@ describe('observer activity stream', () => {
   test('a dead observer is dropped, not retried, and never wedges the commit path', async () => {
     const core = await seeded(await tempRoot());
     const dead: ObserverSink = { id: 'dead', sendObserver: async () => { throw new Error('gone'); } };
+    core.onConnection('dead', 'open');
     expect((await core.observe('obs-dead', dead)).ok).toBeTrue();
     const send = await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     expect(send.ok).toBeTrue();
@@ -214,6 +219,7 @@ describe('observer activity stream', () => {
     await observe(core, 'watcher', got);
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     const agentGot: { deliveryId?: string }[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('sub1', deliverySink('codex', agentGot), 'codex', 0);
     // The delivery push rides the (slow) mirror chain; wait for it.
     for (let i = 0; i < 40 && agentGot.length === 0; i++) await Bun.sleep(50);
@@ -232,6 +238,7 @@ describe('observer activity stream', () => {
   test('observe on an empty journal is rejected session-not-active', async () => {
     const core = makeCore(await tempRoot());
     await core.recover();
+    core.onConnection('o', 'open');
     const response = await core.observe('obs-none', observerSink('o', []));
     expect(response.ok).toBeFalse();
     if (!response.ok) expect(response.error.code).toBe('session-not-active');
@@ -244,6 +251,7 @@ describe('observer restart correctness (codex review round 2)', () => {
     const core = await seeded(root);
     await core.execute('ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'consumed' } });
     const got: { deliveryId?: string }[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('sub1', deliverySink('codex', got), 'codex', 0);
     await Bun.sleep(50);
     await core.ack('a1', got[0]!.deliveryId!, 'client-b');

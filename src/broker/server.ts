@@ -377,6 +377,10 @@ export class BrokerCore {
       if (this.#stopping) {
         return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
       }
+      // Publication guard (codex re-read, 20260720-110117-282): the socket
+      // may have closed while this request sat behind the commit chain — a
+      // dead sink registered here would WIN delivery selection repeatedly.
+      if (!this.#connections.has(sink.id)) return err(reqId, 'connection-closed', 'Connection closed before the subscription registered.');
       this.#subscriptions.set(sink.id, { sink, as, connectedSince: this.#clock.now(), lastActivity: this.#clock.now() });
       this.#notifyPresence(); // item 8: listener appeared
       // Open/unacked beats cursor (frozen rule): every open delivery for
@@ -403,6 +407,9 @@ export class BrokerCore {
       if (this.#stopping) return err(reqId, 'broker-stopping', 'Broker is draining; retry to respawn.');
       const state = this.#journal.sessionState;
       if (!state) return err(reqId, 'session-not-active', 'No session in journal.');
+      // Publication guard (codex re-read): never tag a connection that
+      // closed while this request waited on the chain.
+      if (!this.#connections.has(sink.id)) return err(reqId, 'connection-closed', 'Connection closed before the observer registered.');
       // Registration and every activity notify both run inside the commit
       // chain, so an observer registered at head N receives exactly the
       // txns with seq > N — no stale push for commits its snapshot already
@@ -521,6 +528,11 @@ export class BrokerCore {
         const committed = await this.#commitUserEnvelope(reqId, clientId, envelope);
         if (!committed.ok) return committed;
       }
+      // Publication guard (codex re-read): the socket may have died during
+      // the registration commit above. The TOFU registration stays durably
+      // committed — that is correct — but a dead connection must never be
+      // tagged as an authenticated observer (stale auth forever).
+      if (!this.#connections.has(sink.id)) return err(reqId, 'connection-closed', 'Connection closed during user-attach; the registration (if any) is committed — reattach.');
       this.#observers.set(sink.id, sink);
       this.#userConnections.add(sink.id);
       const snapshot: ObserverSnapshotDto = {

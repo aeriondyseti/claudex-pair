@@ -288,6 +288,7 @@ describe('F16', () => {
     await core.execute('f16-ask', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     // A live subscriber takes the delivery lease (still working).
     const got: unknown[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('f16-sub', makeSink('codex', got), 'codex', 0);
     await Bun.sleep(100);
     expect(got.length).toBe(1);
@@ -321,6 +322,7 @@ describe('F18 (server slice)', () => {
 
     // A subscriber for the removed agent gets nothing redelivered.
     const got: unknown[] = [];
+    core.onConnection('sink-codex', 'open');
     await core.subscribe('f18-sub', makeSink('codex', got), 'codex', 0);
     await Bun.sleep(100);
     expect(got).toHaveLength(0);
