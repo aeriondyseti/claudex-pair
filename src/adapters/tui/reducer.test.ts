@@ -473,3 +473,23 @@ describe('action safety: buffer clears at execution; displays are exact (codex a
     expect(resume.state.composer?.actionHint).toContain('/resume (no arguments)');
   });
 });
+
+describe('slice 4b: watch stays OPEN while paused (F-A12)', () => {
+  test('a paused attach renders WITHOUT exit and the composer stays usable; paused activity does not exit; completed still exits', () => {
+    const pausedSession = { ...active, status: 'paused' as const };
+    const step1 = reduceWatch(initialWatchState({ width: 100, tail: 10, now: 'n' }), {
+      kind: 'attach', snapshot: snapshot({ session: pausedSession, transcript: [] }), endpoint: 'e', now: 'n',
+    });
+    expect(step1.effects).toEqual(['render']); // NOT exit — the user must be able to /resume
+    let state = step1.state;
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    expect(state.composer?.channel).toBe('registered'); // composer usable while paused
+
+    const step2 = reduceWatch(state, { kind: 'activity', activity: { seq: 5, session: pausedSession, entries: [], ackedDeliveryIds: [], voidedDeliveryIds: [] } });
+    expect(step2.effects).toEqual(['render']); // paused activity: still open
+
+    const completed = { ...active, status: 'completed' as const };
+    const step3 = reduceWatch(step2.state, { kind: 'activity', activity: { seq: 6, session: completed, entries: [], ackedDeliveryIds: [], voidedDeliveryIds: [] } });
+    expect(step3.effects).toEqual(['render', 'exit']); // terminal still exits
+  });
+});

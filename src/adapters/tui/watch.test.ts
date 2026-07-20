@@ -254,3 +254,14 @@ describe('slice-4 action rendering', () => {
     expect(frame.match(/⚡ user action/g)?.length).toBe(1); // advisory carries NO marker
   });
 });
+
+describe('slice 4b: paused rendering', () => {
+  test('the PAUSED banner renders loud with the composer line intact', () => {
+    const frame = renderWatchFrame({
+      model: model({ session: { ...session, status: 'paused' } }), width: 100, tail: 10,
+      composer: composer({}),
+    });
+    expect(frame).toContain('⏸ SESSION PAUSED by the user');
+    expect(frame).toContain('to:*'); // composer affordance stays — /resume must be reachable
+  });
+});

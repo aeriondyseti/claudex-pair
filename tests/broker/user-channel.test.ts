@@ -406,3 +406,32 @@ describe('actionKind snapshot projection (codex step-5 audit A)', () => {
     for (const n of notices) expect(n.message.header).toMatchObject({ groupId: 'act-proj', provenance: 'trusted_user_client' });
   });
 });
+
+describe('slice 4b: pause/resume through the broker (F-A10)', () => {
+  test('pause commits, SURVIVES a broker restart via journal replay, matrix holds on the recovered broker, resume restores', async () => {
+    const root = await tempRoot();
+    const core = await seeded(root);
+    core.onConnection('pz-conn', 'open');
+    expect((await core.userAttach('att-pz', sink('pz-conn'), 'user-client', 'a'.repeat(64))).ok).toBeTrue();
+    expect((await core.userAction('act-pause', 'user-client', 'pz-conn', { verb: 'pause', reason: 'lunch' })).ok).toBeTrue();
+    expect(core.journal.sessionState?.status).toBe('paused');
+
+    // Restart: journal replay restores paused (F-A10).
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    expect(reopened.journal.sessionState?.status).toBe('paused');
+
+    // Matrix holds on the recovered broker: agent mutation -> session-paused.
+    const braked = await reopened.execute('try-send', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    expect(braked.ok).toBeFalse();
+    if (!braked.ok) expect(braked.error.code).toBe('session-paused');
+
+    // User resume on the recovered broker (fresh attach: connection auth).
+    reopened.onConnection('pz-conn-2', 'open');
+    expect((await reopened.userAttach('att-pz2', sink('pz-conn-2'), 'user-client-2', 'a'.repeat(64))).ok).toBeTrue();
+    expect((await reopened.userAction('act-resume', 'user-client-2', 'pz-conn-2', { verb: 'resume' })).ok).toBeTrue();
+    expect(reopened.journal.sessionState?.status).toBe('active');
+    const unbraked = await reopened.execute('try-send-2', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
+    expect(unbraked.ok).toBeTrue();
+  });
+});

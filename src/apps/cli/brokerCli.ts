@@ -144,7 +144,8 @@ function renderTurn(s: StatusDto, as: AgentId) {
   // latch): a removed agent must NEVER be advised to re-arm, whatever path
   // delivered its final message.
   if (!s.session.agents.includes(as)) { out(`YOU WERE REMOVED FROM THE SESSION. Stop all work immediately; do not re-arm this wait and do not send. Report to your human.`); return; }
-  if (s.session.status !== 'active') out(`SESSION ${s.session.status.toUpperCase()} — your partner ended the session. Wrap up and report to the user; do not wait again.`);
+  if (s.session.status === 'paused') out(`SESSION PAUSED by the user — stand by for resume. Do not re-send and do not end; re-arm: pair wait -As ${as}`);
+  else if (s.session.status !== 'active') out(`SESSION ${s.session.status.toUpperCase()} — your partner ended the session. Wrap up and report to the user; do not wait again.`);
   else if (s.session.turn === as) out(`It is now YOUR turn, ${as}. Your role: ${s.session.driver === as ? 'DRIVER' : 'NAVIGATOR'}. Act on the message, then send a reply (turn: pass) and wait again.`);
   else out(`FYI only — the turn stays with ${s.session.turn}. Note the content and continue; if you are idle, re-arm: pair wait -As ${as}`);
 }

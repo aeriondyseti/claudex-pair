@@ -116,6 +116,9 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
       lines.push(`   ${line}`);
     }
   }
+  if (model.session.status === 'paused') {
+    lines.push('', ` ${WARN}${BOLD}⏸ SESSION PAUSED by the user — agents are braked; /resume to continue.${RESET}`);
+  }
   if (composer?.pending) {
     const kind = composer.pending.action ? 'action' : 'send';
     const status = composer.pending.state === 'sending'

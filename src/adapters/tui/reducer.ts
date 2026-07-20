@@ -26,7 +26,7 @@ export function reduceWatch(state: WatchTuiState, event: WatchEvent): WatchStep 
         // any composer state retained from a previous broker attachment.
         composer: event.model.source.kind === 'broker' ? state.composer : undefined,
       };
-      return step(next, event.model.session.status === 'active' ? ['render'] : ['render', 'exit']);
+      return step(next, event.model.session.status === 'completed' ? ['render', 'exit'] : ['render']); // paused is LIVE: stay open
     }
     case 'activity':
       return activity(state, event.activity);
@@ -78,7 +78,7 @@ function attach(state: WatchTuiState, snapshot: ObserverSnapshotDto, endpoint: s
     liveness: snapshot.liveness,
     composer: normalizeComposer(state.composer, snapshot.session.agents, entries, state.tail),
   };
-  const effects: readonly WatchEffect[] = snapshot.session.status === 'active' ? ['render'] : ['render', 'exit'];
+  const effects: readonly WatchEffect[] = snapshot.session.status === 'completed' ? ['render', 'exit'] : ['render']; // paused is LIVE: the composer must stay usable for /resume
   // Apply a deferred pre-attach user-channel event (close-out #2): the model
   // is broker-sourced now, so the stash gains composer authority here — and
   // only here. Attach's own effects win (render / render+exit ordering).
@@ -110,7 +110,7 @@ function activity(state: WatchTuiState, value: WatchActivity): WatchStep {
   const model = rebuildBrokerModel(state.model, value.session, value.seq, entries, state.liveness, state.now);
   const composer = activityComposer(state, entries, value.session.agents);
   const next = { ...state, model, headSeq: value.seq, entries, composer };
-  return step(next, value.session.status === 'active' ? ['render'] : ['render', 'exit']);
+  return step(next, value.session.status === 'completed' ? ['render', 'exit'] : ['render']); // paused is LIVE
 }
 
 function text(state: WatchTuiState, value: string): WatchStep {
