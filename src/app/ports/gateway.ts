@@ -197,6 +197,10 @@ export interface ObserverSession {
  */
 export interface UserObserverSession extends ObserverSession {
   send(reqId: string, target: AgentId | '*', body: string): Promise<void>;
+  /** U1 slice 4: privileged action on the SAME authenticated connection.
+   * reqId is minted at CONFIRM time (freeze-then-mint) and reused verbatim
+   * on retries — the broker dedups by it. */
+  action(reqId: string, action: unknown): Promise<void>;
 }
 
 /** Broker daemon status — meaningful before/without any session. */

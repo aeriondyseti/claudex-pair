@@ -335,6 +335,7 @@ describe('subscription reconnect', () => {
         clientId: 'late-client', connected: true,
         onDelivery: () => () => {}, onObserverPush: () => () => {},
         onClose: (l: (e: Error) => void) => { closes.add(l); return () => closes.delete(l); },
+        onServerError: () => () => {},
         subscribe: async () => { subs += 1; return { reqId: 'r', ok: true }; },
         ack: (id: string) => {
           if (deferFirstAck && !deferredReject) return new Promise((_, reject) => { deferredReject = reject as (e: Error) => void; });

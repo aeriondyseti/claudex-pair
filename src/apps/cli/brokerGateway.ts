@@ -103,6 +103,7 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       snapshot: response.data as ObserverSnapshotDto,
       pushes: queue,
       send: async (reqId, target, body) => { expectOk(await client.userSend(target, body, reqId)); },
+      action: async (reqId, action) => { expectOk(await client.userAction(action, reqId)); },
       close: async () => { offPush(); offClose(); queue.close(); },
     };
   }
@@ -119,8 +120,9 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     let offClose = () => {};
     let cancelBackoff: (() => void) | undefined;
 
+    let removed = false; // removed-from-session latch: terminal, never reconnected
     const scheduleReconnect = () => {
-      if (!active || reconnecting) return;
+      if (!active || reconnecting || removed) return;
       offDelivery(); offClose();
       reconnecting = reconnect().finally(() => { reconnecting = undefined; });
     };
@@ -136,10 +138,18 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
      */
     const attach = async (next: IpcClient): Promise<void> => {
       const offD = next.onDelivery((frame) => { sequences.set(frame.deliveryId, frame.deliverySeq); queue.push(toDelivery(frame)); });
+      // Slice-4 kicked-wait seam (design REV 6, round-2 D): an unsolicited
+      // removed-from-session is a TYPED TERMINAL failure — latched before
+      // any close callback can replace it, and reconnect is suppressed.
+      const offErr = next.onServerError((e) => {
+        if (e.code !== 'removed-from-session') return;
+        removed = true;
+        queue.fail(new BrokerWireError(e.code, e.message));
+      });
       try { expectOk(await next.subscribe(as, cursor)); }
-      catch (error) { offD(); next.close(); throw error; }
-      if (!active) { offD(); next.close(); return; } // cancelled mid-handshake
-      offDelivery = offD;
+      catch (error) { offD(); offErr(); next.close(); throw error; }
+      if (!active) { offD(); offErr(); next.close(); return; } // cancelled mid-handshake
+      offDelivery = () => { offD(); offErr(); };
       offClose = next.onClose(() => scheduleReconnect());
       client = next;
       this.client = next;

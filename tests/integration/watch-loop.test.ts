@@ -220,8 +220,8 @@ describe('watch event loop host', () => {
     const sends: { reqId: string; target: string; body: string }[] = [];
     const sessionB = fakeSession(1);
     (sessionB.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
-    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); } };
-    const userSessionB = { ...sessionB.session, send: async (reqId: string, target: string, body: string) => void sends.push({ reqId, target, body }) };
+    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); }, action: async () => undefined };
+    const userSessionB = { ...sessionB.session, send: async (reqId: string, target: string, body: string) => void sends.push({ reqId, target, body }), action: async () => undefined };
 
     const attachCalls: boolean[] = []; // spawn flag per userAttach call
     let brokerAlive = true;
@@ -293,6 +293,7 @@ describe('watch event loop host', () => {
           if (!commits.includes(reqId)) commits.push(reqId); // commit lands
           if (failAfterCommit) throw new Error('IPC connection closed'); // …but the response is lost
         },
+        action: async () => undefined,
       };
     };
     const attachCalls: boolean[] = [];
@@ -332,8 +333,8 @@ describe('watch event loop host', () => {
     const sends: string[] = [];
     const sessionB = fakeSession(1);
     (sessionB.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
-    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); } };
-    const userSessionB = { ...sessionB.session, send: async (reqId: string) => void sends.push(reqId) };
+    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); }, action: async () => undefined };
+    const userSessionB = { ...sessionB.session, send: async (reqId: string) => void sends.push(reqId), action: async () => undefined };
 
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
