@@ -261,13 +261,23 @@ describe('round 4 #2: rebind terminates waits promptly; ONE explicit regenerate 
     const claudeGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-claude-2' }), creds({ claude: CRED.claude }));
     cleanups.push(() => claudeGw.close());
     await send(claudeGw, 'claude', 'codex', 'after the rebind', 'a-1');
-    const resumedDelivery = (await pending2).value!;
-    // Logical-identity deduplication (at-least-once wire): consume by
-    // deliveryId until the post-rebind message shows exactly once.
-    const seen = new Map<string, string>();
-    seen.set(resumedDelivery.deliveryId, resumedDelivery.message.body as string);
-    await subA2.ack(resumedDelivery.deliveryId);
-    expect([...seen.values()].some((b) => b.includes('after the rebind') || b.includes('USER'))).toBeTrue();
+    // Logical-identity deduplication (at-least-once wire): drain and ack
+    // by deliveryId until the EXACT post-rebind body appears (bounded),
+    // then assert exactly ONE unique delivery identity carries it —
+    // same-ID re-occurrences remain legal redelivery.
+    const seen = new Map<string, string>(); // deliveryId -> body
+    const iterator2 = subA2.deliveries[Symbol.asyncIterator]();
+    let step2 = await pending2;
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const delivery = step2.value!;
+      seen.set(delivery.deliveryId, delivery.message.body as string);
+      await subA2.ack(delivery.deliveryId);
+      if ([...seen.values()].some((b) => b.includes('after the rebind'))) break;
+      if (Date.now() > deadline) throw new Error('post-rebind message never arrived');
+      step2 = await iterator2.next();
+    }
+    expect([...seen.entries()].filter(([, b]) => b.includes('after the rebind'))).toHaveLength(1);
     expect(store.mints).toBe(1); // exactly one replacement, ever
   }, 20_000);
 });

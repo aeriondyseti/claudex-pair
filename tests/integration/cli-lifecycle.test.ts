@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Delivery, DeliverySubscription, ExecuteOutcome, StatusDto } from '@app/ports/gateway.ts';
 import { runBrokerCli, type CliGateway } from '../../src/apps/cli/brokerCli.ts';
+import { BrokerWireError } from '../../src/apps/cli/brokerGateway.ts';
 
 /**
  * D1 regression (root cause 2026-07-20, codex finding 20260720-101816-882):
@@ -431,5 +432,40 @@ describe('peer 1A round 2 #7: pair byte-identity and peer status text', () => {
     expect(text).toContain('ATTENTION [tofu-1]');
     expect(text).not.toContain('Driver:');
     expect(text).not.toContain('undefined');
+  });
+});
+
+
+describe('peer 1A round 4 #2: the CLI contract for a rebound credential', () => {
+  test('a blocked wait woken by credential-revoked exits 2 with the exact -Regenerate recovery and re-arm guidance, without reconnect spin', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    let subscribes = 0;
+    const revoking = {
+      ...gateway,
+      subscribe: async (): Promise<DeliverySubscription> => {
+        subscribes += 1;
+        return {
+          deliveries: {
+            [Symbol.asyncIterator]() {
+              return { next: () => Promise.reject(new BrokerWireError('credential-revoked', 'Your credential was rebound by the user - generate a new one and re-attach.')) };
+            },
+          },
+          ack: async () => {},
+          extend: async () => {},
+          close: async () => { log.push('subscription-close'); },
+        };
+      },
+    } as unknown as CliGateway;
+    const capture = captureOut();
+    let code: number | undefined;
+    try {
+      code = await runBrokerCli('wait', new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30']]), [], 'unused-root', () => revoking);
+    } finally { capture.restore(); }
+    expect(code).toBe(2);
+    const text = capture.text();
+    expect(text).toContain('pair attach -As claude -Regenerate');
+    expect(text).toContain('re-arm');
+    expect(subscribes).toBe(1); // typed terminal wake — no reconnect spin
   });
 });
