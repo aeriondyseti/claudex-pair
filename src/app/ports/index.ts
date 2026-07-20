@@ -23,6 +23,9 @@ export type StoredMessage = {
      * mode and deliberately drops them (no user channel there). */
     readonly groupId?: string;
     readonly provenance?: 'trusted_user_client';
+    /** U1 slice 4: durable discriminator on ACTION notices — the renderer's
+     * lightning marker keys on this, never on provenance (design REV 6). */
+    readonly actionKind?: import('@core/events.ts').UserActionKind;
   };
   readonly body: string;
   readonly raw: string;

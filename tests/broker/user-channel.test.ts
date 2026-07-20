@@ -387,3 +387,22 @@ describe('slice-4a userAction (design REV 6)', () => {
     if (!unknown.ok) expect(unknown.error.code).toBe('bad-command'); // 4b verb, not in 4a
   });
 });
+
+describe('actionKind snapshot projection (codex step-5 audit A)', () => {
+  test('an executed user action projects actionKind into the observer snapshot transcript', async () => {
+    const core = await seeded(await tempRoot());
+    core.onConnection('proj-conn', 'open');
+    expect((await core.userAttach('att-proj', sink('proj-conn'), 'user-client', 'a'.repeat(64))).ok).toBeTrue();
+    expect((await core.userAction('act-proj', 'user-client', 'proj-conn', { verb: 'kick', agent: 'codex', reason: 'x' })).ok).toBeTrue();
+
+    // Fresh observer: the snapshot transcript ring must carry the marker.
+    core.onConnection('obs-proj', 'open');
+    const observed = await core.observe('obs-proj-req', sink('obs-proj'));
+    expect(observed.ok).toBeTrue();
+    if (!observed.ok) return;
+    const snapshot = observed.data as import('@app/ports/gateway.ts').ObserverSnapshotDto;
+    const notices = snapshot.transcript.filter((t) => (t.message.header as { actionKind?: string }).actionKind === 'kick');
+    expect(notices.length).toBeGreaterThanOrEqual(2); // stop-notice + survivor notice
+    for (const n of notices) expect(n.message.header).toMatchObject({ groupId: 'act-proj', provenance: 'trusted_user_client' });
+  });
+});

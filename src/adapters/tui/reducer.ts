@@ -287,6 +287,11 @@ function userChannel(
     scrollOffset: previous?.scrollOffset ?? 0,
     filter: previous?.filter ?? 'all',
     ...(previous?.pending === undefined ? {} : { pending: previous.pending }),
+    // A registered/unregistered re-push during recovery must not orphan a
+    // failed action's retry: the frozen draft survives the rebuild (codex
+    // step-5 audit B).
+    ...(previous?.confirming === undefined ? {} : { confirming: previous.confirming }),
+    ...(previous?.actionHint === undefined ? {} : { actionHint: previous.actionHint }),
   };
   return rendered({ ...state, pendingChannel: undefined }, composer);
 }
@@ -380,6 +385,9 @@ function sendingPending(pending: NonNullable<ComposerState['pending']>): NonNull
     target: pending.target,
     body: pending.body,
     state: 'sending',
+    // The action flag must survive the retry rebuild — dropping it turned
+    // an action retry into a plain send (codex step-5 audit B).
+    ...(pending.action === undefined ? {} : { action: pending.action }),
   };
 }
 

@@ -111,3 +111,20 @@ describe('push → reducer pending reconciliation (close-out #1)', () => {
     expect(other.composer?.pending).toMatchObject({ reqId: 'req-9' }); // still awaiting its own commit
   });
 });
+
+describe('actionKind projection (codex step-5 audit A)', () => {
+  test('decodePush carries actionKind from the wire event into the stored header', async () => {
+    const wirePush = {
+      kind: 'activity', seq: 6, at: 't', principal: 'user-client',
+      session: { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude', status: 'active', started: 's', grants: {} },
+      events: [{
+        kind: 'message-sent', id: 'a1', from: 'user', to: 'claude', type: 'done', turn: 'keep',
+        body: 'Session ended by user.', at: 't', groupId: 'req-7', provenance: 'trusted_user_client', actionKind: 'end',
+      }],
+      ackedDeliveryIds: [], voidedDeliveryIds: [],
+    } as unknown as ObserverPush;
+    const decoded = decodePush(wirePush);
+    if (decoded.kind !== 'activity') throw new Error('expected activity');
+    expect(decoded.activity.entries[0]!.message.header).toMatchObject({ actionKind: 'end', groupId: 'req-7', provenance: 'trusted_user_client' });
+  });
+});

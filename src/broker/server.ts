@@ -701,6 +701,7 @@ export class BrokerCore {
         // U1 composer reconciliation reads these from the header.
         ...(m.groupId === undefined ? {} : { groupId: m.groupId }),
         ...(m.provenance === undefined ? {} : { provenance: m.provenance }),
+        ...(m.actionKind === undefined ? {} : { actionKind: m.actionKind }),
       },
       body: m.body,
       raw: this.#codec.raw(pair),

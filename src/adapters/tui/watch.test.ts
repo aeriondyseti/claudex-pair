@@ -246,7 +246,7 @@ describe('slice-4 action rendering', () => {
       ...userMessage('act-1', 'claude', false, 'g-act'),
       message: {
         ...userMessage('act-1', 'claude', false, 'g-act').message,
-        header: { ...userMessage('act-1', 'claude', false, 'g-act').message.header, actionKind: 'end' },
+        header: { ...userMessage('act-1', 'claude', false, 'g-act').message.header, actionKind: 'end' as const },
       },
     };
     const frame = renderWatchFrame({ model: model({ transcript: [advisory, notice] }), width: 100, tail: 10, composer: composer({}) });

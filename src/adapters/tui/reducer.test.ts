@@ -413,3 +413,28 @@ describe('slice-4 action confirmation: freeze-then-mint (F-A7)', () => {
     expect(state.composer?.confirming).toBeUndefined(); // frozen draft dropped with the clear
   });
 });
+
+describe('action retry survives a recovery re-push (codex step-5 audit B)', () => {
+  test('pending:error action + user-channel registered re-push preserves the frozen draft; Enter re-emits with the SAME reqId', () => {
+    let state = attached(snapshot({ transcript: [] }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    ({ state } = reduceWatch(state, { kind: 'text', text: '/end wrap up' }));
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'rf' })); // freeze
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-mint' })); // mint + effect
+    ({ state } = reduceWatch(state, { kind: 'submit-result', reqId: 'r-mint', ok: false, error: 'IPC connection closed' }));
+    expect(state.composer?.pending).toMatchObject({ reqId: 'r-mint', state: 'error', action: true });
+
+    // Recovery adoptSession re-pushes attach + registered; the rebuild must
+    // NOT orphan the frozen draft.
+    ({ state } = reduceWatch(state, { kind: 'attach', snapshot: snapshot({ transcript: [] }), endpoint: 'e', now: 'later' }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    expect(state.composer?.confirming).toMatchObject({ verb: 'end', summary: 'wrap up' });
+    expect(state.composer?.pending).toMatchObject({ reqId: 'r-mint', state: 'error' });
+
+    // Enter retries: SAME reqId, action effect re-emitted — never a no-op.
+    const retry = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-fresh-candidate' });
+    const effect = retry.effects.find((e) => typeof e !== 'string' && e.kind === 'action');
+    expect(effect).toMatchObject({ kind: 'action', reqId: 'r-mint', action: { verb: 'end', summary: 'wrap up' } });
+    expect(retry.state.composer?.pending).toMatchObject({ reqId: 'r-mint', state: 'sending' });
+  });
+});

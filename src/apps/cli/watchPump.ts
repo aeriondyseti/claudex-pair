@@ -39,6 +39,7 @@ export function toStored(event: Extract<Event, { kind: 'message-sent' }>): Store
       // here made live sends never clear pending (codex slice review #1).
       ...(event.groupId === undefined ? {} : { groupId: event.groupId }),
       ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
+      ...(event.actionKind === undefined ? {} : { actionKind: event.actionKind }),
     },
     body: event.body,
     raw: fsMessageCodec.raw(pair),
