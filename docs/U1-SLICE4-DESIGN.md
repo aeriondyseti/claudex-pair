@@ -1,12 +1,11 @@
 # U1 slice 4 — privileged user actions (design, pre-code)
 
-Status: REV 3 — full codex critique round 1 applied (blockers R1/R2, tails
-A/B/C: kick structural validity, paused matrix, action correlation,
-freeze-then-mint confirmation, shared roster-aware commit, kicked-wait
-wake, principal-as-actor, user-* namespace fail-closed gate,
-authenticate→dedup→state ordering) and ALL five open questions ruled. No
-code until approved (slice-4 design gate, per the slice-3 close verdict
-`20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
+Status: REV 4 — round 1 (blockers R1/R2, tails A/B/C) and round 2 (B:
+durable `actionKind` discriminator on action notices; C: zero-recipient
+kick fallback removed — the driver always survives in pair topology —
+and cancel-notice recipients deduplicated) fully applied; all five open
+questions ruled. No code until approved (slice-4 design gate, per the
+slice-3 close verdict `20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
 credential, connection-bound auth, `user-message`, watch composer).
 Upstream requirements: ENHANCEMENTS.md U1 ("state changes go through
 explicit privileged commands — cancel-grant, pause, resume, end — executed
@@ -127,22 +126,30 @@ and-restore. Pause is a brake on agents, never on the human.
    terminal, not churn). The same mechanism serves `user-end-session` for
    agents whose wait would otherwise sleep through the done fan-out they
    are no longer roster-entitled to receive.
-5. **Action correlation** (codex tail A — blocking): the composer's pending
-   slot clears ONLY on durable activity/snapshot content with
-   `groupId === reqId`, and reused transition events carry no groupId — so
-   without more, an executed action would never clear its pending. Every
-   user-action txn therefore ALSO emits a **durable action notice**: a
-   `message-sent` event from `user` with `groupId = reqId`,
-   `provenance = trusted_user_client`, and per-verb recipients —
-   `user-end-session`: the done summary to every agent (the existing end
-   fan-out, now groupId-tagged); `user-kick-agent`: notice to every
-   SURVIVOR (and the transcript entry is the durable correlation even when
-   the roster empties to none — recipients may be zero, the transcript ring
-   entry is mandatory); `user-cancel-grant`: notice to issuer + assignee;
-   `pause`/`resume`: notice to every agent. Message ids follow the
-   collision-proof `${base}-s${seq}-r${i}` scheme; the notice is projected
-   in BOTH live activity pushes and observer snapshots (transcript ring), so
-   a watch that reattaches mid-action still clears its pending.
+5. **Action correlation** (codex tail A — blocking; recipients and marker
+   corrected per round 2 B/C): the composer's pending slot clears ONLY on
+   durable activity/snapshot content with `groupId === reqId`, and reused
+   transition events carry no groupId — so without more, an executed action
+   would never clear its pending. Every user-action txn therefore ALSO
+   emits a **durable action notice**: a `message-sent` event from `user`
+   with `groupId = reqId`, `provenance = trusted_user_client`, AND a
+   durable **`actionKind`** header field (`end` | `cancel-grant` | `kick` |
+   `pause` | `resume`) — provenance+groupId alone are indistinguishable
+   from an ordinary advisory user message, so `actionKind` is what the ⚡
+   action marker renders from, projected in BOTH live activity pushes and
+   observer snapshots (round 2 B). Per-verb recipients:
+   - `user-end-session`: the done summary to every agent (the existing end
+     fan-out, now groupId+actionKind-tagged);
+   - `user-kick-agent`: notice to every survivor — in pair topology the
+     driver cannot be kicked, so there is ALWAYS at least one survivor; no
+     zero-recipient case exists or is representable (round 2 C);
+   - `user-cancel-grant`: notice to issuer and assignee, recipient list
+     DEDUPLICATED (a future issuer==assignee grant shape must not produce
+     a double notice — round 2 C);
+   - `pause`/`resume`: notice to every agent.
+   Message ids follow the collision-proof `${base}-s${seq}-r${i}` scheme;
+   snapshot projection means a watch that reattaches mid-action still
+   clears its pending.
 
 ## Confirmation UX (watch TUI)
 
@@ -174,7 +181,8 @@ confirmation*, per ENHANCEMENTS U1:
   single pending slot (a user typing `/end` mid-send waits for the send to
   settle — simplest honest serialization).
 - The transcript renders executed actions with a distinct `⚡ user action`
-  marker (provenance-tagged, like user messages).
+  marker keyed on the notice's durable `actionKind` field — never on
+  provenance alone, which advisory user messages share (round 2 B).
 
 ## Agent-facing surfaces
 
