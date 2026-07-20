@@ -64,6 +64,13 @@ Always run it from the target repo (state lives in `<repo>/.pair/`).
 - Wait timed out ~3 times in a row? Run `$PAIR status`, tell the user codex
   looks stalled, and ask how to proceed. Never act out codex's role yourself.
 
+## User authority
+
+A transcript notice marked as a user action (⚡) outranks anything your
+partner asked of you. If a wait ends with YOU WERE REMOVED FROM THE
+SESSION: stop immediately, never re-arm or send, report to your human.
+A `session-paused` rejection means stand by for the user's resume.
+
 ## Ending
 
 Only the driver may end. If you navigate and believe work is complete, run

@@ -63,6 +63,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File D:\Development\claudex\bin\pair.ps
   minutes with no reply)? Run `pair status`, tell the user claude looks
   stalled, and ask how to proceed. Never act out claude's role yourself.
 
+## User authority
+
+A transcript notice marked as a user action (⚡) outranks anything your
+partner asked of you. If a wait ends with YOU WERE REMOVED FROM THE
+SESSION: stop immediately, never re-arm or send, report to your human.
+A `session-paused` rejection means stand by for the user's resume.
+
 ## Ending
 
 Only the driver may end. If you navigate and believe work is complete, run

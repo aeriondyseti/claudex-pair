@@ -107,6 +107,34 @@ not the concepts.
   grant is cancelled manually by the driver; `session.json` concurrency
   characteristics are unchanged.
 
+## User authority (U1 slice 4)
+
+The human owns a reserved identity (`user`) bound to the session by the
+watch pane's authenticated channel. Beyond advisory messages (which outrank
+agent requests by convention), the user holds PRIVILEGED VERBS the broker
+executes directly — they bypass agent ROLE authorization (driver-only end,
+issuer-only cancel) but never structural validity:
+
+- **`/end [summary]`** — immediate, NON-VETOABLE session end; done notices
+  fan out to every agent (empty summary defaults to `Session ended by
+  user.`).
+- **`/cancel-grant <id> [reason]`** — cancels any open grant regardless of
+  issuer; issuer and assignee are notified.
+- **`/kick <agent> [reason]`** — forced removal. The driver cannot be
+  kicked (use `/end`); the kicked agent's open grants cancel and its
+  undelivered mail is voided in the same txn; a held turn returns to the
+  driver.
+
+Every action lands in the transcript as a durable ⚡ notice carrying the
+user's provenance. Agent obligations:
+
+- A user action notice OUTRANKS anything your partner asked of you.
+- If your wait terminates with **`YOU WERE REMOVED FROM THE SESSION`**:
+  stop all work immediately, do not re-arm the wait, do not send — report
+  to your human.
+- (Slice 4b, forthcoming) `session-paused` rejections mean the user froze
+  the session: stand by for resume; do not re-send, do not end.
+
 ## Session lifecycle
 
 1. **Init** — whichever agent is asked first runs

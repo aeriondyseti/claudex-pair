@@ -1,14 +1,9 @@
 # U1 slice 4 — privileged user actions (design, pre-code)
 
-Status: REV 5 — rounds 1 and 2 fully applied including the round-2 tail
-(B: durable `actionKind` discriminator; C: impossible zero-recipient kick
-fallback removed, cancel notices deduplicated; D: the kicked-wait wire
-seam specified end to end — IpcClient onServerError for unsolicited
-ErrorFrames, typed latched terminal removed-from-session, reconnect
-suppression, KICK-ONLY scope so a racing error can never hide the end
-summary; E editorial: paused is the third status, resume preserves
-allowed paused mutations); all five open questions ruled. No code until approved (slice-4 design gate, per the
-slice-3 close verdict `20260720-113254-615`). Builds on slice 3 (advisory user channel: TOFU
+Status: REV 6 — APPROVED (codex hash-specific verdict `20260720-115032-857`
+at commit d449c0c). Both critique rounds and all tails are incorporated;
+all five open questions ruled. 4a implementation in progress, tests-first.
+Builds on slice 3 (advisory user channel: TOFU
 credential, connection-bound auth, `user-message`, watch composer).
 Upstream requirements: ENHANCEMENTS.md U1 ("state changes go through
 explicit privileged commands — cancel-grant, pause, resume, end — executed
