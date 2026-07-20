@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { MAX_AGENTS, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, MAX_AGENTS, SESSION_ID_PATTERN, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -414,9 +414,11 @@ function decideJoin(
   if (s.agents.length >= MAX_AGENTS) {
     return err(new ProtocolError('registry-full', `The roster is at the M1 bound (${MAX_AGENTS} live agents) — someone must leave before '${command.agent}' can join.`));
   }
+  const badMeta = validateAgentMeta(command.meta, command.agent);
+  if (badMeta) return err(badMeta);
   return ok([
     { kind: 'agent-joined', agent: command.agent, at: envelope.meta.at },
-    { kind: 'registry-updated', version: s.registry.version + 1, change: 'joined', agent: command.agent, at: envelope.meta.at },
+    { kind: 'registry-updated', version: s.registry.version + 1, change: 'joined', agent: command.agent, at: envelope.meta.at, ...(command.meta === undefined ? {} : { meta: command.meta }) },
     messageEvent(
       envelope,
       by,
@@ -552,6 +554,14 @@ function decideInit(
       );
     }
   }
+  if (command.sessionId !== undefined && !SESSION_ID_PATTERN.test(command.sessionId)) {
+    return err(new ProtocolError('invalid-session-id', 'sessionId must be 8-64 chars of letters, digits, and dashes.'));
+  }
+  for (const [id, meta] of Object.entries(command.meta ?? {})) {
+    if (!agents.includes(id)) return err(new ProtocolError('invalid-agents', `meta declared for unknown agent '${id}'`));
+    const bad = validateAgentMeta(meta, id);
+    if (bad) return err(bad);
+  }
   if (agents.length > MAX_AGENTS) {
     return err(new ProtocolError('invalid-agents', `at most ${MAX_AGENTS} agents per session (M1 registry bound); got ${agents.length}`));
   }
@@ -571,9 +581,23 @@ function decideInit(
     );
   }
   return ok([
-    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.displays === undefined ? {} : { displays: command.displays }) },
+    { kind: 'session-initialized', task: command.task, agents, driver: command.driver, at, ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), ...(command.meta === undefined ? {} : { meta: command.meta }) },
     { kind: 'registry-updated', version: 1, change: 'init', at },
   ]);
+}
+
+/** M1: bounded, control-safe per-agent config validation (fail-closed). */
+function validateAgentMeta(meta: import('./types.ts').AgentMeta | undefined, agent: string): ProtocolError | undefined {
+  if (!meta) return undefined;
+  if (meta.display !== undefined && !DISPLAY_PATTERN.test(meta.display)) {
+    return new ProtocolError('invalid-agents', `display for '${agent}' must be 1-64 printable characters (control codes rejected)`);
+  }
+  for (const [field, value] of [['cliType', meta.cliType], ['role', meta.role]] as const) {
+    if (value !== undefined && !AGENT_NAME_PATTERN.test(value)) {
+      return new ProtocolError('invalid-agents', `${field} for '${agent}' must be a lowercase identifier (letter first, letters/digits/dash/underscore, max 16 chars)`);
+    }
+  }
+  return undefined;
 }
 
 function messageEvent(
@@ -635,7 +659,10 @@ function decideSend(
   }
   const events: Event[] = [
     { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at,
-      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }) },
+      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
+      // M1 session binding: conversational messages carry the session id;
+      // system notices (messageEvent) derive theirs from the transcript (v1).
+      ...(s.sessionId === undefined ? {} : { sessionId: s.sessionId }) },
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });

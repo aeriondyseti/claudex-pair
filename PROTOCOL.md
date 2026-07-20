@@ -170,19 +170,32 @@ user's provenance. Agent obligations:
 
 ## Agent registry (M1)
 
-The session carries a lifecycle **registry**: one record per participant —
-filesystem-safe `id` (the protocol identity), presentation-only `display`
-(`pair init -Agents 'codex=Codex CLI'`), optional `cliType`/`role`, and a
-lifecycle status (`active`/`left` with joined/left timestamps). `agents`
-remains the live-member projection. Every membership change (init, join,
-leave, kick — driver or user) bumps a **monotonic registry version** and
-emits a `registry_updated` event to subscribers; `pair status` prints the
-version. The roster is bounded at **8 live agents** (fail-closed at init
-and join; a departure frees the slot). Rejoin is a new admission: fresh
-`joinedAt`, display preserved. Pre-M1 sessions synthesize a v0 registry
-from `agents[]`. Peer-model electorate snapshots key on the registry
-version; admission *authorization* (beyond driver admittance) arrives with
-the peer-model slices.
+The session carries a lifecycle **registry**, mirrored to
+`.pair/agents.json` (state-driven and manifest-covered like
+`user-channel.json`: tamper or absence is repaired from journal state):
+one record per participant — filesystem-safe `id` (the protocol identity),
+presentation-only `display`, and optional `cliType`/`role` identifiers
+(`pair init -Agents 'codex=Codex CLI=codex=reviewer'`; at admission time
+`pair join ... -Display/-CliType/-Role`), plus a lifecycle status
+(`active`/`left` with joined/left timestamps). `agents` remains the
+live-member projection. Every membership change (init, join, leave, kick —
+driver or user) emits a **canonical `registry_updated` event** whose
+monotonic version becomes the state version verbatim (provenance and state
+cannot drift); `pair status` prints it. The roster is bounded at **8 LIVE
+agents** (fail-closed at init and join; a departure frees the slot —
+lifetime records don't count). Rejoin is a new admission: fresh
+`joinedAt`, `leftAt` cleared, config preserved unless overridden.
+
+A **`session_id`** is minted once at `pair init` (deferred here from item
+7) and persists in state, `session.json`, and `agents.json`.
+Conversational messages carry it as a `session:` header line
+(backward-compatible codec, like `reply_to`); system notices derive theirs
+from the transcript in v1. Pre-M1 sessions synthesize a v0 registry from
+`agents[]` and have no `session_id`; status renders both compatibly.
+Peer-model electorate snapshots key on the registry version. Admission
+**authorization** beyond driver admittance (credential binding,
+user-or-policy admission per PEER-MODEL R4) is peer-slice work — M1 clears
+prerequisite 3 only PARTIALLY until it lands.
 
 ## Session lifecycle
 

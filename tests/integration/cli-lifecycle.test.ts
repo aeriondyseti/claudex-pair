@@ -383,3 +383,17 @@ describe('item 7 round 3: untagged resolution wakes the thread; absent authority
     } finally { capture.restore(); }
   }, 10_000);
 });
+
+
+describe('M1: status renders compatibly against a pre-M1 broker', () => {
+  test('an absent registry never crashes renderStatus (observed against a running old broker)', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    const bare = { ...gateway, status: async () => { const s = await gateway.status(); const { registry: _r, ...session } = s.session as StatusDto['session'] & { registry?: unknown }; return { ...s, session } as unknown as StatusDto; } };
+    const capture = captureOut();
+    try {
+      expect(await runBrokerCli('status', new Map(), [], 'unused-root', () => bare)).toBe(0);
+    } finally { capture.restore(); }
+    expect(capture.text()).toContain('pre-M1');
+  });
+});

@@ -13,6 +13,15 @@ export const AGENT_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,15}$/;
  * decide; the CLI casts untrusted strings into these fields. */
 export const MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
+/** M1: session identity minted once at init (deferred here from item 7). */
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{7,63}$/;
+
+/** M1 per-agent config: display is free text minus control chars (it is
+ * presentation-only and never enters paths or headers); cliType/role use
+ * the agent-name grammar. */
+export const DISPLAY_PATTERN = /^[^\u0000-\u001f\u007f]{1,64}$/;
+export type AgentMeta = { readonly display?: string; readonly cliType?: string; readonly role?: string };
+
 export type MessageType =
   | 'ask'
   | 'answer'
@@ -99,6 +108,9 @@ export type SessionState = {
   readonly status: SessionStatus;
   readonly started: Timestamp;
   readonly grants: Readonly<Record<GrantId, Grant>>;
+  /** M1: session identity — minted at init from M1 on; absent only on
+   * pre-M1 sessions. Conversational message headers carry it (`session:`). */
+  readonly sessionId?: string;
   /** M1: full lifecycle registry. `agents` above remains the LIVE-member
    * projection (evolve keeps both consistent) — existing validation and
    * turn logic read the projection unchanged. */

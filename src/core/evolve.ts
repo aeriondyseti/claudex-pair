@@ -1,5 +1,5 @@
 import type { Event } from './events.ts';
-import type { AgentRecord, SessionState } from './types.ts';
+import type { AgentMeta, AgentRecord, Registry, SessionState } from './types.ts';
 
 /**
  * Pure fold: state = events.reduce(evolve, undefined). Total over every
@@ -17,9 +17,14 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         status: 'active',
         started: event.at,
         grants: {},
+        ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
+        // M1 canonical transitions: init declares the roster at version 0;
+        // every LATER version is set by a registry-updated event (the ONE
+        // canonical registry transition) — the event's version IS the state
+        // version, so provenance and state cannot drift.
         registry: {
-          version: 1,
-          agents: Object.fromEntries(event.agents.map((a) => [a, liveRecord(a, event.at, event.displays?.[a])])),
+          version: 0,
+          agents: Object.fromEntries(event.agents.map((a) => [a, liveRecord(a, event.at, event.meta?.[a])])),
         },
       };
     case 'turn-passed':
@@ -73,43 +78,13 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state;
     case 'agent-left':
     case 'agent-kicked':
-      return (
-        state && {
-          ...state,
-          agents: state.agents.filter((a) => a !== event.agent),
-          registry: {
-            version: state.registry.version + 1,
-            agents: {
-              ...state.registry.agents,
-              [event.agent]: {
-                ...(state.registry.agents[event.agent] ?? liveRecord(event.agent, event.at)),
-                status: 'left',
-                leftAt: event.at,
-              },
-            },
-          },
-        }
-      );
+      // Membership events mutate the LIVE projection only; the paired
+      // registry-updated event carries the canonical registry transition.
+      return state && { ...state, agents: state.agents.filter((a) => a !== event.agent) };
     case 'agent-joined':
-      return (
-        state && {
-          ...state,
-          agents: [...state.agents, event.agent],
-          registry: {
-            version: state.registry.version + 1,
-            agents: {
-              ...state.registry.agents,
-              // Rejoin is a NEW admission: fresh joinedAt, leftAt cleared;
-              // the display survives from the previous record.
-              [event.agent]: liveRecord(event.agent, event.at, state.registry.agents[event.agent]?.display),
-            },
-          },
-        }
-      );
+      return state && { ...state, agents: [...state.agents, event.agent] };
     case 'registry-updated':
-      // Notification/provenance only — the membership event carries the
-      // registry mutation, so pre-M1 journals replay correctly.
-      return state;
+      return state && { ...state, registry: applyRegistryUpdate(state.registry, event) };
     case 'message-sent':
       return state; // delivery is the Mailbox port's concern, not session state
     case 'user-channel-registered':
@@ -123,8 +98,39 @@ export function replay(events: readonly Event[]): SessionState | undefined {
   return events.reduce<SessionState | undefined>(evolve, undefined);
 }
 
-function liveRecord(id: string, at: string, display?: string): AgentRecord {
-  return { id, display: display ?? id, status: 'active', joinedAt: at };
+/** M1: the ONE canonical registry transition — shared by evolve and the
+ * fs binding. event.version becomes the state version verbatim; a rejoin
+ * is a NEW admission (fresh joinedAt, leftAt cleared) that inherits
+ * display/cliType/role from the prior record unless the event overrides. */
+export function applyRegistryUpdate(registry: Registry, event: Extract<Event, { kind: 'registry-updated' }>): Registry {
+  const agents: Record<string, AgentRecord> = { ...registry.agents };
+  if (event.agent !== undefined) {
+    const prev = agents[event.agent];
+    if (event.change === 'joined') {
+      const display = event.meta?.display ?? prev?.display;
+      const cliType = event.meta?.cliType ?? prev?.cliType;
+      const role = event.meta?.role ?? prev?.role;
+      agents[event.agent] = liveRecord(event.agent, event.at, {
+        ...(display === undefined ? {} : { display }),
+        ...(cliType === undefined ? {} : { cliType }),
+        ...(role === undefined ? {} : { role }),
+      });
+    } else if (event.change === 'left' || event.change === 'kicked') {
+      agents[event.agent] = { ...(prev ?? liveRecord(event.agent, event.at)), status: 'left', leftAt: event.at };
+    }
+  }
+  return { version: event.version, agents };
+}
+
+function liveRecord(id: string, at: string, meta?: AgentMeta): AgentRecord {
+  return {
+    id,
+    display: meta?.display ?? id,
+    status: 'active',
+    joinedAt: at,
+    ...(meta?.cliType === undefined ? {} : { cliType: meta.cliType }),
+    ...(meta?.role === undefined ? {} : { role: meta.role }),
+  };
 }
 
 function updateGrant(

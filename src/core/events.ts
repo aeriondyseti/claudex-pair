@@ -1,4 +1,4 @@
-import type { AgentId, GrantId, GrantScope, MessageId, MessageType, Timestamp, TurnMode } from './types.ts';
+import type { AgentMeta, AgentId, GrantId, GrantScope, MessageId, MessageType, Timestamp, TurnMode } from './types.ts';
 
 /**
  * Events are the WAL vocabulary (ENHANCEMENTS.md rev 7): the future broker's
@@ -29,9 +29,9 @@ export type Event =
    * membership event itself mutates the registry in evolve, so replaying
    * pre-M1 journals still builds a correct registry). version is the
    * POST-change registry version. */
-  | { kind: 'registry-updated'; version: number; change: 'init' | 'joined' | 'left' | 'kicked'; agent?: AgentId; at: Timestamp }
-  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; displays?: Readonly<Record<AgentId, string>> }
-  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId }
+  | { kind: 'registry-updated'; version: number; change: 'init' | 'joined' | 'left' | 'kicked'; agent?: AgentId; meta?: AgentMeta; at: Timestamp }
+  | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>> }
+  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
   | { kind: 'session-ended'; by: AgentId; summary: string; at: Timestamp }

@@ -1,4 +1,4 @@
-import type { AgentId, GrantId, MessageId, MessageType, Timestamp, TurnMode } from './types.ts';
+import type { AgentMeta, AgentId, GrantId, MessageId, MessageType, Timestamp, TurnMode } from './types.ts';
 
 /**
  * Ids, time, and the authenticated principal are produced at the edges and
@@ -11,7 +11,7 @@ export type CommandMeta = {
 };
 
 export type Command =
-  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; displays?: Readonly<Record<AgentId, string>> }
+  | { kind: 'init-session'; task: string; agents: readonly AgentId[]; driver: AgentId; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>> }
   // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
   // message answers. Advisory metadata in the core; the broker derives the
   // awaiting-set from it. Never affects turn semantics.
@@ -27,7 +27,7 @@ export type Command =
   | { kind: 'revoke-turn'; reason: string }
   // ENHANCEMENTS 11: roster mutations — driver authority, uniformly.
   | { kind: 'leave-session' }
-  | { kind: 'join-session'; agent: AgentId }
+  | { kind: 'join-session'; agent: AgentId; meta?: AgentMeta }
   | { kind: 'kick-agent'; agent: AgentId; reason: string }
   // U1 slice 3 (U1-SLICE3-DESIGN.md, approved): INTERNAL shape only — the
   // authenticated user-channel handler allocates groupId (=== reqId) and

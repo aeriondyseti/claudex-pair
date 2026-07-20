@@ -44,13 +44,20 @@ export async function runBrokerCli(
     }
     if (command === 'init') {
       const task = required(flags, 'task', "init requires -Task '<what the agents are building>'");
-      // M1 ids-vs-display: each -Agents token is `id[=Display Name]`; the id
-      // stays filesystem-safe, the display is presentation-only.
+      // M1 ids-vs-display + per-agent config: each -Agents token is
+      // `id[=Display Name[=cliType[=role]]]` — the id stays filesystem-safe;
+      // display is presentation-only; cliType/role are identifiers.
       const tokens = (str(flags, 'agents') ?? 'claude,codex').split(',').map((t) => t.trim()).filter(Boolean);
       const agents = tokens.map((t) => t.split('=')[0]!.trim().toLowerCase());
-      const displays = Object.fromEntries(tokens.flatMap((t) => { const eq = t.indexOf('='); return eq > 0 ? [[t.slice(0, eq).trim().toLowerCase(), t.slice(eq + 1).trim()]] : []; }));
+      const meta = Object.fromEntries(tokens.flatMap((t) => {
+        const [id, display, cliType, role] = t.split('=').map((p) => p.trim());
+        const m = { ...(display ? { display } : {}), ...(cliType ? { cliType: cliType.toLowerCase() } : {}), ...(role ? { role: role.toLowerCase() } : {}) };
+        return Object.keys(m).length ? [[id!.toLowerCase(), m]] : [];
+      }));
       const driver = (str(flags, 'driver') ?? 'claude').toLowerCase();
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, ...(Object.keys(displays).length ? { displays } : {}) });
+      // M1: session identity is minted HERE, once, at init (deferred from item 7).
+      const sessionId = randomUUID();
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, ...(Object.keys(meta).length ? { meta } : {}) });
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);
@@ -98,7 +105,16 @@ export async function runBrokerCli(
       out(`Turn revoked from ${revoked?.kind === 'turn-revoked' ? revoked.from : 'partner'}; ${from} now holds the turn. Broker liveness guard verified there was no live delivery lease.`); return 0;
     }
     if (command === 'leave') { const as = required(flags, 'as', 'leave requires -As <you>').toLowerCase(); await execute(gateway, as, { kind: 'leave-session' }); out(`${as} left the session.`); return 0; }
-    if (command === 'join') { const from = required(flags, 'from', 'join requires -From <driver>').toLowerCase(); const agent = required(flags, 'agent', 'join requires -Agent <name>').toLowerCase(); await execute(gateway, from, { kind: 'join-session', agent }); out(`${agent} joined the session. Earlier deliveries are not replayed; the rejoined agent starts with a fresh cursor.`); return 0; }
+    if (command === 'join') {
+      const from = required(flags, 'from', 'join requires -From <driver>').toLowerCase();
+      const agent = required(flags, 'agent', 'join requires -Agent <name>').toLowerCase();
+      // M1 per-agent config at admission time.
+      const display = str(flags, 'display'); const cliType = str(flags, 'clitype'); const role = str(flags, 'role');
+      const meta = { ...(display ? { display } : {}), ...(cliType ? { cliType: cliType.toLowerCase() } : {}), ...(role ? { role: role.toLowerCase() } : {}) };
+      await execute(gateway, from, { kind: 'join-session', agent, ...(Object.keys(meta).length ? { meta } : {}) });
+      out(`${agent} joined the session. Earlier deliveries are not replayed; the rejoined agent starts with a fresh cursor.`);
+      return 0;
+    }
     if (command === 'kick') { const from = required(flags, 'from', 'kick requires -From <driver>').toLowerCase(); const agent = required(flags, 'agent', 'kick requires -Agent <name>').toLowerCase(); await execute(gateway, from, { kind: 'kick-agent', agent, reason: str(flags, 'reason') ?? '' }); out(`${agent} was removed from the session; its pending deliveries were voided.`); return 0; }
     if (command === 'end') {
       const as = required(flags, 'as', 'end requires -As <your own agent name>').toLowerCase();
@@ -188,9 +204,13 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
 }
 
 function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
-  const reg = s.session.registry;
-  const left = Object.values(reg.agents).filter((a) => a.status === 'left').map((a) => a.id);
-  out(`Registry:  v${reg.version} (${s.session.agents.length} live, cap ${MAX_AGENTS}${left.length ? `; left: ${left.join(', ')}` : ''})`); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+  // M1: a RUNNING pre-M1 broker serves a session without registry/sessionId
+  // — render compatibly, never crash (codex M1 finding 5).
+  const reg = s.session.registry as StatusDto['session']['registry'] | undefined;
+  if (reg) {
+    const left = Object.values(reg.agents).filter((a) => a.status === 'left').map((a) => a.id);
+    out(`Session:   ${s.session.sessionId ?? '(pre-M1 — none)'}   Registry: v${reg.version} (${s.session.agents.length} live, cap ${MAX_AGENTS}${left.length ? `; left: ${left.join(', ')}` : ''})`);
+  } else out('Session:   (pre-M1 broker — no registry)'); out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));

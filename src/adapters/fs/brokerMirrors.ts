@@ -34,6 +34,17 @@ const USER_CHANNEL_MIRROR = 'user-channel.json';
 /** Canonical informational-mirror content derived from session state —
  * undefined means the file must not exist. Single source for writer and
  * reconcile's expected-hash comparison. */
+const AGENTS_MIRROR = 'agents.json';
+
+/** M1: `.pair/agents.json` — the registry mirror ENHANCEMENTS M1 names.
+ * INFORMATIONAL like user-channel.json: state-driven, manifest-covered,
+ * repaired from journal state on any disagreement (incl. tamper and the
+ * pre-M1 upgrade where the file is absent from disk AND old manifests). */
+function agentsContent(state: SessionState | undefined): string | undefined {
+  if (!state) return undefined;
+  return `${JSON.stringify({ sessionId: state.sessionId ?? null, registry: state.registry }, null, 2)}\n`;
+}
+
 function userChannelContent(state: SessionState | undefined): string | undefined {
   if (!state?.userChannelTokenHash) return undefined;
   return `${JSON.stringify({
@@ -74,6 +85,8 @@ export class FsMirrors implements MirrorStore {
     // mirror (codex round 1): normalize per the NEW state — which removes
     // the file, since a just-initialized session has no binding.
     await this.#writeUserChannel(state);
+    // M1: the registry mirror exists from the first commit onward.
+    await this.#writeAgents(state);
     return result;
   }
 
@@ -92,6 +105,7 @@ export class FsMirrors implements MirrorStore {
             id: event.id, from: event.from, to: event.to,
             type: event.type, turn: event.turn, sent: event.at, body: event.body,
             ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }),
+            ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
           });
           break;
         case 'grant-issued':
@@ -102,6 +116,11 @@ export class FsMirrors implements MirrorStore {
           break;
         case 'user-channel-registered':
           await this.#writeUserChannel(state);
+          break;
+        case 'registry-updated':
+          // Membership cases above rewrote session.json; this keeps the
+          // named M1 mirror in lockstep within the same txn application.
+          await this.#writeAgents(state);
           break;
         case 'turn-passed':
         case 'driver-changed':
@@ -126,6 +145,20 @@ export class FsMirrors implements MirrorStore {
    * (hashMirrorFiles) so an external edit is tamper, and removed on rebuild
    * when the recovered state carries no binding.
    */
+  /** M1: write/repair/remove the agents.json registry mirror from state. */
+  async #writeAgents(state: SessionState | undefined): Promise<void> {
+    const path = join(this.pairDir, AGENTS_MIRROR);
+    const content = agentsContent(state);
+    if (content === undefined) {
+      await rm(path, { force: true });
+      return;
+    }
+    await mkdir(this.pairDir, { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, content, 'utf8');
+    await rename(tmp, path);
+  }
+
   async #writeUserChannel(state: SessionState | undefined): Promise<void> {
     const path = join(this.pairDir, USER_CHANNEL_MIRROR);
     const content = userChannelContent(state);
@@ -185,12 +218,12 @@ export class FsMirrors implements MirrorStore {
     // deleting it must never put the broker into a global read-only
     // conflict — it is repaired from journal state below, after the
     // authoritative set is judged. Auth never consults it.
-    const authoritative = ([path]: [string, string]) => path !== USER_CHANNEL_MIRROR;
+    const authoritative = ([path]: [string, string]) => path !== USER_CHANNEL_MIRROR && path !== AGENTS_MIRROR;
     const diverged = Object.entries(manifest.files)
       .filter(authoritative)
       .filter(([path, hash]) => current[path] !== hash)
       .map(([path]) => path);
-    const added = Object.keys(current).filter((p) => p !== USER_CHANNEL_MIRROR && !(p in manifest.files));
+    const added = Object.keys(current).filter((p) => p !== USER_CHANNEL_MIRROR && p !== AGENTS_MIRROR && !(p in manifest.files));
     if (diverged.length || added.length) {
       throw new MirrorConflictError([...diverged.map((p) => `changed: ${p}`), ...added.map((p) => `added: ${p}`)].join(', '));
     }
@@ -201,8 +234,18 @@ export class FsMirrors implements MirrorStore {
     // BOTH disk and old manifest: drift comparison read 'clean' forever).
     const expected = userChannelContent(state);
     const expectedHash = expected === undefined ? undefined : createHash('sha256').update(expected).digest('hex');
+    const expectedAgents = agentsContent(state);
+    const expectedAgentsHash = expectedAgents === undefined ? undefined : createHash('sha256').update(expectedAgents).digest('hex');
+    let repaired = false;
     if (current[USER_CHANNEL_MIRROR] !== expectedHash) {
       await this.#writeUserChannel(state); // create, normalize, or remove
+      repaired = true;
+    }
+    if (current[AGENTS_MIRROR] !== expectedAgentsHash) {
+      await this.#writeAgents(state); // M1: create, repair, or remove
+      repaired = true;
+    }
+    if (repaired) {
       await this.writeManifest(headSeq);
       return 'rebuilt';
     }
@@ -225,6 +268,7 @@ export class FsMirrors implements MirrorStore {
     // Outside the state guard deliberately: rebuild(undefined) must also
     // remove a stale mirror — no recovered session means no binding.
     await this.#writeUserChannel(state);
+    await this.#writeAgents(state);
     for (const agent of state?.agents ?? []) {
       const dir = join(this.pairDir, 'inbox', agent);
       await rm(dir, { recursive: true, force: true });
@@ -235,6 +279,7 @@ export class FsMirrors implements MirrorStore {
         id: d.message.id, from: d.message.from, to: d.message.to,
         type: d.message.type, turn: d.message.turn, sent: d.message.at, body: d.message.body,
         ...(d.message.replyTo === undefined ? {} : { replyTo: d.message.replyTo }),
+        ...(d.message.sessionId === undefined ? {} : { sessionId: d.message.sessionId }),
       });
     }
     await this.writeManifest(headSeq);
@@ -243,7 +288,7 @@ export class FsMirrors implements MirrorStore {
   async archived(last?: number): Promise<readonly StoredMessage[]> {
     return (await this.#mailbox.archived(last)).map((a) => ({
       name: a.name,
-      header: { id: a.message.id, from: a.message.from, to: a.message.to, type: a.message.type, turn: a.message.turn, sent: a.message.sent, ...(a.message.replyTo === undefined ? {} : { replyTo: a.message.replyTo }) },
+      header: { id: a.message.id, from: a.message.from, to: a.message.to, type: a.message.type, turn: a.message.turn, sent: a.message.sent, ...(a.message.replyTo === undefined ? {} : { replyTo: a.message.replyTo }), ...(a.message.sessionId === undefined ? {} : { sessionId: a.message.sessionId }) },
       body: a.message.body,
       raw: serializeMessage(a.message),
     }));
@@ -268,6 +313,9 @@ export class FsMirrors implements MirrorStore {
       }
     };
     await addFile('session.json');
+    // M1 registry mirror: covered for drift detection, exempt from
+    // authoritative conflict (state-repaired, like user-channel.json).
+    await addFile(AGENTS_MIRROR);
     // Covered so drift is DETECTED, but exempt from authoritative conflict:
     // reconcile repairs it from journal state instead (informational file).
     await addFile(USER_CHANNEL_MIRROR);
@@ -290,8 +338,8 @@ export class FsMirrors implements MirrorStore {
 
 /** The fs adapter's message codec, injected into the broker core. */
 export const fsMessageCodec = {
-  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; body: string }) => messageFilename(m as PairMessage),
-  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; body: string }) => serializeMessage(m as PairMessage),
+  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; body: string }) => messageFilename(m as PairMessage),
+  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; body: string }) => serializeMessage(m as PairMessage),
 };
 
 function toDiskSession(state: SessionState): DiskSession {
@@ -303,6 +351,7 @@ function toDiskSession(state: SessionState): DiskSession {
     turn: state.turn,
     status: state.status,
     started: state.started,
+    ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
     registry: state.registry,
   };
 }

@@ -56,6 +56,14 @@ describe('item 7: reply_to codec round-trip (codex blocker 2)', () => {
     expect(parseMessage(raw)).toEqual(threaded);
   });
 
+  test('M1: sessionId serializes as session and round-trips; legacy raw parses with it absent', () => {
+    const bound: PairMessage = { ...base, sessionId: 'session-0001' };
+    const raw = serializeMessage(bound);
+    expect(raw).toContain('session: session-0001');
+    expect(parseMessage(raw)).toEqual(bound);
+    expect('sessionId' in parseMessage(serializeMessage(base))).toBeFalse();
+  });
+
   test('backward compatible: no replyTo emits no reply_to line; legacy raw parses with it absent', () => {
     const raw = serializeMessage(base);
     expect(raw).not.toContain('reply_to');

@@ -1,6 +1,7 @@
 import type { CommandEnvelope } from '@core/commands.ts';
 import type { Event } from '@core/events.ts';
-import type { Grant, SessionState } from '@core/types.ts';
+import type { Grant, Registry, SessionState } from '@core/types.ts';
+import { applyRegistryUpdate, replay } from '@core/evolve.ts';
 import { navigators } from '@core/queries.ts';
 import type { CommitReceipt, Deps, Mailbox, ProtocolStore, StoredMessage } from '@app/ports/index.ts';
 import { FsGrantStore, FsMailbox, FsSessionStore, fromDiskGrant, serializeMessage, toDiskGrant, type DiskSession, type PairMessage } from '@adapters/fs/index.ts';
@@ -35,11 +36,9 @@ export function bindFsDeps(root: string): Deps {
       status: disk.status,
       started: disk.started,
       grants: grantMap,
+      ...(disk.sessionId === undefined ? {} : { sessionId: disk.sessionId }),
       // M1 legacy tolerance: fs sessions without a registry synthesize v0.
-      registry: disk.registry ?? {
-        version: 0,
-        agents: Object.fromEntries(disk.agents.map((a) => [a, { id: a, display: a, status: 'active' as const, joinedAt: disk.started }])),
-      },
+      registry: disk.registry ?? synthesizeRegistry(disk),
     };
   };
 
@@ -66,6 +65,8 @@ export function bindFsDeps(root: string): Deps {
           const name = await mailboxFs.publish({
             id: event.id, from: event.from, to: event.to,
             type: event.type, turn: event.turn, sent: event.at, body: event.body,
+            ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }),
+            ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
           });
           messageFiles.push(name);
           // Removed agents have no live inbox. Keep their notice durable in
@@ -118,6 +119,12 @@ export function bindFsDeps(root: string): Deps {
         case 'grant-cancelled':
           await grants.transition(event.grantId, ['offered', 'active'], (g) => ({ ...g, state: 'cancelled', result: event.reason || g.result }), event.at, activeGuard);
           break;
+        case 'registry-updated':
+          // M1: fs mode persists the canonical transition — without this,
+          // explicit-fs sessions lose version/history on every reload.
+          session.registry = applyRegistryUpdate(session.registry ?? synthesizeRegistry(session), event);
+          sessionDirty = true;
+          break;
         case 'session-initialized':
           break; // handled by initialize()
       }
@@ -131,6 +138,10 @@ export function bindFsDeps(root: string): Deps {
     async initialize(_envelope, events) {
       const init = events.find((e) => e.kind === 'session-initialized');
       if (!init || init.kind !== 'session-initialized') throw new Error('initialize called without session-initialized event');
+      // Replay the full init event list so the registry (v0 declaration +
+      // the canonical registry-updated transition) and sessionId land in
+      // the mirror exactly as the core computed them.
+      const initState = replay([...events]);
       const disk: DiskSession = {
         task: init.task,
         agents: [...init.agents],
@@ -139,6 +150,8 @@ export function bindFsDeps(root: string): Deps {
         turn: init.driver,
         status: 'active',
         started: init.at,
+        ...(initState?.sessionId === undefined ? {} : { sessionId: initState.sessionId }),
+        ...(initState?.registry === undefined ? {} : { registry: initState.registry }),
       };
       return sessions.initialize(disk);
     },
@@ -153,6 +166,8 @@ export function bindFsDeps(root: string): Deps {
     header: {
       id: entry.message.id, from: entry.message.from, to: entry.message.to,
       type: entry.message.type, turn: entry.message.turn, sent: entry.message.sent,
+      ...(entry.message.replyTo === undefined ? {} : { replyTo: entry.message.replyTo }),
+      ...(entry.message.sessionId === undefined ? {} : { sessionId: entry.message.sessionId }),
     },
     body: entry.message.body,
     raw: serializeMessage(entry.message),
@@ -165,6 +180,15 @@ export function bindFsDeps(root: string): Deps {
   };
 
   return { store, mailbox, clock: systemClock, ids: systemIds };
+}
+
+
+/** M1 legacy tolerance: v0 registry from the live roster. */
+function synthesizeRegistry(disk: { agents: readonly string[]; started: string }): Registry {
+  return {
+    version: 0,
+    agents: Object.fromEntries(disk.agents.map((a) => [a, { id: a, display: a, status: 'active' as const, joinedAt: disk.started }])),
+  };
 }
 
 export { navigators };

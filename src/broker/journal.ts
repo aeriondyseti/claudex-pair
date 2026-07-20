@@ -141,6 +141,28 @@ function normalizeRegistry(state: SessionState | undefined): SessionState | unde
   };
 }
 
+/** M1 legacy upgrade: add active records for live agents the replayed
+ * registry never saw, and mark records for departed agents left. Version
+ * is untouched (legacy history has no versioned transitions to claim). */
+function reconcileRegistryProjection(state: SessionState | undefined): SessionState | undefined {
+  if (!state) return state;
+  const agents: Record<string, import('@core/types.ts').AgentRecord> = { ...state.registry.agents };
+  let dirty = false;
+  for (const a of state.agents) {
+    if (agents[a]?.status !== 'active') {
+      agents[a] = { id: a, display: agents[a]?.display ?? a, status: 'active', joinedAt: agents[a]?.joinedAt ?? state.started };
+      dirty = true;
+    }
+  }
+  for (const [id, rec] of Object.entries(agents)) {
+    if (rec.status === 'active' && !state.agents.includes(id)) {
+      agents[id] = { ...rec, status: 'left' };
+      dirty = true;
+    }
+  }
+  return dirty ? { ...state, registry: { ...state.registry, agents } } : state;
+}
+
 function legacyAwaitingFrom(transcript: readonly TranscriptRecord[]): AwaitingEntry[] {
   const map = new Map<string, AwaitingEntry>();
   for (const t of transcript) {
@@ -254,6 +276,11 @@ export class Journal {
       this.segmentIndex = 1;
       this.segmentBytes = 0;
     }
+    // M1 legacy upgrade: pre-M1 segments replay membership without
+    // registry-updated events — force the registry to agree with the live
+    // projection (new sessions are consistent by construction; this is a
+    // no-op for them).
+    this.state = reconcileRegistryProjection(this.state);
   }
 
   private applyRecord(record: TxnRecord): void {

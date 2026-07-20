@@ -28,6 +28,8 @@ export type StoredMessage = {
     readonly actionKind?: import('@core/events.ts').UserActionKind;
     /** Item 7 threading: the MessageId this message answers. */
     readonly replyTo?: MessageId;
+    /** M1: the session this message belongs to (`session:` header line). */
+    readonly sessionId?: string;
   };
   readonly body: string;
   readonly raw: string;

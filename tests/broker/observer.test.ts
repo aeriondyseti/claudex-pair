@@ -382,3 +382,25 @@ describe('observer idle semantics', () => {
     expect(stoppedIdle2).toBe(0); // participant connection keeps it alive
   }, 15_000);
 });
+
+
+describe('M1: registry-updated reaches activity subscribers with the post-state version', () => {
+  test('one registry-updated per membership commit; version equals status registry version', async () => {
+    const core = await seeded(await tempRoot());
+    const got: ObserverPushWire[] = [];
+    await observe(core, 'obs-m1', got);
+
+    const r = await core.execute('t-join', 'client-a', 'claude', { command: { kind: 'join-session', agent: 'agy', meta: { display: 'Antigravity' } } });
+    expect(r.ok).toBeTrue();
+
+    const activity = got.filter((p): p is Extract<ObserverPushWire, { kind: 'activity' }> => p.kind === 'activity');
+    const regEvents = activity.flatMap((a) => a.events.filter((e) => e.kind === 'registry-updated'));
+    expect(regEvents).toHaveLength(1);
+
+    const status = await core.query('st-m1', 'status');
+    expect(status.ok).toBeTrue();
+    const session = (status.ok ? (status.data as { session: { registry: { version: number; agents: Record<string, { display: string }> } } }).session : undefined)!;
+    expect((regEvents[0] as { version: number }).version).toBe(session.registry.version);
+    expect(session.registry.agents['agy']!.display).toBe('Antigravity');
+  });
+});

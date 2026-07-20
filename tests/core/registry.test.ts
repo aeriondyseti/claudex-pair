@@ -10,11 +10,11 @@ import { MAX_AGENTS, type SessionState } from '../../src/core/types.ts';
  * the bounded roster — tests-first per the session task. */
 
 const AT = '2026-07-20 14:00:00';
-const env = (command: unknown, principal: string, id: string): CommandEnvelope =>
-  ({ command, meta: { id, at: AT, principal } }) as CommandEnvelope;
+const env = (command: unknown, principal: string, id: string, at = AT): CommandEnvelope =>
+  ({ command, meta: { id, at, principal } }) as CommandEnvelope;
 
-function run(state: SessionState | undefined, command: unknown, principal: string, id: string): Event[] {
-  const d = decide(state, env(command, principal, id));
+function run(state: SessionState | undefined, command: unknown, principal: string, id: string, at = AT): Event[] {
+  const d = decide(state, env(command, principal, id, at));
   if (!d.ok) throw d.error;
   return d.value;
 }
@@ -23,20 +23,40 @@ function applyAll(state: SessionState, events: readonly Event[]): SessionState {
   return events.reduce<SessionState | undefined>(evolve, state)!;
 }
 
-function initEvents(agents: string[] = ['claude', 'codex'], displays?: Record<string, string>): Event[] {
-  return run(undefined, { kind: 'init-session', task: 't', agents, driver: agents[0]!, ...(displays ? { displays } : {}) }, agents[0]!, 'i1');
+function initEvents(agents: string[] = ['claude', 'codex'], meta?: Record<string, { display?: string; cliType?: string; role?: string }>): Event[] {
+  return run(undefined, { kind: 'init-session', task: 't', agents, driver: agents[0]!, sessionId: 'session-0001', ...(meta ? { meta } : {}) }, agents[0]!, 'i1');
 }
 
 const registryUpdates = (events: readonly Event[]) => events.filter((e) => e.kind === 'registry-updated');
 
 describe('M1: init builds the registry', () => {
-  test('v1 with active records, display defaulting to id, explicit displays honored', () => {
-    const events = initEvents(['claude', 'codex'], { codex: 'Codex CLI' });
+  test('v1 with active records, display defaulting to id, full per-agent config honored', () => {
+    const events = initEvents(['claude', 'codex'], { codex: { display: 'Codex CLI', cliType: 'codex', role: 'reviewer' } });
     const s = replay(events)!;
+    expect(s.sessionId).toBe('session-0001');
     expect(s.registry.version).toBe(1);
     expect(s.registry.agents['claude']).toEqual({ id: 'claude', display: 'claude', status: 'active', joinedAt: AT });
-    expect(s.registry.agents['codex']).toEqual({ id: 'codex', display: 'Codex CLI', status: 'active', joinedAt: AT });
+    expect(s.registry.agents['codex']).toEqual({ id: 'codex', display: 'Codex CLI', cliType: 'codex', role: 'reviewer', status: 'active', joinedAt: AT });
     expect(registryUpdates(events)).toEqual([{ kind: 'registry-updated', version: 1, change: 'init', at: AT }]);
+  });
+
+  test('sessionId binds outgoing conversational message headers', () => {
+    const s = replay(initEvents())!;
+    const sent = run(s, { kind: 'send-message', to: 'codex', type: 'info', turn: 'keep', body: 'x' }, 'claude', 's1').find((e) => e.kind === 'message-sent');
+    expect(sent).toMatchObject({ sessionId: 'session-0001' });
+  });
+
+  test('meta and sessionId are validated fail-closed', () => {
+    const err = (command: unknown) => {
+      const d = decide(undefined, env(command, 'claude', 'iv'));
+      expect(d.ok).toBeFalse();
+      return d.ok ? '' : (d.error as { code?: string }).code;
+    };
+    const base = { kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude' };
+    expect(err({ ...base, sessionId: 'a b c' })).toBe('invalid-session-id');
+    expect(err({ ...base, meta: { codex: { display: 'evil\u0000name' } } })).toBe('invalid-agents');
+    expect(err({ ...base, meta: { codex: { cliType: 'Not Valid!' } } })).toBe('invalid-agents');
+    expect(err({ ...base, meta: { stranger: { display: 'x' } } })).toBe('invalid-agents');
   });
 
   test('the M1 bound is enforced at init, fail-closed', () => {
@@ -77,11 +97,30 @@ describe('M1: membership changes version the registry', () => {
     expect(s.registry.version).toBe(5);
   });
 
-  test('a rejoining agent keeps its display name', () => {
-    let s = replay(initEvents(['claude', 'codex'], { codex: 'Codex CLI' }))!;
+  test('changed-time rejoin: NEW admission gets the new joinedAt, clears leftAt, keeps config', () => {
+    const LATER = '2026-07-20 15:30:00';
+    let s = replay(initEvents(['claude', 'codex'], { codex: { display: 'Codex CLI', cliType: 'codex' } }))!;
     s = applyAll(s, run(s, { kind: 'leave-session' }, 'codex', 'l2'));
-    s = applyAll(s, run(s, { kind: 'join-session', agent: 'codex' }, 'claude', 'j3'));
-    expect(s.registry.agents['codex']!.display).toBe('Codex CLI');
+    expect(s.registry.agents['codex']).toMatchObject({ status: 'left', leftAt: AT, joinedAt: AT });
+    s = applyAll(s, run(s, { kind: 'join-session', agent: 'codex' }, 'claude', 'j3', LATER));
+    expect(s.registry.agents['codex']).toMatchObject({ display: 'Codex CLI', cliType: 'codex', status: 'active', joinedAt: LATER });
+    expect('leftAt' in s.registry.agents['codex']!).toBeFalse();
+  });
+
+  test('join-time meta overrides the prior record (validated)', () => {
+    let s = replay(initEvents())!;
+    s = applyAll(s, run(s, { kind: 'leave-session' }, 'codex', 'l4'));
+    s = applyAll(s, run(s, { kind: 'join-session', agent: 'codex', meta: { role: 'tester' } }, 'claude', 'j6'));
+    expect(s.registry.agents['codex']).toMatchObject({ role: 'tester', status: 'active' });
+    const d = decide(s, env({ kind: 'join-session', agent: 'agy', meta: { role: 'BAD ROLE' } }, 'claude', 'j7'));
+    expect(d.ok).toBeFalse();
+  });
+
+  test('the registry-updated event is CANONICAL: its version becomes the state version verbatim', () => {
+    const s = replay(initEvents())!;
+    const forced = evolve(s, { kind: 'registry-updated', version: 7, change: 'joined', agent: 'ghost', at: AT })!;
+    expect(forced.registry.version).toBe(7);
+    expect(forced.registry.agents['ghost']).toMatchObject({ status: 'active' });
   });
 
   test('join at the live cap is rejected with registry-full', () => {

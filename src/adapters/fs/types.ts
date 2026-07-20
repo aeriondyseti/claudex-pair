@@ -8,6 +8,8 @@ export type DiskSession = {
   turn: AgentId;
   status: 'active' | 'paused' | 'completed';
   started: Timestamp;
+  /** M1: session identity (absent on legacy sessions). */
+  sessionId?: string;
   /** M1: mirrored lifecycle registry. Optional — legacy sessions lack it
    * and consumers synthesize v0 from agents[]. */
   registry?: Registry;
@@ -36,6 +38,8 @@ export type PairMessage = {
   sent: Timestamp;
   /** Item 7: serialized as `reply_to:` (optional, backward compatible). */
   replyTo?: MessageId;
+  /** M1: serialized as `session:` (optional, backward compatible). */
+  sessionId?: string;
   body: string;
 };
 

@@ -42,6 +42,7 @@ export type ProtocolErrorCode =
   | 'user-auth-failed'
   | 'invalid-recipient'
   | 'registry-full'
+  | 'invalid-session-id'
   | 'invalid-message-type'
   | 'invalid-reply-to'
   | 'session-paused'

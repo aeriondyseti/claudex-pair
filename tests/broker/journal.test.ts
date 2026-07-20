@@ -241,3 +241,30 @@ describe('M1: legacy snapshot registry synthesis', () => {
     expect(reopened.sessionState?.registry.agents['claude']).toMatchObject({ status: 'active', display: 'claude' });
   });
 });
+
+
+describe('M1: legacy journal replay (pre-M1 segments, no registry-updated events)', () => {
+  const at = '2026-07-20 14:00:00';
+  test('membership-only history reconciles the registry to the live projection at v0', async () => {
+    const { journal, pairDir } = await freshJournal();
+    // Old-shape records: session-initialized + agent-joined/left WITHOUT
+    // registry-updated companions (exactly what a pre-M1 broker journaled).
+    await journal.commit(env({ kind: 'init-session' }, 'claude', 'i1'),
+      [{ kind: 'session-initialized', task: 't', agents: ['claude', 'codex'], driver: 'claude', at }] as never[],
+      { ok: true }, { clientId: 'c', reqId: 'r-i1' });
+    await journal.commit(env({ kind: 'join-session' }, 'claude', 'j1'),
+      [{ kind: 'agent-joined', agent: 'agy', at }] as never[],
+      { ok: true }, { clientId: 'c', reqId: 'r-j1' });
+    await journal.commit(env({ kind: 'leave-session' }, 'codex', 'l1'),
+      [{ kind: 'agent-left', agent: 'codex', at }] as never[],
+      { ok: true }, { clientId: 'c', reqId: 'r-l1' });
+
+    const reopened = new Journal(pairDir);
+    await reopened.recover();
+    const reg = reopened.sessionState!.registry;
+    expect(reg.version).toBe(0); // legacy history claims no versioned transitions
+    expect(reg.agents['agy']).toMatchObject({ status: 'active' }); // joined without registry event → reconciled in
+    expect(reg.agents['codex']).toMatchObject({ status: 'left' }); // departed → reconciled out
+    expect(reg.agents['claude']).toMatchObject({ status: 'active' });
+  });
+});

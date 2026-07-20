@@ -31,7 +31,7 @@ export function attachEvent(snapshot: ObserverSnapshotDto, endpoint: string, now
 }
 
 export function toStored(event: Extract<Event, { kind: 'message-sent' }>): StoredMessage {
-  const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }) };
+  const pair = { id: event.id, from: event.from, to: event.to, type: event.type, turn: event.turn, sent: event.at, body: event.body, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }), ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }) };
   return {
     name: fsMessageCodec.filename(pair),
     header: {
@@ -42,6 +42,7 @@ export function toStored(event: Extract<Event, { kind: 'message-sent' }>): Store
       ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
       ...(event.actionKind === undefined ? {} : { actionKind: event.actionKind }),
       ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }),
+      ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
     },
     body: event.body,
     raw: fsMessageCodec.raw(pair),

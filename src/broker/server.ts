@@ -702,7 +702,7 @@ export class BrokerCore {
 
   #toStored(delivery: OpenDelivery): StoredMessage {
     const m = delivery.message;
-    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }) };
+    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }), ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }) };
     return {
       name: this.#codec.filename(pair),
       header: {
@@ -712,6 +712,7 @@ export class BrokerCore {
         ...(m.provenance === undefined ? {} : { provenance: m.provenance }),
         ...(m.actionKind === undefined ? {} : { actionKind: m.actionKind }),
         ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
+        ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }),
       },
       body: m.body,
       raw: this.#codec.raw(pair),
