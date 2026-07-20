@@ -37,6 +37,11 @@ export type Event =
   | { kind: 'admission-completed'; at: Timestamp }
   /** Round 2 #4: the durable atomic barrier-open fact. */
   | { kind: 'barrier-opened'; members: AgentId[]; registryVersion: number; at: Timestamp }
+  /** 1B: public submission STATUS — the body is protocol-sealed in the
+   * TxnRecord, never in any event. */
+  | { kind: 'proposal-submitted'; author: AgentId; contentHash: string; bytes: number; at: Timestamp }
+  /** 1B: the atomic reveal — electorate = openedMembers minus abstained. */
+  | { kind: 'barrier-revealed'; electorate: AgentId[]; at: Timestamp }
   | { kind: 'admission-authorized'; agent: AgentId; at: Timestamp }
   | { kind: 'absentee-ruled'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; at: Timestamp }
   /** Peer 1A: outcome provenance is permanent — 'forced' can never read
@@ -45,7 +50,7 @@ export type Event =
   | { kind: 'attention-raised'; id: string; category: 'tofu-bind'; detail: string; at: Timestamp }
   | { kind: 'attention-cleared'; id: string; at: Timestamp }
   | { kind: 'session-initialized'; task: string; agents: readonly AgentId[]; driver: AgentId; at: Timestamp; sessionId?: string; meta?: Readonly<Record<AgentId, AgentMeta>>; topology?: Topology }
-  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }
+  | { kind: 'message-sent'; id: MessageId; from: AgentId; to: AgentId; type: MessageType; turn: TurnMode; body: string; at: Timestamp; groupId?: string; provenance?: 'trusted_user_client' | 'broker'; actionKind?: UserActionKind; replyTo?: MessageId; sessionId?: string }
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
   | { kind: 'session-ended'; by: AgentId; summary: string; at: Timestamp }

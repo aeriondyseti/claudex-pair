@@ -8,6 +8,10 @@ export type CommandMeta = {
   readonly id: MessageId;
   readonly at: Timestamp;
   readonly principal: AgentId;
+  /** 1B: broker-stamped exact UTF-8 accounting for content-carrying
+   * commands (propose, draft-amend) — pure decide never computes crypto. */
+  readonly contentHash?: string;
+  readonly contentBytes?: number;
 };
 
 export type Command =
@@ -58,6 +62,10 @@ export type Command =
    * from expected (authorized pending observer); wait sets a new absolute
    * deadline. */
   | { kind: 'user-rule-absentee'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; groupId: string; noticeIdBase: string }
+  /** 1B: sealed blind proposal (collecting substate). The body crosses
+   * the wire in the command but is journaled ONLY in the record's sealed
+   * field; meta.contentHash/contentBytes are broker-stamped. */
+  | { kind: 'propose'; content: string }
   /** Round 2 #8: complete a durable attention item (loud TOFU etc.) —
    * without this the instruction can never be satisfied. */
   | { kind: 'user-clear-attention'; id: string; groupId: string; noticeIdBase: string }

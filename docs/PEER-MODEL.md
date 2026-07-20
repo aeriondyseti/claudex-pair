@@ -88,9 +88,13 @@ specced for the adversarial topology, reused here:
   submissions pages the human, who rules each absentee as *abstain* (barrier
   proceeds without them; they remain observers for this round) or *wait*
   (deadline extended). Never a silent quorum shrink.
-- On reveal, every proposal is delivered to every peer simultaneously and
-  lands in the archive. Blindness is what buys independent designs instead
-  of anchoring on whoever writes fastest.
+- On reveal, a broker-authored manifest wake is delivered to every active
+  agent simultaneously; the authoritative proposal bodies are served by
+  `pair artifacts` (the planning-artifacts query) and informational
+  mirrors — the mailbox archive holds manifests, not bodies *(1B design
+  correction: content-addressed reveal avoids N x N body duplication)*.
+  Blindness is what buys independent designs instead of anchoring on
+  whoever writes fastest.
 
 Proposals are prose plus a candidate task decomposition (schema below —
 non-binding at this stage, but writing it early surfaces decomposition

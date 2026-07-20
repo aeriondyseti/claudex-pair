@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { DISPLAY_PATTERN, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -106,6 +106,8 @@ function decideInner(
       return withLive(state, (s) => decideUserForcePhase(s, command, envelope));
     case 'user-clear-attention':
       return withLive(state, (s) => decideUserClearAttention(s, command, envelope));
+    case 'propose':
+      return withActive(state, (s) => decidePropose(s, command, envelope));
   }
 }
 
@@ -204,8 +206,12 @@ function decideUserRuleAbsentee(
   if (bad) return err(bad);
   const peer = requirePeer(s, 'user-rule-absentee');
   if (peer instanceof ProtocolError) return err(peer);
+  // 1B: the same verb rules non-submitters while the barrier COLLECTS.
+  if (peer.planning?.substate === 'collecting') {
+    return decideCollectingRuling(peer, peer.planning, command, envelope);
+  }
   if (peer.planning?.substate !== 'admitting') {
-    return err(new ProtocolError('admitting-closed', 'Absentee rulings apply to the admitting substate (barrier rulings arrive with slice 2).'));
+    return err(new ProtocolError('admitting-closed', 'Absentee rulings apply to the admitting and collecting substates.'));
   }
   const isAbsentee = peer.planning.authorizedExpected.includes(command.agent) && !peer.planning.admitted.includes(command.agent);
   if (!isAbsentee) return err(new ProtocolError('not-an-absentee', `'${command.agent}' is not an expected-but-unadmitted invitee.`));
@@ -227,6 +233,92 @@ function decideUserRuleAbsentee(
     events.push(userActionNotice(command, agent, i, 'rule-absentee', 'info', `USER RULED absentee '${command.agent}': ${command.ruling}${command.newDeadlineAt ? ` (new deadline ${command.newDeadlineAt})` : ''}.`, envelope.meta.at));
   });
   return ok(events);
+}
+
+/** 1B: sealed blind proposal (collecting; author must be an opened member
+ * who has neither submitted nor been abstained). The body is validated
+ * here (grammar/bounds) but journaled only in the record's sealed field. */
+function decidePropose(
+  s: SessionState,
+  command: Extract<Command, { kind: 'propose' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const peer = requirePeer(s, 'propose');
+  if (peer instanceof ProtocolError) return err(peer);
+  if (peer.planning?.substate !== 'collecting') {
+    return err(new ProtocolError('phase-unavailable', 'Proposals are collected only while the blind barrier is open.'));
+  }
+  const from = envelope.meta.principal;
+  const planning = peer.planning;
+  if (!planning.barrier.openedMembers.includes(from)) {
+    return err(new ProtocolError('not-in-electorate', `'${from}' is not in this barrier's opened membership — observers contribute via ordinary messages.`));
+  }
+  if (planning.abstained.includes(from)) {
+    return err(new ProtocolError('already-abstained', `'${from}' was ruled abstained for this barrier and cannot submit to it.`));
+  }
+  if (planning.submitted[from] !== undefined) {
+    return err(new ProtocolError('already-submitted', 'One proposal per member per barrier — amendments belong to convergence.'));
+  }
+  if (!command.content.trim()) {
+    return err(new ProtocolError('blank-content', 'A proposal cannot be blank.'));
+  }
+  const ctl = findControlCharacter(command.content);
+  if (ctl >= 0) {
+    return err(new ProtocolError('control-characters', `Control character at offset ${ctl} — allowed: \n, \t, \r only.`));
+  }
+  const bytes = envelope.meta.contentBytes;
+  const contentHash = envelope.meta.contentHash;
+  if (bytes === undefined || contentHash === undefined) {
+    return err(new ProtocolError('blank-content', 'Internal: content accounting missing (the broker stamps it).'));
+  }
+  if (bytes > PROPOSAL_MAX_BYTES) {
+    return err(new ProtocolError('proposal-too-large', `Proposal is ${bytes} bytes; the bound is ${PROPOSAL_MAX_BYTES}.`));
+  }
+  const cumulative = Object.values(planning.submitted).reduce((sum, sub) => sum + sub.bytes, 0) + bytes;
+  if (cumulative > PROPOSALS_TOTAL_MAX_BYTES) {
+    // Checked at EVERY propose so the cap can never first bite on the
+    // last submission (design rev 2 #4).
+    return err(new ProtocolError('proposals-exhausted', `Cumulative sealed bytes would reach ${cumulative}; the bound is ${PROPOSALS_TOTAL_MAX_BYTES}.`));
+  }
+  return ok([{ kind: 'proposal-submitted', author: from, contentHash, bytes, at: envelope.meta.at }]);
+}
+
+/** 1B collecting rulings (Ruling A: an empty-electorate abstain REJECTS
+ * with no mutation — no event, no attention, no dedup record). */
+function decideCollectingRuling(
+  peer: SessionState & { topology: 'peer' },
+  planning: Extract<NonNullable<import('./types.ts').PlanningState>, { substate: 'collecting' }>,
+  command: Extract<Command, { kind: 'user-rule-absentee' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const isAbsentee = planning.barrier.openedMembers.includes(command.agent)
+    && planning.submitted[command.agent] === undefined
+    && !planning.abstained.includes(command.agent);
+  if (!isAbsentee) return err(new ProtocolError('not-an-absentee', `'${command.agent}' is not an unruled non-submitter of this barrier.`));
+  if (command.ruling === 'wait') {
+    if (!command.newDeadlineAt) return err(new ProtocolError('not-an-absentee', "ruling 'wait' requires a new absolute deadline (-NewDeadlineAt)."));
+    return ok([
+      { kind: 'absentee-ruled', agent: command.agent, ruling: 'wait', newDeadlineAt: command.newDeadlineAt, at: envelope.meta.at },
+      ...noticeFanout(peer, command, `USER RULED barrier absentee '${command.agent}': wait (new deadline ${command.newDeadlineAt}).`, envelope.meta.at),
+    ]);
+  }
+  const effective = planning.barrier.openedMembers.filter((a) => a !== command.agent && !planning.abstained.includes(a));
+  if (effective.length === 0) {
+    return err(new ProtocolError('empty-electorate', `Abstaining '${command.agent}' would leave nobody in the electorate — wait, admit someone, or force the phase.`));
+  }
+  return ok([
+    { kind: 'absentee-ruled', agent: command.agent, ruling: 'abstain', at: envelope.meta.at },
+    ...noticeFanout(peer, command, `USER RULED barrier absentee '${command.agent}': abstain — the barrier reveals without them; they remain an authorized observer.`, envelope.meta.at),
+  ]);
+}
+
+function noticeFanout(
+  peer: SessionState & { topology: 'peer' },
+  command: Extract<Command, { kind: 'user-rule-absentee' }>,
+  text: string,
+  at: string,
+): Event[] {
+  return peer.agents.map((agent, i) => userActionNotice(command, agent, i, 'rule-absentee', 'info', text, at));
 }
 
 function decideUserForcePhase(
@@ -819,6 +911,11 @@ function decideSend(
   envelope: CommandEnvelope,
 ): Result<Event[], ProtocolError> {
   const from = envelope.meta.principal;
+  // 1B: reveal manifests are broker-authored ONLY — no topology may send
+  // type 'proposal' (spoofed reveal artifacts, design rev 3 #8).
+  if (command.type === 'proposal') {
+    return err(new ProtocolError('broker-authored-type', "'proposal' messages are broker-authored reveal manifests and cannot be sent by agents."));
+  }
   // U1: the user reads via the transcript; agents get no user inbox (v1).
   if (command.to === USER_IDENTITY) {
     return err(new ProtocolError('user-not-addressable', `'${USER_IDENTITY}' is a reserved identity and cannot receive messages (v1); the user reads the transcript via pair watch.`));

@@ -107,7 +107,7 @@ describe('agent-attach: TOFU admission, reconnect proof, rejection matrix', () =
 
     const s = await session(core);
     expect([...s.agents].sort()).toEqual(['claude', 'codex']);
-    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'codex'] } }); // atomic barrier-open fact (round 2 #4)
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { openedMembers: ['claude', 'codex'] } }); // atomic barrier-open fact (round 2 #4)
     expect(s.registry.agents['codex']!.binding).toMatchObject({ credentialVersion: 1 });
     // Admission is the membership change: fresh joinedAt at admission time.
     expect(s.registry.agents['codex']!.status).toBe('active');
@@ -316,7 +316,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     expect(ruling.ok).toBeTrue();
 
     let s = await session(core);
-    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'codex'] } });
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { openedMembers: ['claude', 'codex'] } });
     expect(s.authorized).toContain('agy'); // abstain kept the DURABLE authorization
 
     // The abstained invitee attaches LATER: admitted as a member, but the
@@ -327,7 +327,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     s = await session(core);
     expect(s.agents).toContain('agy');
     if (s.planning?.substate !== 'collecting') throw new Error('shape');
-    expect(s.planning.barrier.members).toEqual(['claude', 'codex']); // frozen
+    expect(s.planning.barrier.openedMembers).toEqual(['claude', 'codex']); // frozen
 
     // Post-barrier user admission: authorize + attach a brand-new observer.
     expect((await core.userAction('ract-2', 'client-user', 'conn-user', { verb: 'admit', agent: 'gemini' })).ok).toBeTrue();
@@ -336,7 +336,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     s = await session(core);
     expect(s.agents).toContain('gemini');
     if (s.planning?.substate !== 'collecting') throw new Error('shape');
-    expect(s.planning.barrier.members).toEqual(['claude', 'codex']); // still frozen
+    expect(s.planning.barrier.openedMembers).toEqual(['claude', 'codex']); // still frozen
   });
 
   test('#4: the closing attach txn is ATOMIC — exact event list incl. the barrier-open fact', async () => {
@@ -366,7 +366,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     core.onConnection('conn-agy', 'open');
     expect((await core.agentAttach('at-2', 'conn-agy', 'client-agy', 'agy', CRED.agy)).ok).toBeTrue();
     s = await session(core);
-    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'agy'] } });
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { openedMembers: ['claude', 'agy'] } });
 
     // The bound leaver re-attaches: RE-ADMITTED (membership txn), frozen barrier unchanged.
     core.onConnection('conn-codex-2', 'open');
@@ -375,7 +375,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     s = await session(core);
     expect(s.agents).toContain('codex');
     if (s.planning?.substate !== 'collecting') throw new Error('shape');
-    expect(s.planning.barrier.members).toEqual(['claude', 'agy']);
+    expect(s.planning.barrier.openedMembers).toEqual(['claude', 'agy']);
 
     // User kick revokes DURABLE authorization: re-attach is rejected.
     core.onConnection('conn-user', 'open');

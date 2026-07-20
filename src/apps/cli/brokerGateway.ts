@@ -89,6 +89,8 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
     return response.data as { agent: string; credentialVersion: number; admitted: boolean };
   }
   async log(tail = 10): Promise<readonly StoredMessage[]> { return this.query<readonly StoredMessage[]>('log', { tail }); }
+  /** Peer 1B: authoritative planning artifacts (public read-only). */
+  async planningArtifacts(): Promise<unknown> { return this.query<unknown>('planning-artifacts'); }
   async grants(): Promise<readonly Grant[]> { return this.query<readonly Grant[]>('grants'); }
   async brokerStatus(): Promise<BrokerStatusDto> {
     try { return await this.query<BrokerStatusDto>('broker-status', undefined, false); }

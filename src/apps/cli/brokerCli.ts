@@ -107,6 +107,21 @@ export async function runBrokerCli(
       out(`${bound.agent} attached (credential v${bound.credentialVersion})${bound.admitted ? ' and is ADMITTED' : ''}. The credential is provisioned in your store; every pair command auto-attaches on its own connection from now on.`);
       return 0;
     }
+    if (command === 'propose') {
+      // 1B: sealed blind proposal — the body crosses once at the transport
+      // edge and is journaled only in the record's sealed field.
+      const as = required(flags, 'as', 'propose requires -As <your own agent name>').toLowerCase();
+      const r = await execute(gateway, as, { kind: 'propose', content: await bodyFrom(flags) });
+      const sub = r.events.find((e) => e.kind === 'proposal-submitted');
+      const revealed = r.events.some((e) => e.kind === 'barrier-revealed');
+      out(`Proposal sealed (${sub?.kind === 'proposal-submitted' ? `${sub.bytes} bytes, sha256 ${sub.contentHash}` : 'committed'}).${revealed ? ' Your submission CLOSED the barrier — proposals are revealed; read them with: pair artifacts' : ' It stays blind until every opened member submits or is ruled.'}`);
+      return 0;
+    }
+    if (command === 'artifacts') {
+      if (gateway.planningArtifacts === undefined) throw new Error('artifacts requires the broker gateway.');
+      renderArtifacts(await gateway.planningArtifacts());
+      return 0;
+    }
     if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') {
@@ -262,6 +277,28 @@ function renderTurn(s: StatusDto, as: AgentId) {
  * chains back into the thread. Computed to a fixpoint so the closure never
  * depends on parent-before-child ordering (round 2: archives are id-sorted
  * today, but correctness must not lean on that). */
+/** 1B: human rendering of the per-phase artifact view. */
+function renderArtifacts(raw: unknown): void {
+  const a = raw as { phase?: string; submissions?: { author: string; contentHash: string; bytes: number; at: string }[]; proposals?: Record<string, { contentHash: string; bytes: number; at: string; body: string }>; draft?: { revision: number; hash: string; author: string | null; at: string; body: string } | null; revisionLog?: unknown[] };
+  out(`Artifacts:  ${a.phase ?? 'unknown'}`);
+  if (a.phase === 'sealed') {
+    for (const sub of a.submissions ?? []) out(`  sealed: ${sub.author} — ${sub.bytes} bytes, sha256 ${sub.contentHash} (${sub.at})`);
+    if (!(a.submissions ?? []).length) out('  (no submissions yet)');
+    return;
+  }
+  if (a.phase !== 'revealed') return;
+  for (const [author, p] of Object.entries(a.proposals ?? {})) {
+    out(`${'='.repeat(66)}
+PROPOSAL ${author} — ${p.bytes} bytes, sha256 ${p.contentHash} (${p.at})
+${'-'.repeat(66)}
+${p.body}`);
+  }
+  if (a.draft) out(`${'='.repeat(66)}
+DRAFT r${a.draft.revision}${a.draft.author ? ` by ${a.draft.author}` : ''} (${a.draft.at})
+${'-'.repeat(66)}
+${a.draft.body || '(empty)'}`);
+}
+
 function threadChain<T extends { readonly header: { readonly id: string; readonly replyTo?: string } }>(messages: readonly T[], root: string): T[] {
   const inThread = new Set([root]);
   for (let grew = true; grew;) {

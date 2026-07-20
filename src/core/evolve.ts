@@ -1,5 +1,5 @@
 import type { Event } from './events.ts';
-import type { AgentMeta, AgentRecord, Registry, SessionState } from './types.ts';
+import { EMPTY_DRAFT_HASH, type AgentMeta, type AgentRecord, type Registry, type SessionState } from './types.ts';
 
 /**
  * Pure fold: state = events.reduce(evolve, undefined). Total over every
@@ -143,8 +143,38 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state;
     case 'barrier-opened':
       return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
-        ? { ...state, planning: { substate: 'collecting', barrier: { members: event.members, registryVersion: event.registryVersion, openedAt: event.at } } }
+        ? { ...state, planning: { substate: 'collecting', barrier: { openedMembers: event.members, registryVersion: event.registryVersion, openedAt: event.at }, submitted: {}, abstained: [] } }
         : state;
+    case 'proposal-submitted':
+      return state && state.topology === 'peer' && state.planning?.substate === 'collecting'
+        ? { ...state, planning: { ...state.planning, submitted: { ...state.planning.submitted, [event.author]: { contentHash: event.contentHash, bytes: event.bytes, at: event.at } } } }
+        : state;
+    case 'barrier-revealed': {
+      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'collecting') return state;
+      const electorate = event.electorate;
+      // Ruling B: the stored round order is the FULL frozen electorate
+      // (rotated by starterIndex = 0 at reveal) — never live-filtered.
+      // Holder = first LIVE member; none live -> convergence-blocked with
+      // the complete unserved round-0 order retained.
+      const holderIndex = electorate.findIndex((a) => state.registry.agents[a]?.status === 'active');
+      const common = {
+        barrier: state.planning.barrier,
+        draft: { revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at },
+        revisionLog: [{ revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at }],
+        findings: {},
+      };
+      if (holderIndex === -1) {
+        return { ...state, planning: { substate: 'convergence-blocked', rotation: { electorate, starterIndex: 0, round: 0, remaining: electorate }, ...common } };
+      }
+      return {
+        ...state,
+        planning: {
+          substate: 'converging',
+          rotation: { electorate, starterIndex: 0, round: 0, remaining: electorate.slice(holderIndex + 1), holder: electorate[holderIndex]! },
+          ...common,
+        },
+      };
+    }
     case 'admission-authorized': {
       if (!state || state.topology !== 'peer') return state;
       const authorized = state.authorized.includes(event.agent) ? state.authorized : [...state.authorized, event.agent];
@@ -156,7 +186,14 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return { ...state, authorized, ...(planning === undefined ? {} : { planning }) };
     }
     case 'absentee-ruled':
-      if (!state || state.topology !== 'peer' || state.planning?.substate !== 'admitting') return state;
+      if (!state || state.topology !== 'peer') return state;
+      if (state.planning?.substate === 'collecting') {
+        if (event.ruling === 'abstain') {
+          return { ...state, planning: { ...state.planning, abstained: [...state.planning.abstained, event.agent] } };
+        }
+        return { ...state, planning: { ...state.planning, ...(event.newDeadlineAt === undefined ? {} : { deadlineAt: event.newDeadlineAt }) } };
+      }
+      if (state.planning?.substate !== 'admitting') return state;
       if (event.ruling === 'abstain') {
         return { ...state, planning: { ...state.planning, authorizedExpected: state.planning.authorizedExpected.filter((a) => a !== event.agent) } };
       }

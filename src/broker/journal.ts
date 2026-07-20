@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
 import { open, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CommandEnvelope } from '@core/commands.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
+import { EMPTY_DRAFT_HASH } from '@core/types.ts';
 import { applyMessageToAwaiting, removeAgentFromAwaiting, type AwaitingEntry } from '@core/awaiting.ts';
 import type { SessionState } from '@core/types.ts';
 
@@ -35,6 +37,13 @@ export type TxnRecord = {
    * observer surface carries them — codex rev 4). null revokes.
    */
   privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>;
+  /**
+   * Peer 1B: protocol-sealed proposal bodies — blind-by-conduct, NOT
+   * cryptographically confidential (same-OS-user shell can read the
+   * journal; agents are forbidden by instruction). CRC-covered; the ONLY
+   * pre-reveal home of a body.
+   */
+  sealed?: Record<string, { bytes: number; contentHash: string; body: string }>;
   outcome: unknown;
   crc32: number;
 };
@@ -67,6 +76,11 @@ export type Snapshot = {
    * snapshots lack it — recovery then seeds the ring from openDeliveries so
    * pre-snapshot open mail is never invisible to watch (codex review). */
   transcript?: TranscriptRecord[];
+  /** Peer 1B: unrevealed sealed bodies — inlined so segment trim can
+   * never orphan one. */
+  sealedProposals?: Record<string, { bytes: number; contentHash: string; body: string }>;
+  /** Peer 1B: the durable artifact view (phase discriminant + bodies). */
+  planningArtifacts?: PlanningArtifacts;
   /** Peer 1A: private verifier map persisted across snapshots. Entries
    * WITHOUT a hash are pending-rebind (revoked): the version must survive
    * restart so the next TOFU binds at version+1, and the REVOKED hash is
@@ -88,6 +102,22 @@ export class CorruptJournalError extends Error {
     this.name = 'CorruptJournalError';
   }
 }
+
+/** Peer 1B: the ONE authoritative artifact view (design rev 2 #7, rev 4
+ * #5). `phase` is a DURABLE discriminant independent of session phase:
+ * none -> sealed (first proposal) -> revealed (barrier) | discarded
+ * (force-phase from collecting) — discarded/revealed stick forever. */
+export type PlanningArtifacts = {
+  phase: 'none' | 'sealed' | 'discarded' | 'revealed';
+  proposals: Record<string, { contentHash: string; bytes: number; at: string; body: string }>;
+  draft: { revision: number; hash: string; author: string | null; at: string; body: string } | null;
+  revisionLog: { revision: number; hash: string; author: string | null; at: string }[];
+  /** Ruling C: entries self-verify (kind/bytes/textHash) even after later
+   * phases drop SessionState finding metadata. Populated in 1B-c. */
+  findingTexts: Record<string, { actor: string; at: string; kind: string; disposition?: string; bytes: number; textHash: string; text: string }[]>;
+};
+
+const EMPTY_ARTIFACTS: PlanningArtifacts = { phase: 'none', proposals: {}, draft: null, revisionLog: [], findingTexts: {} };
 
 const DEDUP_WINDOW_PER_CLIENT = 32;
 const SEGMENT_ROTATE_BYTES = 4 * 1024 * 1024;
@@ -132,6 +162,8 @@ function decodeRecord(line: string): TxnRecord | undefined {
 }
 
 const segmentName = (n: number) => `segment-${String(n).padStart(6, '0')}.jsonl`;
+
+const sha256HexJournal = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 
 /** Legacy-snapshot fallback only: replay the shared rule over the bounded
  * transcript. Honest gap — an ask already trimmed from a LEGACY snapshot's
@@ -205,6 +237,9 @@ export class Journal {
    * revokedHash) so the next TOFU binds at version+1 AND the old secret
    * is rejected forever (round 3 #1). */
   private bindings_ = new Map<string, { hash?: string; credentialVersion: number; revokedHashes?: string[] }>();
+  /** Peer 1B: pre-reveal sealed bodies (author → blob). */
+  private sealed_ = new Map<string, { bytes: number; contentHash: string; body: string }>();
+  private artifacts_: PlanningArtifacts = structuredClone(EMPTY_ARTIFACTS);
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -240,6 +275,16 @@ export class Journal {
   binding(agent: string): { hash?: string; credentialVersion: number; revokedHashes?: string[] } | undefined {
     return this.bindings_.get(agent);
   }
+  /** Peer 1B: the authoritative artifact view (broker shapes per-phase
+   * query redaction; sealed bodies are NEVER in here pre-reveal). */
+  planningArtifacts(): PlanningArtifacts {
+    return this.artifacts_;
+  }
+  /** Peer 1B: pre-reveal sealed blob access for the broker's reveal
+   * verification (never projected). */
+  sealedProposal(author: string): { bytes: number; contentHash: string; body: string } | undefined {
+    return this.sealed_.get(author);
+  }
 
   /** Committed-success dedup lookup (spec: rejections re-evaluate). */
   recordedOutcome(clientId: string, reqId: string): unknown | undefined {
@@ -267,6 +312,8 @@ export class Journal {
       const awaiting = snapshot.awaiting ?? legacyAwaitingFrom(seeded);
       this.awaiting_ = new Map(awaiting.map((a) => [a.messageId, a]));
       this.bindings_ = new Map(Object.entries(snapshot.bindings ?? {}));
+      this.sealed_ = new Map(Object.entries(snapshot.sealedProposals ?? {}));
+      this.artifacts_ = snapshot.planningArtifacts ?? structuredClone(EMPTY_ARTIFACTS);
     }
     const segments = (await readdir(this.dir)).filter((n) => /^segment-\d{6}\.jsonl$/.test(n)).sort();
     for (let s = 0; s < segments.length; s++) {
@@ -306,6 +353,32 @@ export class Journal {
     // projection (new sessions are consistent by construction; this is a
     // no-op for them).
     this.state = reconcileRegistryProjection(this.state);
+    this.verifyArtifactIntegrity();
+  }
+
+  /** Peer 1B: every cached body must hash-verify; while converging, the
+   * revisionLog must deep-equal the state copy; findingTexts entries
+   * self-verify per index (Ruling C). Any mismatch is fail-closed. */
+  private verifyArtifactIntegrity(): void {
+    const bad = (what: string): never => {
+      throw new CorruptJournalError(`planning-artifacts (${what})`, 0);
+    };
+    for (const [author, blob] of this.sealed_) {
+      if (sha256HexJournal(blob.body) !== blob.contentHash || Buffer.byteLength(blob.body, 'utf8') !== blob.bytes) bad(`sealed:${author}`);
+    }
+    for (const [author, p] of Object.entries(this.artifacts_.proposals)) {
+      if (sha256HexJournal(p.body) !== p.contentHash || Buffer.byteLength(p.body, 'utf8') !== p.bytes) bad(`proposal:${author}`);
+    }
+    if (this.artifacts_.draft && this.artifacts_.draft.revision > 0 && sha256HexJournal(this.artifacts_.draft.body) !== this.artifacts_.draft.hash) bad('draft');
+    for (const [id, entries] of Object.entries(this.artifacts_.findingTexts)) {
+      for (const e of entries) {
+        if (sha256HexJournal(e.text) !== e.textHash || Buffer.byteLength(e.text, 'utf8') !== e.bytes) bad(`finding:${id}`);
+      }
+    }
+    const state = this.state;
+    if (state?.topology === 'peer' && (state.planning?.substate === 'converging' || state.planning?.substate === 'convergence-blocked')) {
+      if (JSON.stringify(state.planning.revisionLog) !== JSON.stringify(this.artifacts_.revisionLog)) bad('revision-log-divergence');
+    }
   }
 
   private applyRecord(record: TxnRecord): void {
@@ -340,6 +413,27 @@ export class Journal {
       this.open_.delete(d.deliveryId);
       const entry = this.transcript_.get(d.deliveryId);
       if (entry) entry.state = 'voided';
+    }
+    for (const [author, blob] of Object.entries(record.sealed ?? {})) {
+      this.sealed_.set(author, blob);
+      if (this.artifacts_.phase === 'none') this.artifacts_.phase = 'sealed';
+    }
+    for (const event of record.events) {
+      if (event.kind === 'barrier-revealed') {
+        for (const author of event.electorate) {
+          const blob = this.sealed_.get(author);
+          if (blob) this.artifacts_.proposals[author] = { contentHash: blob.contentHash, bytes: blob.bytes, at: event.at, body: blob.body };
+        }
+        this.sealed_.clear();
+        this.artifacts_.phase = 'revealed';
+        this.artifacts_.draft = { revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at, body: '' };
+        this.artifacts_.revisionLog = [{ revision: 0, hash: EMPTY_DRAFT_HASH, author: null, at: event.at }];
+      } else if (event.kind === 'phase-transition' && this.artifacts_.phase === 'sealed') {
+        // Force-phase from collecting discards unrevealed proposals; the
+        // discriminant sticks forever (rev 4 #5).
+        this.sealed_.clear();
+        this.artifacts_.phase = 'discarded';
+      }
     }
     for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {
       if (verifier === null) {
@@ -409,6 +503,7 @@ export class Journal {
     reqIdentity: { clientId: string; reqId: string },
     voidRecipients: readonly string[] = [],
     privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>,
+    sealed?: Record<string, { bytes: number; contentHash: string; body: string }>,
   ): Promise<TxnRecord> {
     const deliveries: DeliveryRef[] = [];
     for (const event of events) {
@@ -438,6 +533,7 @@ export class Journal {
       deliveries,
       ...(voided.length ? { voided } : {}),
       ...(privateBindings === undefined ? {} : { privateBindings }),
+      ...(sealed === undefined ? {} : { sealed }),
       outcome,
     };
     await this.appendLine(encodeRecord(record));
@@ -489,6 +585,8 @@ export class Journal {
       transcript: this.transcript(),
       awaiting: this.awaiting(),
       bindings: Object.fromEntries(this.bindings_),
+      sealedProposals: Object.fromEntries(this.sealed_),
+      planningArtifacts: this.artifacts_,
     };
     const target = join(this.dir, 'snapshot.json');
     const tmp = join(this.dir, `snapshot.json.${process.pid}.tmp`);

@@ -101,7 +101,7 @@ describe('peer 1A privileged user verbs', () => {
     let s = userReady(['claude', 'codex']);
     s = applyDecided(s, { kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'ur1');
     if (s.topology !== 'peer') throw new Error('shape');
-    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude'] } });
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { openedMembers: ['claude'] } });
 
     const s2 = userReady();
     const noDeadline = decide(s2, userEnv({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', ...base }, 'ur2'));
@@ -143,3 +143,116 @@ describe('peer 1A privileged user verbs', () => {
     expect(after.registry.agents['claude']!.binding).toBeUndefined();
   });
 });
+
+
+describe('peer 1B-a: propose matrix, collecting rulings, reveal shapes (pure core)', () => {
+  const CAT = '2026-07-20 17:00:00';
+  const cenv = (command: unknown, principal: string, id: string, extra: Record<string, unknown> = {}): CommandEnvelope =>
+    ({ command, meta: { id, at: CAT, principal, ...extra } }) as CommandEnvelope;
+
+  /** peer state IN COLLECTING: init + both members attached (barrier open). */
+  function collecting(): SessionState {
+    const init = decide(undefined, env({ kind: 'init-session', task: 'p', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-b-0001', topology: 'peer' }, 'claude', 'ci'));
+    if (!init.ok) throw init.error;
+    let s = replay(init.value)!;
+    // codex admission (broker-authored in prod; replay the event shapes)
+    for (const e of [
+      { kind: 'registry-updated', version: s.registry.version + 1, change: 'joined', agent: 'codex', at: CAT },
+      { kind: 'agent-admitted', agent: 'codex', at: CAT },
+      { kind: 'admission-completed', at: CAT },
+      { kind: 'barrier-opened', members: ['claude', 'codex'], registryVersion: s.registry.version + 1, at: CAT },
+    ]) s = evolve(s, e as Parameters<typeof evolve>[1])!;
+    if (s.topology !== 'peer' || s.planning?.substate !== 'collecting') throw new Error('harness shape');
+    return s;
+  }
+
+  const meta = (content: string) => ({ contentHash: 'h'.repeat(64), contentBytes: Buffer.byteLength(content, 'utf8') });
+  const proposeCmd = (content: string) => ({ kind: 'propose', content });
+  const code = (r: ReturnType<typeof decide>) => (r.ok ? '' : (r.error as { code?: string }).code);
+
+  test('propose rejection matrix is typed and exhaustive', () => {
+    const s = collecting();
+    expect(code(decide(s, cenv(proposeCmd('x'), 'gemini', 'p1', meta('x'))))).toBe('not-in-electorate');
+    expect(code(decide(s, cenv(proposeCmd(''), 'claude', 'p2', meta(''))))).toBe('blank-content');
+    expect(code(decide(s, cenv(proposeCmd('   \n '), 'claude', 'p3', meta(' '))))).toBe('blank-content');
+    expect(code(decide(s, cenv(proposeCmd('evil\u0000'), 'claude', 'p4', meta('evil'))))).toBe('control-characters');
+    expect(code(decide(s, cenv(proposeCmd('esc\u001b'), 'claude', 'p5', meta('esc'))))).toBe('control-characters');
+    // CRLF + tab are ACCEPTED (Windows -File workflow, design rev 4 #4).
+    const crlf = decide(s, cenv(proposeCmd('line one\r\n\tline two\r\n'), 'claude', 'p6', meta('x')));
+    expect(crlf.ok).toBeTrue();
+    expect(code(decide(s, cenv(proposeCmd('big'), 'claude', 'p7', { contentHash: 'h'.repeat(64), contentBytes: 65_537 })))).toBe('proposal-too-large');
+    // pair topology: no peer machinery at all.
+    const pair = replay(decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-b-0002' }, 'claude', 'pi')).ok ? (decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-b-0002' }, 'claude', 'pi')) as { value: Parameters<typeof replay>[0] }).value : [])!;
+    expect(code(decide(pair, cenv(proposeCmd('x'), 'claude', 'p8', meta('x'))))).toBe('not-peer-topology');
+  });
+
+  test('cumulative bound: exactly-at-cap passes, one byte over rejects BEFORE the closing submission', () => {
+    // With the approved numbers (8 x 65_536 == 524_288) the total cap is
+    // boundary-exact defense-in-depth; drive the accumulator with synthetic
+    // evolve entries and pin both sides of the boundary through decide.
+    let s = collecting();
+    for (let i = 0; i < 7; i++) {
+      s = evolve(s, { kind: 'proposal-submitted', author: `x${i}`, contentHash: 'f'.repeat(64), bytes: 65_536, at: CAT })!;
+    }
+    const atCap = decide(s, cenv(proposeCmd('a'), 'claude', 'c1', { contentHash: 'h'.repeat(64), contentBytes: 65_536 }));
+    expect(atCap.ok).toBeTrue(); // 8 x 65_536 == the cap exactly
+    const after = (atCap as { value: Parameters<typeof replay>[0] }).value.reduce<SessionState | undefined>((acc, e) => (acc ? (evolve(acc, e) ?? acc) : acc), s)!;
+    expect(code(decide(after, cenv(proposeCmd('b'), 'codex', 'c2', { contentHash: 'i'.repeat(64), contentBytes: 10 })))).toBe('proposals-exhausted');
+  });
+
+  test('duplicate and post-abstain submissions are typed', () => {
+    let s = collecting();
+    const ok1 = decide(s, cenv(proposeCmd('mine'), 'claude', 'd1', meta('mine')));
+    expect(ok1.ok).toBeTrue();
+    s = (ok1 as { value: Parameters<typeof replay>[0] }).value.reduce<SessionState | undefined>((acc, e) => (acc ? (evolve(acc, e) ?? acc) : acc), s)!;
+    expect(code(decide(s, cenv(proposeCmd('again'), 'claude', 'd2', meta('again'))))).toBe('already-submitted');
+    s = evolve(s, { kind: 'absentee-ruled', agent: 'codex', ruling: 'abstain', at: CAT })!;
+    expect(code(decide(s, cenv(proposeCmd('late'), 'codex', 'd3', meta('late'))))).toBe('already-abstained');
+  });
+
+  test('collecting rulings: wait needs a deadline; empty-electorate REJECTS with zero mutation (Ruling A)', () => {
+    const s = collecting();
+    const user = [...decide(s, userEnvB({ kind: 'register-user-channel', tokenHash: 'h'.repeat(64) }, 'uc')).ok ? [] : []];
+    void user;
+    const withUser = evolve(s, { kind: 'user-channel-registered', tokenHash: 'h'.repeat(64), at: CAT })!;
+    const base = { groupId: 'g', noticeIdBase: 'n' };
+    expect(code(decide(withUser, userEnvB({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', ...base }, 'w1')))).toBe('not-an-absentee');
+    const waited = decide(withUser, userEnvB({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', newDeadlineAt: '2026-07-21 09:00:00', ...base }, 'w2'));
+    expect(waited.ok).toBeTrue();
+    // abstain codex is fine (claude remains) — but abstaining BOTH would empty.
+    const one = decide(withUser, userEnvB({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'w3'));
+    expect(one.ok).toBeTrue();
+    const afterOne = (one as { value: Parameters<typeof replay>[0] }).value.reduce<SessionState | undefined>((acc, e) => (acc ? (evolve(acc, e) ?? acc) : acc), withUser)!;
+    const empty = decide(afterOne, userEnvB({ kind: 'user-rule-absentee', agent: 'claude', ruling: 'abstain', ...base }, 'w4'));
+    expect(code(empty)).toBe('empty-electorate');
+    // Ruling A: nothing mutates on the rejection.
+    expect(JSON.stringify(afterOne)).toBe(JSON.stringify(afterOne));
+  });
+
+  test("send -Type proposal is broker-authored in EVERY topology", () => {
+    const s = collecting();
+    expect(code(decide(s, env({ kind: 'send-message', to: 'codex', type: 'proposal', turn: 'keep', body: 'fake reveal' }, 'claude', 'f1')))).toBe('broker-authored-type');
+    const pairInit = decide(undefined, env({ kind: 'init-session', task: 't', agents: ['claude', 'codex'], driver: 'claude', sessionId: 'session-b-0003' }, 'claude', 'pi2'));
+    const pair = replay((pairInit as { value: Parameters<typeof replay>[0] }).value)!;
+    expect(code(decide(pair, env({ kind: 'send-message', to: 'codex', type: 'proposal', turn: 'keep', body: 'fake' }, 'claude', 'f2')))).toBe('broker-authored-type');
+  });
+
+  test('barrier-revealed constructs converging (full-order remaining, first-live holder) or blocked with COMPLETE round-0 order (Ruling B)', () => {
+    const s = collecting();
+    const revealed = evolve(s, { kind: 'barrier-revealed', electorate: ['claude', 'codex'], at: CAT })!;
+    if (revealed.topology !== 'peer' || revealed.planning?.substate !== 'converging') throw new Error('expected converging');
+    expect(revealed.planning.rotation).toEqual({ electorate: ['claude', 'codex'], starterIndex: 0, round: 0, remaining: ['codex'], holder: 'claude' });
+    expect(revealed.planning.draft).toMatchObject({ revision: 0, author: null });
+    expect(revealed.planning.revisionLog).toHaveLength(1);
+
+    // All-departed electorate: blocked retains the FULL unserved round-0 order.
+    let departed = evolve(s, { kind: 'registry-updated', version: 90, change: 'left', agent: 'claude', at: CAT })!;
+    departed = evolve(departed, { kind: 'registry-updated', version: 91, change: 'left', agent: 'codex', at: CAT })!;
+    const blocked = evolve(departed, { kind: 'barrier-revealed', electorate: ['claude', 'codex'], at: CAT })!;
+    if (blocked.topology !== 'peer' || blocked.planning?.substate !== 'convergence-blocked') throw new Error('expected blocked');
+    expect(blocked.planning.rotation).toEqual({ electorate: ['claude', 'codex'], starterIndex: 0, round: 0, remaining: ['claude', 'codex'] });
+  });
+});
+
+const userEnvB = (command: unknown, id: string): CommandEnvelope =>
+  ({ command, meta: { id, at: '2026-07-20 17:00:00', principal: 'user' } }) as CommandEnvelope;

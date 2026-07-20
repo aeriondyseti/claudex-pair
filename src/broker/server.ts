@@ -5,7 +5,7 @@ import { ProtocolError } from '@core/errors.ts';
 import type { Event } from '@core/events.ts';
 import { evolve } from '@core/evolve.ts';
 import { navigators, openGrants } from '@core/queries.ts';
-import { AGENT_CREDENTIAL_PATTERN, USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
+import { AGENT_CREDENTIAL_PATTERN, BROKER_SENDER, USER_IDENTITY, type AgentId, type SessionState } from '@core/types.ts';
 import type { Clock, Ids, StoredMessage } from '@app/ports/index.ts';
 import type { BrokerStatusDto, StatusDto } from '@app/ports/gateway.ts';
 import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
@@ -39,6 +39,7 @@ export const DEFAULT_CONFIG: BrokerConfig = { idleGraceMs: 60_000, heartbeatMs: 
  * internal shape, constructed by the authenticated user-connection handler
  * (transport gate, U1-SLICE3-DESIGN.md). */
 const COMMAND_KINDS = new Set([
+  'propose',
   'init-session', 'send-message', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
@@ -189,6 +190,55 @@ export class BrokerCore {
     return next;
   }
 
+  /**
+   * Peer 1B: the atomic reveal. Called for the txn that MIGHT complete the
+   * barrier (a submission or a closing abstain ruling); returns the events
+   * to append when every opened member is submitted-or-abstained, undefined
+   * otherwise, or an Error when a sealed body fails hash verification
+   * (fail closed, nothing committed). Notices are broker-authored: sender
+   * is the syntax-invalid BROKER_SENDER with provenance 'broker'.
+   */
+  #revealExtension(
+    state: SessionState & { topology: 'peer' },
+    envelope: CommandEnvelope,
+    change: { kind: 'submit'; author: string; blob: { bytes: number; contentHash: string; body: string } } | { kind: 'abstain'; agent: string },
+  ): Event[] | undefined | Error {
+    const planning = state.planning;
+    if (planning?.substate !== 'collecting') return undefined;
+    const submitted = new Set(Object.keys(planning.submitted));
+    const abstained = new Set(planning.abstained);
+    if (change.kind === 'submit') submitted.add(change.author);
+    else abstained.add(change.agent);
+    if (!planning.barrier.openedMembers.every((m) => submitted.has(m) || abstained.has(m))) return undefined;
+    const electorate = planning.barrier.openedMembers.filter((m) => !abstained.has(m));
+    // Verify EVERY sealed body (including this txn's own) before reveal.
+    const manifest: string[] = [];
+    for (const author of electorate) {
+      const blob = change.kind === 'submit' && author === change.author ? change.blob : this.#journal.sealedProposal(author);
+      if (!blob || sha256Hex(blob.body) !== blob.contentHash) {
+        return new Error(`sealed proposal for '${author}' failed verification — refusing to reveal; run pair doctor.`);
+      }
+      manifest.push(`- ${author}: ${blob.bytes} bytes, sha256 ${blob.contentHash}`);
+    }
+    const at = envelope.meta.at;
+    const body = [
+      `PROPOSALS REVEALED (barrier opened ${planning.barrier.openedAt}).`,
+      `Electorate: ${electorate.join(', ')}.`,
+      ...manifest,
+      `Read the full bodies with: pair artifacts`,
+    ].join('\n');
+    const events: Event[] = [{ kind: 'barrier-revealed', electorate, at }];
+    // Recipients: every current member+observer, registry order (agents[]).
+    state.agents.forEach((recipient, i) => {
+      events.push({
+        kind: 'message-sent', id: `${envelope.meta.id}-p${i}`, from: BROKER_SENDER, to: recipient,
+        type: 'proposal', turn: 'keep', body, at, groupId: envelope.meta.id, provenance: 'broker',
+        ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
+    });
+    return events;
+  }
+
   /** Round 4 #3: lifecycle quiescence — resolves when every committed
    * txn's fire-and-forget mirror application has settled. A same-root
    * successor (restart, test reopen) must await this; without it the old
@@ -232,9 +282,14 @@ export class BrokerCore {
     }
     const command = commandFrom(payload);
     if (!command) return err(reqId, 'bad-command', 'execute payload must be {command: {kind: <known-kind>, ...}}');
+    // Peer 1B: exact UTF-8 content accounting is stamped at the transport
+    // boundary (pure decide never computes crypto).
+    const contentMeta = command.kind === 'propose'
+      ? { contentHash: sha256Hex(command.content), contentBytes: Buffer.byteLength(command.content, 'utf8') }
+      : {};
     const envelope: CommandEnvelope = {
       command,
-      meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as },
+      meta: { id: this.#ids.messageId(), at: this.#clock.now(), principal: as, ...contentMeta },
     };
     // Peer 1A bootstrap: peer init carries the INITIATOR credential at the
     // transport edge (payload, never envelope/journal) and performs an
@@ -277,7 +332,17 @@ export class BrokerCore {
         return err(reqId, 'partner-active', `${holder} holds a live delivery lease (still working) — revocation rejected. Retry after the lease expires or the reply lands.`);
       }
     }
-    const result = await this.#commitEnvelope(reqId, dedupKey, envelope, state, initBind === undefined ? undefined : { extraEvents: initBind.extraEvents, privateBindings: initBind.privateBindings });
+    let opts: Parameters<BrokerCore['commitEnvelopeForTest']>[4];
+    if (initBind !== undefined) opts = { extraEvents: initBind.extraEvents, privateBindings: initBind.privateBindings };
+    if (command.kind === 'propose' && state?.topology === 'peer') {
+      // The body is journaled ONLY in the record's sealed field; the
+      // reveal extension fires when this submission completes the barrier.
+      const sealedBlob = { [as]: { bytes: envelope.meta.contentBytes ?? 0, contentHash: envelope.meta.contentHash ?? '', body: command.content } };
+      const reveal = this.#revealExtension(state, envelope, { kind: 'submit', author: as, blob: sealedBlob[as]! });
+      if (reveal instanceof Error) return err(reqId, 'sealed-corrupt', reveal.message);
+      opts = { ...(opts ?? {}), sealed: sealedBlob, ...(reveal ? { extraEvents: [...(opts?.extraEvents ?? []), ...reveal] } : {}) };
+    }
+    const result = await this.#commitEnvelope(reqId, dedupKey, envelope, state, opts);
     if (result.ok && initBind && connectionId !== undefined && this.#connections.has(connectionId)) {
       // Publication guard: the binding stands even if the socket died; a
       // dead connection is never tagged.
@@ -617,6 +682,20 @@ export class BrokerCore {
       const state = this.#journal.sessionState;
       return { reqId, ok: true, data: state ? Object.values(state.grants) : [] };
     }
+    if (what === 'planning-artifacts') {
+      // Per-phase redaction (design rev 3 #6 / rev 4 #5): sealed shows
+      // submission METADATA only; discarded and none show the discriminant.
+      const artifacts = this.#journal.planningArtifacts();
+      if (artifacts.phase === 'revealed') return { reqId, ok: true, data: artifacts };
+      if (artifacts.phase === 'sealed') {
+        const state = this.#journal.sessionState;
+        const submissions = state?.topology === 'peer' && state.planning?.substate === 'collecting'
+          ? Object.entries(state.planning.submitted).map(([author, sub]) => ({ author, ...sub }))
+          : [];
+        return { reqId, ok: true, data: { phase: 'sealed', submissions } };
+      }
+      return { reqId, ok: true, data: { phase: artifacts.phase } };
+    }
     if (what === 'log' || what.startsWith('log:')) {
       const requested = args && typeof args === 'object' ? Number((args as { tail?: unknown }).tail) : NaN;
       const tail = what.startsWith('log:') ? Number(what.slice(4)) || 10 : Number.isFinite(requested) ? requested : 10;
@@ -790,7 +869,15 @@ export class BrokerCore {
       // txn (pending-new-binding — the version survives; the next attach
       // TOFUs at version+1) and revokes + wakes every old-version tag.
       const rebindAgent = command.kind === 'user-rebind-agent' ? command.agent : undefined;
-      const result = await this.#commitUserEnvelope(reqId, clientId, envelope, rebindAgent === undefined ? undefined : { privateBindings: { [rebindAgent]: null } });
+      let userOpts: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>; extraEvents?: Event[] } | undefined;
+      if (rebindAgent !== undefined) userOpts = { privateBindings: { [rebindAgent]: null } };
+      const ruleState = this.#journal.sessionState;
+      if (command.kind === 'user-rule-absentee' && command.ruling === 'abstain' && ruleState?.topology === 'peer' && ruleState.planning?.substate === 'collecting') {
+        const reveal = this.#revealExtension(ruleState, envelope, { kind: 'abstain', agent: command.agent });
+        if (reveal instanceof Error) return err(reqId, 'sealed-corrupt', reveal.message);
+        if (reveal) userOpts = { ...(userOpts ?? {}), extraEvents: reveal };
+      }
+      const result = await this.#commitUserEnvelope(reqId, clientId, envelope, userOpts);
       if (result.ok && rebindAgent !== undefined) {
         for (const [connId, tag] of [...this.#agentConnections]) {
           if (tag.agent !== rebindAgent) continue;
@@ -810,7 +897,7 @@ export class BrokerCore {
   /** User-channel envelopes commit through the SAME roster-aware primitive
    * as agent execute (slice-4 design REV 6, tail B) — a user kick voids the
    * kicked agent's mail exactly like a driver kick. Already inside #chain. */
-  async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
+  async #commitUserEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>; extraEvents?: Event[] }): Promise<BrokerResponse> {
     return this.#commitEnvelope(reqId, clientId, envelope, this.#journal.sessionState, opts);
   }
 
@@ -822,7 +909,12 @@ export class BrokerCore {
    * commit logic is retired; callers handle stopping/conflict/dedup/auth
    * and any path-specific pre-checks (revoke liveness) BEFORE this.
    */
-  async #commitEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, opts?: { extraEvents?: Event[]; privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
+  /** Test-visible signature anchor for the opts shape. */
+  commitEnvelopeForTest(..._args: [string, string, CommandEnvelope, SessionState | undefined, { extraEvents?: Event[]; privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>; sealed?: Record<string, { bytes: number; contentHash: string; body: string }> }?]): never {
+    throw new Error('type anchor only');
+  }
+
+  async #commitEnvelope(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, opts?: { extraEvents?: Event[]; privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>; sealed?: Record<string, { bytes: number; contentHash: string; body: string }> }): Promise<BrokerResponse> {
     const decided = decide(state, envelope);
     if (!decided.ok) {
       const code = decided.error instanceof ProtocolError ? decided.error.code : 'rejected';
@@ -834,7 +926,7 @@ export class BrokerCore {
   /** The post-decide half of the shared commit primitive — also the direct
    * entry for BROKER-AUTHORED events (peer agent-attach binds, which carry
    * private verifiers that must never transit decide/commands). */
-  async #commitDecided(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, events: readonly Event[], opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null> }): Promise<BrokerResponse> {
+  async #commitDecided(reqId: string, clientId: string, envelope: CommandEnvelope, state: SessionState | undefined, events: readonly Event[], opts?: { privateBindings?: Record<string, { hash: string; credentialVersion: number } | null>; sealed?: Record<string, { bytes: number; contentHash: string; body: string }> }): Promise<BrokerResponse> {
     // F18/F21: roster removals void the agent's undelivered mail in the same
     // txn — capture the open set now (pre-commit) for the mirror moves.
     const removedAgents = events.flatMap((e) => (e.kind === 'agent-left' || e.kind === 'agent-kicked' ? [e.agent] : []));
@@ -870,7 +962,7 @@ export class BrokerCore {
         ...(command.groupId === undefined ? {} : { groupId: command.groupId }),
       },
     };
-    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents, opts?.privateBindings);
+    const record = await this.#journal.commit(envelope, events, response, { clientId, reqId }, removedAgents, opts?.privateBindings, opts?.sealed);
     const open = this.#journal.openDeliveries();
     const fresh = record.deliveries.flatMap((d) => {
       // Voided-in-same-txn deliveries are already closed — never pushed.

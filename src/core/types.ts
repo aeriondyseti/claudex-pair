@@ -36,13 +36,14 @@ export type MessageType =
   | 'turn-revoked'
   | 'leave'
   | 'join'
-  | 'kick';
+  | 'kick'
+  | 'proposal';
 
 /** Runtime mirror of MessageType (keep in sync) — decide validates against
  * this fail-closed because transport casts arbitrary strings to the union. */
 export const MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'ask', 'answer', 'review', 'handoff', 'info', 'done', 'grant', 'grant-done',
-  'grant-cancel', 'propose-end', 'turn-revoked', 'leave', 'join', 'kick',
+  'grant-cancel', 'propose-end', 'turn-revoked', 'leave', 'join', 'kick', 'proposal',
 ] satisfies MessageType[]);
 
 export type TurnMode = 'pass' | 'keep';
@@ -98,6 +99,30 @@ export type AttentionItem = {
   readonly at: Timestamp;
 };
 
+/** 1B: the broker's internal sender for protocol-authored notices —
+ * STRUCTURALLY outside AGENT_NAME_PATTERN, so it can never be an agent
+ * name, principal, or target; legacy agents literally named 'broker'
+ * stay valid (rev 4 #1). */
+export const BROKER_SENDER = '@broker';
+
+/** 1B canonical empty draft (revision 0) hash: sha256(''). */
+export const EMPTY_DRAFT_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+/** 1B resource bounds (design rev 3/4; raw UTF-8 bytes, Buffer.byteLength). */
+export const PROPOSAL_MAX_BYTES = 65_536;
+export const PROPOSALS_TOTAL_MAX_BYTES = 524_288;
+
+/** 1B text grammar: NUL and C0/C1 controls are rejected EXCEPT \n \t \r
+ * (CR accepted verbatim, no normalization — Windows CRLF passes; rev 4 #4).
+ * Under this grammar JSON escaping is at most 2x. */
+export function findControlCharacter(text: string): number {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if ((c < 0x20 && c !== 0x0a && c !== 0x09 && c !== 0x0d) || (c >= 0x7f && c <= 0x9f)) return i;
+  }
+  return -1;
+}
+
 /** M1: bounded practical roster limit — registry-defined, fail-closed at
  * init AND join. Raising it is a deliberate registry change, not implied
  * unbounded scaling (ENHANCEMENTS M1). */
@@ -137,12 +162,40 @@ export type PlanningState =
     }
   | {
       readonly substate: 'collecting';
-      /** Round 2 #4: the atomic barrier-open fact — the FROZEN electorate.
-       * Later observer admissions never enter it. */
-      readonly barrier: { readonly members: readonly AgentId[]; readonly registryVersion: number; readonly openedAt: Timestamp };
+      /** The atomic barrier-open fact. openedMembers is the IMMUTABLE
+       * audit snapshot; the EFFECTIVE electorate at reveal is
+       * openedMembers minus abstained (1B design rev 2 #1). */
+      readonly barrier: BarrierFact;
+      /** Submission STATUS only — bodies are protocol-sealed in the journal. */
+      readonly submitted: Readonly<Record<AgentId, { readonly contentHash: string; readonly bytes: number; readonly at: Timestamp }>>;
+      /** Explicit user rulings ONLY — never a silent shrink. */
+      readonly abstained: readonly AgentId[];
+      readonly deadlineAt?: Timestamp;
     }
-  | { readonly substate: 'converging'; readonly convergenceTurn: AgentId }
+  | ({ readonly substate: 'converging'; readonly rotation: Rotation } & ConvergenceCommon)
+  | ({ readonly substate: 'convergence-blocked'; readonly rotation: BlockedRotation } & ConvergenceCommon)
   | { readonly substate: 'balloting' };
+
+export type BarrierFact = { readonly openedMembers: readonly AgentId[]; readonly registryVersion: number; readonly openedAt: Timestamp };
+
+/** 1B ruling B: the stored round order is the FULL frozen electorate
+ * rotated from starterIndex — never live-filtered away. Holder
+ * selection/advance skips non-live members at advance time. */
+export type Rotation = {
+  readonly electorate: readonly AgentId[];
+  readonly starterIndex: number;
+  readonly round: number;
+  readonly remaining: readonly AgentId[];
+  readonly holder: AgentId;
+};
+export type BlockedRotation = Omit<Rotation, 'holder'>;
+
+export type ConvergenceCommon = {
+  readonly barrier: BarrierFact;
+  readonly draft: { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp };
+  readonly revisionLog: readonly { readonly revision: number; readonly hash: string; readonly author: AgentId | null; readonly at: Timestamp }[];
+  readonly findings: Readonly<Record<string, unknown>>; // Finding lands in 1B-c; empty until then
+};
 
 type SessionBase = {
   readonly task: string;

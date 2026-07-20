@@ -111,6 +111,8 @@ export interface ProtocolGateway {
   /** Peer 1A: bind + tag this connection as `agent` (optional: pair-mode
    * gateways and test fakes may omit it). */
   agentAttach?(agent: AgentId, credential: string): Promise<{ readonly agent: AgentId; readonly credentialVersion: number; readonly admitted: boolean }>;
+  /** Peer 1B: the authoritative artifact view (per-phase redacted). */
+  planningArtifacts?(): Promise<unknown>;
   status(): Promise<StatusDto>;
   log(tail?: number): Promise<readonly StoredMessage[]>;
   /** All grants regardless of state (the CLI `grants` listing). */

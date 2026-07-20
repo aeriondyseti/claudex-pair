@@ -291,3 +291,32 @@ describe('peer 1A round 2 #5: pending-rebind bindings survive snapshots', () => 
     expect(reopened.binding('codex')).toEqual({ credentialVersion: 2, revokedHashes: ['h'.repeat(64), 'i'.repeat(64)] }); // full denylist survives the snapshot
   });
 });
+
+
+describe('peer 1B-a: sealed snapshot inlining + fail-closed artifact verification', () => {
+  const blob = (body: string) => ({ bytes: Buffer.byteLength(body, 'utf8'), contentHash: shaJ(body), body });
+
+  test('unrevealed sealed bodies survive snapshot + segment trim; tampering fails closed', async () => {
+    const { journal, pairDir } = await freshJournal();
+    await commitInit(journal);
+    await journal.commit(env({ kind: 'propose' }, 'claude', 's1'), [] as never[], { ok: true }, { clientId: 'c', reqId: 'r-s1' }, [], undefined, { claude: blob('sealed body\r\nwith CRLF') });
+    await journal.snapshot();
+
+    const reopened = new Journal(pairDir);
+    await reopened.recover();
+    expect(reopened.sealedProposal('claude')?.body).toBe('sealed body\r\nwith CRLF');
+
+    // Tamper the snapshot body: recovery must fail closed.
+    const snapPath = join(pairDir, 'journal', 'snapshot.json');
+    const snap = JSON.parse(await readFile(snapPath, 'utf8')) as { sealedProposals?: Record<string, { body: string }> };
+    snap.sealedProposals!['claude']!.body = 'ALTERED';
+    await Bun.write(snapPath, JSON.stringify(snap));
+    const corrupt = new Journal(pairDir);
+    await expect(corrupt.recover()).rejects.toThrow(CorruptJournalError);
+  });
+});
+
+function shaJ(value: string): string {
+  return createHashJ('sha256').update(value, 'utf8').digest('hex');
+}
+import { createHash as createHashJ } from 'node:crypto';
