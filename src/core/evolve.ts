@@ -25,15 +25,22 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
         },
       };
       // Peer 1A: peer sessions begin ADMITTING — the roster named at init
-      // is authorizedExpected; only the initiator (bound in the init txn)
-      // is a member. Legacy events lack topology → pair.
+      // is authorization, not membership: ONLY the initiator gets a
+      // registry record (invitees get theirs at admission with a real
+      // joinedAt — codex 1A round 2 #2). Legacy events lack topology → pair.
       if (event.topology === 'peer') {
         return {
           ...base,
+          registry: {
+            version: 0,
+            agents: { [event.driver]: liveRecord(event.driver, event.at, event.meta?.[event.driver]) },
+          },
           topology: 'peer' as const,
           agents: [event.driver],
           initiator: event.driver,
           phase: 'planning' as const,
+          // Durable authorization (round 2 #3) lives OUTSIDE the substate.
+          authorized: event.agents,
           planning: { substate: 'admitting' as const, authorizedExpected: event.agents, admitted: [event.driver] },
           attention: [],
         };
@@ -92,10 +99,27 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       // the revocation event is the journaled provenance record.
       return state;
     case 'agent-left':
-    case 'agent-kicked':
+    case 'agent-kicked': {
+      if (!state) return state;
+      const agents = state.agents.filter((a) => a !== event.agent);
       // Membership events mutate the LIVE projection only; the paired
       // registry-updated event carries the canonical registry transition.
-      return state && { ...state, agents: state.agents.filter((a) => a !== event.agent) };
+      if (state.topology !== 'peer') return { ...state, agents };
+      // Round 2 #6 churn rule: a departure during ADMITTING leaves both
+      // the admitted set and the current completion set; a KICK also
+      // revokes durable authorization (re-entry needs a fresh user admit),
+      // while a voluntary leaver stays authorized and re-attaching
+      // RE-ADMITS it.
+      const authorized = event.kind === 'agent-kicked' ? state.authorized.filter((a) => a !== event.agent) : state.authorized;
+      const planning = state.planning?.substate === 'admitting'
+        ? {
+            ...state.planning,
+            admitted: state.planning.admitted.filter((a) => a !== event.agent),
+            authorizedExpected: state.planning.authorizedExpected.filter((a) => a !== event.agent),
+          }
+        : state.planning;
+      return { ...state, agents, authorized, ...(planning === undefined ? {} : { planning }) };
+    }
     case 'agent-joined':
       return state && { ...state, agents: [...state.agents, event.agent] };
     case 'registry-updated':
@@ -114,13 +138,23 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
           }
         : state;
     case 'admission-completed':
+      // Superseded by the paired barrier-opened fact (round 2 #4); kept as
+      // a provenance no-op for replay compatibility.
+      return state;
+    case 'barrier-opened':
       return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
-        ? { ...state, planning: { substate: 'collecting' } }
+        ? { ...state, planning: { substate: 'collecting', barrier: { members: event.members, registryVersion: event.registryVersion, openedAt: event.at } } }
         : state;
-    case 'admission-authorized':
-      return state && state.topology === 'peer' && state.planning?.substate === 'admitting'
-        ? { ...state, planning: { ...state.planning, authorizedExpected: state.planning.authorizedExpected.includes(event.agent) ? state.planning.authorizedExpected : [...state.planning.authorizedExpected, event.agent] } }
-        : state;
+    case 'admission-authorized': {
+      if (!state || state.topology !== 'peer') return state;
+      const authorized = state.authorized.includes(event.agent) ? state.authorized : [...state.authorized, event.agent];
+      // During admitting the authorization also joins the CURRENT barrier
+      // completion set; afterwards it is observer authorization only.
+      const planning = state.planning?.substate === 'admitting'
+        ? { ...state.planning, authorizedExpected: state.planning.authorizedExpected.includes(event.agent) ? state.planning.authorizedExpected : [...state.planning.authorizedExpected, event.agent] }
+        : state.planning;
+      return { ...state, authorized, ...(planning === undefined ? {} : { planning }) };
+    }
     case 'absentee-ruled':
       if (!state || state.topology !== 'peer' || state.planning?.substate !== 'admitting') return state;
       if (event.ruling === 'abstain') {

@@ -35,6 +35,8 @@ export type Event =
   /** Peer 1A: the last expected admission (or closing ruling) — planning
    * leaves 'admitting' atomically in the same txn. */
   | { kind: 'admission-completed'; at: Timestamp }
+  /** Round 2 #4: the durable atomic barrier-open fact. */
+  | { kind: 'barrier-opened'; members: AgentId[]; registryVersion: number; at: Timestamp }
   | { kind: 'admission-authorized'; agent: AgentId; at: Timestamp }
   | { kind: 'absentee-ruled'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; at: Timestamp }
   /** Peer 1A: outcome provenance is permanent — 'forced' can never read

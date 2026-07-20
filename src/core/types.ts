@@ -135,7 +135,12 @@ export type PlanningState =
       /** Absolute deadline for admission; expiry pages the human (durable). */
       readonly deadlineAt?: Timestamp;
     }
-  | { readonly substate: 'collecting' }
+  | {
+      readonly substate: 'collecting';
+      /** Round 2 #4: the atomic barrier-open fact — the FROZEN electorate.
+       * Later observer admissions never enter it. */
+      readonly barrier: { readonly members: readonly AgentId[]; readonly registryVersion: number; readonly openedAt: Timestamp };
+    }
   | { readonly substate: 'converging'; readonly convergenceTurn: AgentId }
   | { readonly substate: 'balloting' };
 
@@ -176,6 +181,11 @@ export type PeerSession = SessionBase & {
   readonly topology: 'peer';
   readonly initiator: AgentId;
   readonly phase: SessionPhase;
+  /** Round 2 #3: DURABLE authorization — survives substates and barrier
+   * transitions. The admitting `authorizedExpected` is the CURRENT
+   * barrier's completion set; this is who may ever attach. An abstained
+   * invitee stays here (authorized pending observer). */
+  readonly authorized: readonly AgentId[];
   readonly planning?: PlanningState;
   /** Durable human-attention queue (peer 1A; codex guardrail: never
    * depend on a live watch connection for visibility). */

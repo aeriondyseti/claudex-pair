@@ -104,7 +104,37 @@ function decideInner(
       return withLive(state, (s) => decideUserRuleAbsentee(s, command, envelope));
     case 'user-force-phase':
       return withLive(state, (s) => decideUserForcePhase(s, command, envelope));
+    case 'user-clear-attention':
+      return withLive(state, (s) => decideUserClearAttention(s, command, envelope));
   }
+}
+
+/** Round 2 #6: a departure during ADMITTING shrinks both the admitted set
+ * and the completion set — if the survivors now satisfy it, the SAME txn
+ * opens the barrier over them (durable fact, frozen electorate). */
+function appendAdmittingCompletion(s: SessionState, departing: AgentId, events: Event[], at: string): void {
+  if (s.topology !== 'peer' || s.planning?.substate !== 'admitting') return;
+  const expected = s.planning.authorizedExpected.filter((a) => a !== departing);
+  const admitted = s.planning.admitted.filter((a) => a !== departing);
+  if (expected.length > 0 && expected.every((a) => admitted.includes(a))) {
+    events.push({ kind: 'admission-completed', at });
+    events.push({ kind: 'barrier-opened', members: admitted, registryVersion: s.registry.version + 1, at });
+  }
+}
+
+function decideUserClearAttention(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-clear-attention' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-clear-attention');
+  if (bad) return err(bad);
+  const peer = requirePeer(s, 'user-clear-attention');
+  if (peer instanceof ProtocolError) return err(peer);
+  if (!peer.attention.some((a) => a.id === command.id)) {
+    return err(new ProtocolError('unknown-attention', `No attention item '${command.id}' — it may already be cleared (status lists open items).`));
+  }
+  return ok([{ kind: 'attention-cleared', id: command.id, at: envelope.meta.at }]);
 }
 
 /** Peer 1A privileged user verbs — all typed, all through the same
@@ -123,20 +153,22 @@ function decideUserAdmit(
   if (bad) return err(bad);
   const peer = requirePeer(s, 'user-admit-agent');
   if (peer instanceof ProtocolError) return err(peer);
-  if (peer.planning?.substate !== 'admitting') {
-    return err(new ProtocolError('admitting-closed', 'Admission authorization after the barrier opens lands with 1B (post-barrier admits become observers).'));
-  }
   if (command.agent === USER_IDENTITY) return err(new ProtocolError('reserved-identity', `'${USER_IDENTITY}' is the reserved user-channel identity.`));
   if (!AGENT_NAME_PATTERN.test(command.agent)) return err(new ProtocolError('invalid-agents', `invalid agent name '${command.agent}'`));
-  if (peer.planning.authorizedExpected.includes(command.agent) || peer.agents.includes(command.agent)) {
+  // Round 2 #3: authorization works in EVERY substate — during admitting
+  // it joins the current completion set; afterwards the agent attaches as
+  // an observer (never entering a frozen barrier electorate).
+  if (peer.authorized.includes(command.agent) || peer.agents.includes(command.agent)) {
     return err(new ProtocolError('already-participant', `'${command.agent}' is already authorized or admitted.`));
   }
-  if (peer.planning.authorizedExpected.length >= MAX_AGENTS) {
+  const pending = peer.authorized.filter((a) => !peer.agents.includes(a)).length;
+  if (peer.agents.length + pending >= MAX_AGENTS) {
     return err(new ProtocolError('registry-full', `The roster is at the M1 bound (${MAX_AGENTS}).`));
   }
+  const observer = peer.planning?.substate !== 'admitting';
   const events: Event[] = [{ kind: 'admission-authorized', agent: command.agent, at: envelope.meta.at }];
   peer.agents.forEach((agent, i) => {
-    events.push(userActionNotice(command, agent, i, 'admit', 'info', `USER AUTHORIZED '${command.agent}' to join — it becomes a member when it attaches with its own credential.`, envelope.meta.at));
+    events.push(userActionNotice(command, agent, i, 'admit', 'info', `USER AUTHORIZED '${command.agent}' to join${observer ? ' as an OBSERVER (the current barrier electorate is frozen)' : ''} — it becomes a member when it attaches with its own credential.`, envelope.meta.at));
   });
   return ok(events);
 }
@@ -182,11 +214,13 @@ function decideUserRuleAbsentee(
   }
   const events: Event[] = [{ kind: 'absentee-ruled', agent: command.agent, ruling: command.ruling, ...(command.newDeadlineAt === undefined ? {} : { newDeadlineAt: command.newDeadlineAt }), at: envelope.meta.at }];
   if (command.ruling === 'abstain') {
-    // The closing ruling opens the barrier atomically (rev 3): every
-    // remaining expected member is admitted once this absentee drops.
+    // The CLOSING ruling opens the barrier atomically (rev 3), emitting
+    // the durable barrier-open fact with the FROZEN electorate (round 2 #4).
     const remaining = peer.planning.authorizedExpected.filter((a) => a !== command.agent);
-    if (remaining.every((a) => peer.planning !== undefined && peer.planning.substate === 'admitting' && peer.planning.admitted.includes(a))) {
+    const admitted = peer.planning.admitted;
+    if (remaining.every((a) => admitted.includes(a))) {
       events.push({ kind: 'admission-completed', at: envelope.meta.at });
+      events.push({ kind: 'barrier-opened', members: [...admitted], registryVersion: peer.registry.version, at: envelope.meta.at });
     }
   }
   peer.agents.forEach((agent, i) => {
@@ -387,6 +421,7 @@ function decideUserKick(
     );
   });
   if (s.turn === command.agent) events.push({ kind: 'turn-passed', to: s.driver });
+  appendAdmittingCompletion(s, command.agent, events, envelope.meta.at);
   return ok(events);
 }
 
@@ -528,6 +563,7 @@ function decideLeave(s: SessionState, envelope: CommandEnvelope): Result<Event[]
     { kind: 'registry-updated', version: s.registry.version + 1, change: 'left', agent, at: envelope.meta.at },
     messageEvent(envelope, agent, sessionAnchor(s), 'leave', `${agent} left the session.`),
   ];
+  appendAdmittingCompletion(s, agent, events, envelope.meta.at);
   if (s.topology === 'pair' && s.turn === agent) events.push({ kind: 'turn-passed', to: s.driver }); // F17: same txn
   return ok(events);
 }

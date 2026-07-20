@@ -166,6 +166,11 @@ function parseActionDraft(buffer: string): { draft?: UserActionDraft & { display
     if (ruling === 'wait' && !newDeadlineAt) return { hint: "ruling 'wait' requires the new absolute deadline" };
     return { draft: { verb: 'rule-absentee', agent, ruling, ...(newDeadlineAt ? { newDeadlineAt } : {}), display: `/rule-absentee ${agent} ${ruling}${newDeadlineAt ? ` ${newDeadlineAt}` : ''}` } };
   }
+  if (verb === 'clear-attention') {
+    const [id = ''] = restParts;
+    if (!id || restParts.length !== 1) return { hint: 'usage: /clear-attention <id> (ids are shown on the ATTENTION lines)' };
+    return { draft: { verb: 'clear-attention', id, display: `/clear-attention ${id}` } };
+  }
   if (verb === 'force-phase') {
     const [to = '', ...reasonParts] = restParts;
     const reason = reasonParts.join(' ');

@@ -67,7 +67,9 @@ export async function runBrokerCli(
         if (cred.kind === 'error') throw new Error(`initiator credential: ${cred.detail}`);
         credential = cred.token;
       }
-      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, topology, ...(Object.keys(meta).length ? { meta } : {}) }, credential);
+      // Pair inits OMIT topology entirely — the pre-peer event shape is a
+      // byte-identity contract (codex 1A round 2 #7).
+      const r = await execute(gateway, driver, { kind: 'init-session', task, agents, driver, sessionId, ...(topology === 'peer' ? { topology } : {}), ...(Object.keys(meta).length ? { meta } : {}) }, credential);
       if (r.gitignoreUpdated) out('Added .pair/ to .gitignore.');
       out(`Pairing session initialized in ${join(root, '.pair')}`);
       out(`  Task:      ${task}`); out(`  Agents:    ${r.session.agents.join(', ')}`);
@@ -237,8 +239,8 @@ function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
     const planning = s.session.planning;
     if (planning?.substate === 'admitting') out(`Admitting: ${planning.admitted.length}/${planning.authorizedExpected.length} attached (${planning.authorizedExpected.filter((a) => !planning.admitted.includes(a)).join(', ') || 'none'} outstanding)${planning.deadlineAt ? `; deadline ${planning.deadlineAt}` : ''}`);
     else out(`Phase:     ${s.session.phase}${planning ? ` (${planning.substate})` : ''}`);
-    for (const item of s.session.attention) out(`ATTENTION: [${item.category}] ${item.detail} (${item.at})`);
-  } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+    for (const item of s.session.attention) out(`ATTENTION [${item.id}] (${item.category}) ${item.detail} — clear with /clear-attention ${item.id} (${item.at})`);
+  } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); if (s.session.topology !== 'peer') out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 function renderTurn(s: StatusDto, as: AgentId) {
   out('='.repeat(66));

@@ -26,7 +26,7 @@ describe('peer init: admitting bootstrap', () => {
     expect(s.phase).toBe('planning');
     expect(s.planning).toMatchObject({ substate: 'admitting', authorizedExpected: ['claude', 'codex', 'agy'], admitted: ['claude'] });
     expect(s.agents).toEqual(['claude']); // only admitted ids are members
-    expect(Object.keys(s.registry.agents).sort()).toEqual(['agy', 'claude', 'codex']); // authorized identities are registered
+    expect(Object.keys(s.registry.agents)).toEqual(['claude']); // round 2 #2: authorization is NOT a registry record — invitees register at admission
     expect(s.sessionId).toBe('session-p-0001');
   });
 
@@ -101,7 +101,7 @@ describe('peer 1A privileged user verbs', () => {
     let s = userReady(['claude', 'codex']);
     s = applyDecided(s, { kind: 'user-rule-absentee', agent: 'codex', ruling: 'abstain', ...base }, 'ur1');
     if (s.topology !== 'peer') throw new Error('shape');
-    expect(s.planning).toEqual({ substate: 'collecting' });
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude'] } });
 
     const s2 = userReady();
     const noDeadline = decide(s2, userEnv({ kind: 'user-rule-absentee', agent: 'codex', ruling: 'wait', ...base }, 'ur2'));

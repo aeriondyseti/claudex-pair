@@ -397,3 +397,39 @@ describe('M1: status renders compatibly against a pre-M1 broker', () => {
     expect(capture.text()).toContain('pre-M1');
   });
 });
+
+
+describe('peer 1A round 2 #7: pair byte-identity and peer status text', () => {
+  test('a pair init through the REAL CLI emits a command with NO topology field', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    let captured: Record<string, unknown> | undefined;
+    const capturing = { ...gateway, execute: async (request: { command: Record<string, unknown> }) => { captured = request.command; return gateway.execute(request as unknown as Parameters<CliGateway['execute']>[0]); } } as unknown as CliGateway;
+    const flags = new Map<string, string | true>([['task', 't'], ['agents', 'claude,codex'], ['driver', 'claude']]);
+    const capture = captureOut();
+    try { expect(await runBrokerCli('init', flags, [], 'unused-root', () => capturing)).toBe(0); } finally { capture.restore(); }
+    expect(captured).toBeDefined();
+    expect('topology' in captured!).toBeFalse(); // byte-identity: the pre-peer event shape
+    expect(typeof captured!['sessionId']).toBe('string');
+  });
+
+  test('peer status prints phase/admitting and NEVER Driver/Navigators/Turn/undefined', async () => {
+    const log: Log = [];
+    const { gateway } = makeFakeGateway(log);
+    const peerSession = {
+      topology: 'peer', task: 't', status: 'active', started: 's', agents: ['claude'], initiator: 'claude', phase: 'planning',
+      authorized: ['claude', 'codex'],
+      planning: { substate: 'admitting', authorizedExpected: ['claude', 'codex'], admitted: ['claude'] },
+      attention: [{ id: 'tofu-1', category: 'tofu-bind', detail: 'claude bound credential v1 (TOFU)', at: 's' }],
+      grants: {}, registry: { version: 2, agents: {} }, sessionId: 'session-x',
+    };
+    const peerGw = { ...gateway, status: async () => ({ ...(await gateway.status()), session: peerSession }) } as unknown as CliGateway;
+    const capture = captureOut();
+    try { expect(await runBrokerCli('status', new Map(), [], 'unused-root', () => peerGw)).toBe(0); } finally { capture.restore(); }
+    const text = capture.text();
+    expect(text).toContain('Admitting: 1/2 attached');
+    expect(text).toContain('ATTENTION [tofu-1]');
+    expect(text).not.toContain('Driver:');
+    expect(text).not.toContain('undefined');
+  });
+});

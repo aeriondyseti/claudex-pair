@@ -296,19 +296,50 @@ export class BrokerCore {
       if (!AGENT_CREDENTIAL_PATTERN.test(credential)) {
         return err(reqId, 'invalid-credential', 'Agent credential must be 64 lowercase hex characters (32 bytes).');
       }
-      const admittingAuthorized = state.planning?.substate === 'admitting' && state.planning.authorizedExpected.includes(agent);
-      if (!state.agents.includes(agent) && !admittingAuthorized) {
+      // Round 2 #3: DURABLE authorization decides attachability in every
+      // substate — an abstained invitee or post-barrier user admit attaches
+      // as an observer; only current-barrier expected members can complete
+      // the admitting set.
+      const authorizedDurable = state.agents.includes(agent) || state.authorized.includes(agent);
+      if (!authorizedDurable) {
         return err(reqId, 'admission-not-authorized', `'${agent}' is not authorized for this session — admission is by user action or the plan's policy, never self-declared.`);
       }
+      const inCurrentBarrier = state.planning?.substate === 'admitting' && state.planning.authorizedExpected.includes(agent);
       const existing = this.#journal.binding(agent);
       if (existing?.hash !== undefined) {
-        // Reconnect: prove the SAME secret (constant-time), no txn.
+        // Reconnect: prove the SAME secret (constant-time).
         if (!constantTimeEqualHex(sha256Hex(credential), existing.hash)) {
           return err(reqId, 'agent-auth-failed', 'Credential rejected.');
         }
+        // Round 2 #6: a bound NON-member (returning leaver, late observer)
+        // is re-admitted by its reconnect — a real membership txn.
+        if (!state.agents.includes(agent)) {
+          const at = this.#clock.now();
+          const events: Event[] = [
+            { kind: 'registry-updated', version: state.registry.version + 1, change: 'joined', agent, at },
+            { kind: 'agent-admitted', agent, at },
+          ];
+          if (inCurrentBarrier) {
+            const admittedAfter = [...(state.planning?.substate === 'admitting' ? state.planning.admitted : []), agent];
+            const expected = state.planning?.substate === 'admitting' ? state.planning.authorizedExpected : [];
+            if (expected.every((a) => admittedAfter.includes(a))) {
+              events.push({ kind: 'admission-completed', at });
+              events.push({ kind: 'barrier-opened', members: admittedAfter, registryVersion: state.registry.version + 1, at });
+            }
+          }
+          const envelope: CommandEnvelope = {
+            command: { kind: 'bind-agent', agent, readmit: true } as unknown as CommandEnvelope['command'],
+            meta: { id: this.#ids.messageId(), at, principal: agent },
+          };
+          const committed = await this.#commitDecided(reqId, clientId, envelope, state, events);
+          if (!committed.ok) return committed;
+          if (!this.#connections.has(connectionId)) return err(reqId, 'connection-closed', 'Connection closed during agent-attach; the re-admission is committed — re-attach.');
+          this.#agentConnections.set(connectionId, { agent, credentialVersion: existing.credentialVersion });
+          return { ...committed, data: { agent, credentialVersion: existing.credentialVersion, admitted: true } };
+        }
         if (!this.#connections.has(connectionId)) return err(reqId, 'connection-closed', 'Connection closed during agent-attach; re-attach.');
         this.#agentConnections.set(connectionId, { agent, credentialVersion: existing.credentialVersion });
-        return { reqId, ok: true, data: { agent, credentialVersion: existing.credentialVersion, admitted: state.agents.includes(agent) } };
+        return { reqId, ok: true, data: { agent, credentialVersion: existing.credentialVersion, admitted: true } };
       }
       // TOFU: no dedup shortcut (mirrors user-attach — an unrelated recorded
       // outcome must never stand in for a bind); a retry lands in the
@@ -321,19 +352,25 @@ export class BrokerCore {
       const credentialVersion = (existing?.credentialVersion ?? 0) + 1;
       const events: Event[] = [];
       let version = state.registry.version;
-      const willAdmit = admittingAuthorized && !state.agents.includes(agent);
+      const willAdmit = !state.agents.includes(agent);
       if (willAdmit) {
         // Admission IS the membership change — fresh joinedAt at admission
-        // time (the init-time record was the authorization, not membership).
+        // time (authorization was never a registry record; round 2 #2).
         events.push({ kind: 'registry-updated', version: ++version, change: 'joined', agent, at });
       }
       events.push({ kind: 'registry-updated', version: ++version, change: 'bound', agent, binding: { bindingId, credentialVersion, boundAt: at }, at });
       if (willAdmit) {
         events.push({ kind: 'agent-admitted', agent, at });
-        const admittedAfter = new Set([...(state.planning?.substate === 'admitting' ? state.planning.admitted : []), agent]);
-        const expected = state.planning?.substate === 'admitting' ? state.planning.authorizedExpected : [];
-        // Last expected admission atomically leaves 'admitting' (rev 3).
-        if (expected.every((a) => admittedAfter.has(a))) events.push({ kind: 'admission-completed', at });
+        if (inCurrentBarrier) {
+          const admittedAfter = [...(state.planning?.substate === 'admitting' ? state.planning.admitted : []), agent];
+          const expected = state.planning?.substate === 'admitting' ? state.planning.authorizedExpected : [];
+          // The LAST expected admission atomically opens the barrier with
+          // the durable frozen-electorate fact (round 2 #4).
+          if (expected.every((a) => admittedAfter.includes(a))) {
+            events.push({ kind: 'admission-completed', at });
+            events.push({ kind: 'barrier-opened', members: admittedAfter, registryVersion: version, at });
+          }
+        }
       }
       events.push({ kind: 'attention-raised', id: `tofu-${bindingId}`, category: 'tofu-bind', detail: `${agent} bound credential v${credentialVersion} (TOFU) — confirm this attach is yours.`, at });
       const envelope: CommandEnvelope = {
@@ -348,7 +385,9 @@ export class BrokerCore {
       // dead connection is simply not tagged (reconnect proves the secret).
       if (!this.#connections.has(connectionId)) return err(reqId, 'connection-closed', 'Connection closed during agent-attach; the binding is committed — re-attach.');
       this.#agentConnections.set(connectionId, { agent, credentialVersion });
-      return { reqId, ok: true, data: { agent, credentialVersion, admitted: true } };
+      // The committed txn's events ride the response (the atomic
+      // admission/barrier facts are the caller's receipt).
+      return { ...committed, data: { agent, credentialVersion, admitted: true } };
     });
   }
 
@@ -714,6 +753,9 @@ export class BrokerCore {
         if (!str(fields.agent) || (ruling !== 'abstain' && ruling !== 'wait')) return err(reqId, 'bad-command', 'user action rule-absentee requires an agent and ruling abstain|wait.');
         const newDeadlineAt = str((fields as { newDeadlineAt?: unknown }).newDeadlineAt);
         command = { kind: 'user-rule-absentee', agent: str(fields.agent), ruling, ...(newDeadlineAt ? { newDeadlineAt } : {}), ...shared };
+      } else if (verb === 'clear-attention') {
+        if (!str((fields as { id?: unknown }).id)) return err(reqId, 'bad-command', 'user action clear-attention requires an id.');
+        command = { kind: 'user-clear-attention', id: str((fields as { id?: unknown }).id), ...shared };
       } else if (verb === 'force-phase') {
         const to = str((fields as { to?: unknown }).to);
         if (to !== 'planning' && to !== 'provisioning' && to !== 'implementation') return err(reqId, 'bad-command', 'user action force-phase requires to: planning|provisioning|implementation.');

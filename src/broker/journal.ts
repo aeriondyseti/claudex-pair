@@ -67,8 +67,10 @@ export type Snapshot = {
    * snapshots lack it — recovery then seeds the ring from openDeliveries so
    * pre-snapshot open mail is never invisible to watch (codex review). */
   transcript?: TranscriptRecord[];
-  /** Peer 1A: private verifier map persisted across snapshots. */
-  bindings?: Record<string, { hash: string; credentialVersion: number }>;
+  /** Peer 1A: private verifier map persisted across snapshots. Entries
+   * WITHOUT a hash are pending-rebind (revoked): the version must survive
+   * restart so the next TOFU binds at version+1 (codex 1A round 2 #5). */
+  bindings?: Record<string, { hash?: string; credentialVersion: number }>;
   /** Item 7: first-class awaiting-set (asks not yet validly answered).
    * Persisted so cap pressure on the transcript ring can never lose an
    * unresolved ask across restart. Optional: a legacy snapshot lacks it —
@@ -472,7 +474,7 @@ export class Journal {
       openDeliveries: this.openDeliveries(),
       transcript: this.transcript(),
       awaiting: this.awaiting(),
-      bindings: Object.fromEntries([...this.bindings_].filter(([, v]) => v.hash !== undefined) as [string, { hash: string; credentialVersion: number }][]),
+      bindings: Object.fromEntries(this.bindings_),
     };
     const target = join(this.dir, 'snapshot.json');
     const tmp = join(this.dir, `snapshot.json.${process.pid}.tmp`);

@@ -107,7 +107,7 @@ describe('agent-attach: TOFU admission, reconnect proof, rejection matrix', () =
 
     const s = await session(core);
     expect([...s.agents].sort()).toEqual(['claude', 'codex']);
-    expect(s.planning).toEqual({ substate: 'collecting' }); // codex was the LAST expected member
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'codex'] } }); // atomic barrier-open fact (round 2 #4)
     expect(s.registry.agents['codex']!.binding).toMatchObject({ credentialVersion: 1 });
     // Admission is the membership change: fresh joinedAt at admission time.
     expect(s.registry.agents['codex']!.status).toBe('active');
@@ -231,5 +231,129 @@ describe('user-rebind-agent: pending-new-binding, revoked tags, TOFU at version+
     const again = await core.agentAttach('at-2', 'conn-codex-2', 'client-codex', 'codex', 'd'.repeat(64));
     expect(again.ok).toBeTrue();
     expect((again as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(2);
+  });
+});
+
+
+describe('1A round 2: registry honesty, durable authorization, frozen electorate, churn, attention', () => {
+  const userSink = { id: 'conn-user', sendObserver: async () => undefined };
+
+  test('#2: init registers ONLY the initiator; restart while admitting changes nothing (version, records, agents.json)', async () => {
+    const root = await tempRoot();
+    const core = await peerCore(root, ['claude', 'codex', 'agy']);
+    const before = await session(core);
+    expect(Object.keys(before.registry.agents)).toEqual(['claude']);
+    const versionBefore = before.registry.version;
+
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    const after = await session(reopened);
+    expect(Object.keys(after.registry.agents)).toEqual(['claude']);
+    expect(after.registry.version).toBe(versionBefore);
+    expect(Object.values(after.registry.agents).every((r) => r.status === 'active')).toBeTrue(); // nobody silently marked left
+    const mirror = JSON.parse(await readFile(join(root, '.pair', 'agents.json'), 'utf8')) as { registry: { version: number; agents: Record<string, unknown> } };
+    expect(Object.keys(mirror.registry.agents)).toEqual(['claude']);
+    expect(mirror.registry.version).toBe(versionBefore);
+  });
+
+  test('#3+#4: closing abstain opens the FROZEN barrier; the abstained invitee attaches later as an observer outside it; post-barrier user admission works', async () => {
+    const core = await peerCore(await tempRoot(), ['claude', 'codex', 'agy']);
+    core.onConnection('conn-codex', 'open');
+    expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
+
+    core.onConnection('conn-user', 'open');
+    expect((await core.userAttach('uat-1', userSink, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
+    const ruling = await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'rule-absentee', agent: 'agy', ruling: 'abstain' });
+    expect(ruling.ok).toBeTrue();
+
+    let s = await session(core);
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'codex'] } });
+    expect(s.authorized).toContain('agy'); // abstain kept the DURABLE authorization
+
+    // The abstained invitee attaches LATER: admitted as a member, but the
+    // frozen electorate never grows.
+    core.onConnection('conn-agy', 'open');
+    const late = await core.agentAttach('at-2', 'conn-agy', 'client-agy', 'agy', CRED.agy);
+    expect(late.ok).toBeTrue();
+    s = await session(core);
+    expect(s.agents).toContain('agy');
+    if (s.planning?.substate !== 'collecting') throw new Error('shape');
+    expect(s.planning.barrier.members).toEqual(['claude', 'codex']); // frozen
+
+    // Post-barrier user admission: authorize + attach a brand-new observer.
+    expect((await core.userAction('ract-2', 'client-user', 'conn-user', { verb: 'admit', agent: 'gemini' })).ok).toBeTrue();
+    core.onConnection('conn-gem', 'open');
+    expect((await core.agentAttach('at-3', 'conn-gem', 'client-gem', 'gemini', 'e'.repeat(64))).ok).toBeTrue();
+    s = await session(core);
+    expect(s.agents).toContain('gemini');
+    if (s.planning?.substate !== 'collecting') throw new Error('shape');
+    expect(s.planning.barrier.members).toEqual(['claude', 'codex']); // still frozen
+  });
+
+  test('#4: the closing attach txn is ATOMIC — exact event list incl. the barrier-open fact', async () => {
+    const core = await peerCore(await tempRoot(), ['claude', 'codex']);
+    core.onConnection('conn-codex', 'open');
+    const closing = await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex);
+    expect(closing.ok).toBeTrue();
+    const kinds = ((closing as { events?: { kind: string }[] }).events ?? []).map((e) => e.kind);
+    expect(kinds).toEqual(['registry-updated', 'registry-updated', 'agent-admitted', 'admission-completed', 'barrier-opened', 'attention-raised']);
+  });
+
+  test('#6: leave during admitting shrinks both sets; a bound leaver RE-ADMITS by reconnect; user kick revokes authorization', async () => {
+    const core = await peerCore(await tempRoot(), ['claude', 'codex', 'agy']);
+    core.onConnection('conn-codex', 'open');
+    expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
+
+    // codex leaves mid-admitting.
+    const left = await core.execute('lv-1', 'client-codex', 'codex', { command: { kind: 'leave-session' } }, 'conn-codex');
+    expect(left.ok).toBeTrue();
+    let s = await session(core);
+    if (s.planning?.substate !== 'admitting') throw new Error('shape');
+    expect(s.planning.admitted).toEqual(['claude']);
+    expect(s.planning.authorizedExpected).toEqual(['claude', 'agy']); // completion set shrank
+    expect(s.authorized).toContain('codex'); // voluntary leave keeps durable authorization
+
+    // agy attaching now COMPLETES the shrunken set.
+    core.onConnection('conn-agy', 'open');
+    expect((await core.agentAttach('at-2', 'conn-agy', 'client-agy', 'agy', CRED.agy)).ok).toBeTrue();
+    s = await session(core);
+    expect(s.planning).toMatchObject({ substate: 'collecting', barrier: { members: ['claude', 'agy'] } });
+
+    // The bound leaver re-attaches: RE-ADMITTED (membership txn), frozen barrier unchanged.
+    core.onConnection('conn-codex-2', 'open');
+    const back = await core.agentAttach('at-3', 'conn-codex-2', 'client-codex', 'codex', CRED.codex);
+    expect(back.ok).toBeTrue();
+    s = await session(core);
+    expect(s.agents).toContain('codex');
+    if (s.planning?.substate !== 'collecting') throw new Error('shape');
+    expect(s.planning.barrier.members).toEqual(['claude', 'agy']);
+
+    // User kick revokes DURABLE authorization: re-attach is rejected.
+    core.onConnection('conn-user', 'open');
+    expect((await core.userAttach('uat-1', userSink, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
+    expect((await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'kick', agent: 'codex' })).ok).toBeTrue();
+    core.onConnection('conn-codex-3', 'open');
+    const rejected = await core.agentAttach('at-4', 'conn-codex-3', 'client-codex', 'codex', CRED.codex);
+    expect((rejected as { error?: { code?: string } }).error?.code).toBe('admission-not-authorized');
+  });
+
+  test('#8: attention clears by user action with id correlation and STAYS cleared across restart', async () => {
+    const root = await tempRoot();
+    const core = await peerCore(root);
+    let s = await session(core);
+    const item = s.attention[0]!;
+    expect(item.category).toBe('tofu-bind');
+
+    core.onConnection('conn-user', 'open');
+    expect((await core.userAttach('uat-1', userSink, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
+    const unknown = await core.userAction('ract-0', 'client-user', 'conn-user', { verb: 'clear-attention', id: 'nope' });
+    expect((unknown as { error?: { code?: string } }).error?.code).toBe('unknown-attention');
+    expect((await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'clear-attention', id: item.id })).ok).toBeTrue();
+    s = await session(core);
+    expect(s.attention.some((a) => a.id === item.id)).toBeFalse();
+
+    const reopened = makeCore(root);
+    expect(await reopened.recover()).not.toBe('conflict');
+    expect((await session(reopened)).attention.some((a) => a.id === item.id)).toBeFalse();
   });
 });

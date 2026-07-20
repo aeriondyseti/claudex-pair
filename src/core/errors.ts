@@ -47,6 +47,7 @@ export type ProtocolErrorCode =
   | 'phase-unavailable'
   | 'admitting-closed'
   | 'not-an-absentee'
+  | 'unknown-attention'
   | 'no-turn-in-phase'
   | 'invalid-session-id'
   | 'invalid-message-type'

@@ -58,6 +58,9 @@ export type Command =
    * from expected (authorized pending observer); wait sets a new absolute
    * deadline. */
   | { kind: 'user-rule-absentee'; agent: AgentId; ruling: 'abstain' | 'wait'; newDeadlineAt?: Timestamp; groupId: string; noticeIdBase: string }
+  /** Round 2 #8: complete a durable attention item (loud TOFU etc.) —
+   * without this the instruction can never be satisfied. */
+  | { kind: 'user-clear-attention'; id: string; groupId: string; noticeIdBase: string }
   /** Peer 1A: bounded forced transition — planning->provisioning ONLY;
    * outcome is permanently 'forced', never unanimity. */
   | { kind: 'user-force-phase'; to: import('./types.ts').SessionPhase; reason: string; groupId: string; noticeIdBase: string }

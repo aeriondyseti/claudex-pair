@@ -88,7 +88,8 @@ export type UserActionDraft =
   | { readonly verb: 'admit'; readonly agent: string }
   | { readonly verb: 'rebind'; readonly agent: string }
   | { readonly verb: 'rule-absentee'; readonly agent: string; readonly ruling: 'abstain' | 'wait'; readonly newDeadlineAt?: string }
-  | { readonly verb: 'force-phase'; readonly to: string; readonly reason: string };
+  | { readonly verb: 'force-phase'; readonly to: string; readonly reason: string }
+  | { readonly verb: 'clear-attention'; readonly id: string };
 
 /**
  * Reducer-owned state (amendment 1). `model` is the renderable view;

@@ -131,7 +131,7 @@ export function renderWatchFrame({ model, width, tail, composer, stalledAfterSec
   // pane attached (the state carries them, not a live push).
   if (model.session.topology === 'peer') {
     for (const item of model.session.attention) {
-      lines.push(` ${WARN}${BOLD}⚠ ATTENTION [${item.category}]${RESET} ${WARN}${item.detail}${RESET}`);
+      lines.push(` ${WARN}${BOLD}⚠ ATTENTION [${item.id}]${RESET} ${WARN}(${item.category}) ${item.detail} — /clear-attention ${item.id}${RESET}`);
     }
   }
   if (model.session.status === 'paused') {
