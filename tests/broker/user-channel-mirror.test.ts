@@ -97,6 +97,35 @@ describe('user-channel informational mirror', () => {
     expect(existsSync(path)).toBeFalse();
   });
 
+  test('pre-feature upgrade: registered state, file absent from BOTH disk and old manifest — reconcile CREATES it (state-driven, not drift-driven)', async () => {
+    const dir = await root();
+    const mirrors = new FsMirrors(dir);
+    await mirrors.applyInit(base);
+    // Simulate a pre-feature session: registered in the journal, but the
+    // mirror writes never happened (turn-passed keeps the manifest current
+    // WITHOUT a user-channel entry — undefined===undefined drift).
+    await mirrors.applyEvents(registered, [{ kind: 'turn-passed', to: 'codex' }], 2);
+    const path = join(dir, '.pair', 'user-channel.json');
+    expect(existsSync(path)).toBeFalse();
+
+    expect(await mirrors.reconcile(registered, [], 2)).toBe('rebuilt');
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ registered: true });
+    expect(await mirrors.reconcile(registered, [], 2)).toBe('clean');
+  });
+
+  test('session-initialized EVENT path normalizes: a new unbound session removes the prior canonical file even with a matching manifest', async () => {
+    const dir = await root();
+    const mirrors = new FsMirrors(dir);
+    await mirrors.applyInit(base);
+    await mirrors.applyEvents(registered, [{ kind: 'user-channel-registered', tokenHash: registered.userChannelTokenHash!, at: 'now' }], 2);
+    const path = join(dir, '.pair', 'user-channel.json');
+    expect(existsSync(path)).toBeTrue();
+    // Replay-style init event (no applyInit): the file goes immediately.
+    await mirrors.applyEvents(base, [{ kind: 'session-initialized', task: 't2', agents: ['claude', 'codex'], driver: 'claude', at: 'later' }], 3);
+    expect(existsSync(path)).toBeFalse();
+    expect(await mirrors.reconcile(base, [], 3)).toBe('clean');
+  });
+
   test('authoritative-set tamper still conflicts — the exemption is exactly one informational file', async () => {
     const dir = await root();
     const mirrors = new FsMirrors(dir);

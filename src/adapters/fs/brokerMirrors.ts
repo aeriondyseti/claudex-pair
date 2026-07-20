@@ -31,6 +31,17 @@ type Manifest = { mirroredSeq: number; files: Record<string, string> };
 
 const USER_CHANNEL_MIRROR = 'user-channel.json';
 
+/** Canonical informational-mirror content derived from session state —
+ * undefined means the file must not exist. Single source for writer and
+ * reconcile's expected-hash comparison. */
+function userChannelContent(state: SessionState | undefined): string | undefined {
+  if (!state?.userChannelTokenHash) return undefined;
+  return `${JSON.stringify({
+    registered: true,
+    note: 'Informational mirror; the broker journal is authoritative. The user credential is never stored in .pair.',
+  }, null, 2)}\n`;
+}
+
 export class FsMirrors implements MirrorStore {
   readonly pairDir: string;
   #sessions: FsSessionStore;
@@ -71,7 +82,11 @@ export class FsMirrors implements MirrorStore {
     for (const event of events) {
       switch (event.kind) {
         case 'session-initialized':
-          break; // applyInit handled this inline
+          // applyInit handled the session files inline, but replay paths can
+          // reach here without applyInit — normalize the user-channel mirror
+          // per the NEW state regardless (codex combined audit).
+          await this.#writeUserChannel(state);
+          break;
         case 'message-sent':
           await this.#mailbox.publish({
             id: event.id, from: event.from, to: event.to,
@@ -112,16 +127,13 @@ export class FsMirrors implements MirrorStore {
    */
   async #writeUserChannel(state: SessionState | undefined): Promise<void> {
     const path = join(this.pairDir, USER_CHANNEL_MIRROR);
-    if (!state?.userChannelTokenHash) {
+    const content = userChannelContent(state);
+    if (content === undefined) {
       await rm(path, { force: true });
       return;
     }
-    const content = {
-      registered: true,
-      note: 'Informational mirror; the broker journal is authoritative. The user credential is never stored in .pair.',
-    };
     const tmp = `${path}.${process.pid}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(content, null, 2)}\n`, 'utf8');
+    await writeFile(tmp, content, 'utf8');
     await rename(tmp, path);
   }
 
@@ -181,8 +193,15 @@ export class FsMirrors implements MirrorStore {
     if (diverged.length || added.length) {
       throw new MirrorConflictError([...diverged.map((p) => `changed: ${p}`), ...added.map((p) => `added: ${p}`)].join(', '));
     }
-    if (current[USER_CHANNEL_MIRROR] !== manifest.files[USER_CHANNEL_MIRROR]) {
-      await this.#writeUserChannel(state); // normalize: recreate, repair, or remove
+    // State-driven, not drift-driven (codex combined audit): the expected
+    // canonical content derives from recovered STATE; repair whenever the
+    // disk disagrees with it — manifest equality is irrelevant here. This
+    // covers the pre-feature upgrade (registered state, file absent from
+    // BOTH disk and old manifest: drift comparison read 'clean' forever).
+    const expected = userChannelContent(state);
+    const expectedHash = expected === undefined ? undefined : createHash('sha256').update(expected).digest('hex');
+    if (current[USER_CHANNEL_MIRROR] !== expectedHash) {
+      await this.#writeUserChannel(state); // create, normalize, or remove
       await this.writeManifest(headSeq);
       return 'rebuilt';
     }

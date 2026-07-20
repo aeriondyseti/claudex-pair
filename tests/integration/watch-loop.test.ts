@@ -325,6 +325,65 @@ describe('watch event loop host', () => {
     expect(await loop).toBe(0);
   }, 10_000);
 
+  test('recovery never overlaps an in-flight background attach: it awaits settlement on the shared gateway, then recovers exactly once', async () => {
+    const userChannel = { registered: true, authenticated: true };
+    const sessionA = fakeSession(1);
+    (sessionA.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
+    const sends: string[] = [];
+    const sessionB = fakeSession(1);
+    (sessionB.session.snapshot as { userChannel?: typeof userChannel }).userChannel = userChannel;
+    const userSessionA = { ...sessionA.session, send: async () => { throw new Error('IPC connection closed'); } };
+    const userSessionB = { ...sessionB.session, send: async (reqId: string) => void sends.push(reqId) };
+
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    let gateHeld = false;
+    let overlapped = false;
+    const calls: boolean[] = [];
+    const gateway: ObserverGatewayLike = {
+      observe: async () => { throw new Error('token present'); },
+      userAttach: async (_token, spawn) => {
+        if (gateHeld) overlapped = true; // a second connector call while one is parked = the race
+        calls.push(spawn === true);
+        if (calls.length === 1) return userSessionA;
+        if (calls.length === 2) {
+          gateHeld = true;
+          await gate; // background connect-only attempt parked mid-flight
+          gateHeld = false;
+          throw new Error('ECONNREFUSED'); // broker still dead when it resumes
+        }
+        return userSessionB; // the recovery attach (spawn=true)
+      },
+      close: async () => undefined,
+    };
+    let handlers: TerminalHandlers | undefined;
+    const seen: WatchEvent[] = [];
+    const spy: WatchReducer = (state, event) => { seen.push(event); return reduceWatch(state, event); };
+    const loop = runBrokerEventLoop('unused-root', { tail: 5, refreshSec: 2, userToken: 'u'.repeat(64) }, spy, {
+      gateway,
+      terminal: (h) => { handlers = h; return { interactive: true, width: () => 80, close: () => undefined }; },
+      reattachDelayMs: 25,
+      write: () => undefined,
+    });
+    await until(() => seen.some((e) => e.kind === 'user-channel' && e.state === 'registered'));
+    await sessionA.session.close(); // broker dies; background attach parks at the gate
+    await until(() => gateHeld);
+
+    handlers!.onText!('no overlap');
+    handlers!.onKey?.('submit'); // recovery starts while the background attach is parked
+    await Bun.sleep(60); // give a racy implementation every chance to overlap
+    expect(calls.length).toBe(2); // recovery is WAITING, not racing
+    expect(seen.some((e) => e.kind === 'submit-result')).toBeFalse();
+
+    releaseGate();
+    await until(() => seen.some((e) => e.kind === 'submit-result' && e.ok));
+    expect(overlapped).toBeFalse(); // no connector call ever overlapped the parked one
+    expect(calls).toEqual([true, false, true]); // initial spawn, parked connect-only, recovery spawn
+    expect(sends.length).toBe(1); // recovered exactly once
+    handlers!.onQuit();
+    expect(await loop).toBe(0);
+  }, 10_000);
+
   test('non-TTY exclusion proof (close-out #7): zero credential activity, zero user-attach, no send path — even with a registered broker binding', async () => {
     const { mkdtemp, mkdir, rm } = await import('node:fs/promises');
     const { join } = await import('node:path');

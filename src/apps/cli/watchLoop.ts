@@ -174,10 +174,11 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
     return { next: await gateway.observe(spawn), degraded: false };
   };
 
+  let attachTask: Promise<void> | undefined; // recovery awaits settlement before touching the gateway
   const startAttach = (): void => {
     if (attaching || closed) return;
     attaching = true;
-    void (async () => {
+    attachTask = (async () => {
       try {
         for (;;) {
           if (closed || recovering || session) return; // recovery/success owns attachment
@@ -203,6 +204,7 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
         }
       } finally {
         attaching = false;
+        attachTask = undefined;
       }
     })();
   };
@@ -236,8 +238,20 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: message(first) });
           return;
         }
+        const failedSession = session; // the session the submit just failed on
         recovering = true; // background loop yields; its catch won't close our client
         try {
+          // Never race the in-flight background attach on the SHARED gateway
+          // (`getClient` ??=-assigns one client): await its settlement — the
+          // loop exits promptly once `recovering` is up (codex combined
+          // audit). If it adopted a FRESH session meanwhile, ride it; the
+          // one the submit failed on is never retried in place.
+          await attachTask?.catch(() => undefined);
+          if (session && session !== failedSession) {
+            await submitViaSession(effect);
+            queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+            return;
+          }
           pumpGeneration++; // silence the dying session's pump
           await session?.close();
           session = undefined;
