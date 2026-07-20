@@ -29,10 +29,23 @@ export type ThreadedHeader = {
 const RESOLVING_TYPES: ReadonlySet<string> = new Set(['answer', 'review']);
 
 export function applyMessageToAwaiting(awaiting: Map<string, AwaitingEntry>, message: ThreadedHeader): void {
-  if (message.replyTo !== undefined) {
-    const entry = awaiting.get(message.replyTo);
-    if (entry && RESOLVING_TYPES.has(message.type) && message.from === entry.to && message.to === entry.from) {
-      awaiting.delete(message.replyTo);
+  if (RESOLVING_TYPES.has(message.type)) {
+    if (message.replyTo !== undefined) {
+      const entry = awaiting.get(message.replyTo);
+      if (entry && message.from === entry.to && message.to === entry.from) {
+        awaiting.delete(message.replyTo);
+      }
+    } else {
+      // Compatibility rule (round 2): an UNTAGGED answer/review settles the
+      // OLDEST open debt on the reverse endpoints — otherwise a partner not
+      // yet sending -ReplyTo leaves phantom debts forever. Anything with
+      // more than one ask in flight must tag (PROTOCOL "Threading").
+      for (const [id, entry] of awaiting) {
+        if (entry.to === message.from && entry.from === message.to) {
+          awaiting.delete(id);
+          break;
+        }
+      }
     }
   }
   if (message.type === 'ask') {

@@ -1,7 +1,7 @@
 import type { CommandEnvelope, Command, GrantScopeInput } from './commands.ts';
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
-import { AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
+import { MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Grant, type GrantScope, type Result, type SessionState } from './types.ts';
 
 /**
  * The protocol state machine. Pure, deterministic, total. Every invariant in
@@ -584,6 +584,15 @@ function decideSend(
   if (bad) return err(bad);
   if (from === command.to) {
     return err(new ProtocolError('self-addressed', `-From and -To must differ (both were '${from}')`));
+  }
+  // Item 7 round 2 (codex): fail-closed runtime validation — the CLI casts
+  // untrusted strings into these fields, and replyTo is serialized into a
+  // header line (CR/LF or delimiter injection must never reach a codec).
+  if (!MESSAGE_TYPES.has(command.type)) {
+    return err(new ProtocolError('invalid-message-type', `Unknown message type '${command.type}'.`));
+  }
+  if (command.replyTo !== undefined && !MESSAGE_ID_PATTERN.test(command.replyTo)) {
+    return err(new ProtocolError('invalid-reply-to', `-ReplyTo must be a plain message id (letters, digits, . _ : -; max 64 chars).`));
   }
   if (command.turn === 'pass' && s.turn !== from) {
     return err(

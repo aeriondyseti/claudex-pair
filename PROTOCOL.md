@@ -69,6 +69,37 @@ Enforced invariants: a turn-passing message is only accepted from the current
 turn-holder, and `handoff` is only accepted from the current driver. FYIs
 (`-Turn keep`) may be sent by anyone at any time.
 
+## Threading (`reply_to`, item 7)
+
+Message ids are collision-safe (`yyyyMMdd-HHmmss-fff-xxxxxx`: sortable
+wall-clock prefix + per-process sequence + random suffix); a `session_id`
+field is deliberately deferred to the M1 registry work. Replies carry
+causality in the optional `reply_to` header field, which never moves the
+turn.
+
+- **Tag your replies.** When answering an `ask`, send `answer`/`review`
+  with `-ReplyTo <ask id>`. Only `answer`/`review` on the reverse endpoints
+  resolves the ask; a tagged message of any other type, with wrong
+  endpoints, or naming an unknown id is advisory metadata only.
+- **Compatibility rule.** An UNTAGGED `answer`/`review` settles the OLDEST
+  open ask between the two agents in that direction, so single-thread
+  exchanges work untagged. Anything with more than one ask in flight MUST
+  tag with `-ReplyTo` — untagged resolution is deliberately deterministic,
+  not clever.
+- **The awaiting-set.** The broker journals every open ask ("who owes
+  whom"), authoritatively (persisted; survives restarts and history
+  trimming). `pair status` prints `Awaiting:` lines; `pair watch` shows
+  them with ages. Entries clear on a valid reply, when either party leaves
+  or is kicked, and at session end.
+- **Thread-scoped waits.** `pair wait -As <you> -Thread <ask id>` — and
+  every fused ask automatically — prints and acks all traffic but exits
+  only when the journal confirms THAT ask resolved. User messages and ⚡
+  action notices still wake it immediately (act on them, then re-arm; the
+  printed hint preserves `-Thread`). Timeout re-arm hints preserve
+  `-Thread` too.
+- **Thread log.** `pair log -Thread <id>` prints the root and its
+  transitive reply chain, computed over the full archive.
+
 ## Work grants (grants-lite)
 
 When the agents **agree in conversation** that a set of tasks is parallelizable

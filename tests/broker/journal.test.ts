@@ -196,3 +196,29 @@ describe('journal item-7 awaiting-set', () => {
     expect(reopened.awaiting().map((a) => a.messageId)).toEqual(['a2']);
   });
 });
+
+
+describe('journal item-7 untagged compatibility rule (round 2)', () => {
+  const at = '2026-07-20 13:00:00';
+  const msg2 = (id: string, from: string, to: string, type: string, replyTo?: string) =>
+    [{ kind: 'message-sent', id, from, to, type, turn: 'keep', body: 'b', at, ...(replyTo ? { replyTo } : {}) }] as never[];
+  const commit2 = (journal: Journal, id: string, from: string, to: string, type: string, replyTo?: string) =>
+    journal.commit(env({ kind: 'send-message' }, from, id), msg2(id, from, to, type, replyTo), { ok: true }, { clientId: 'c', reqId: `r2-${id}` });
+
+  test('an untagged answer settles the OLDEST reverse-endpoint debt only — no phantom debts', async () => {
+    const { journal } = await freshJournal();
+    await commitInit(journal);
+    await commit2(journal, 'a1', 'claude', 'codex', 'ask');
+    await commit2(journal, 'a2', 'claude', 'codex', 'ask');
+    await commit2(journal, 'b1', 'codex', 'claude', 'ask'); // other direction
+
+    await commit2(journal, 'ans1', 'codex', 'claude', 'answer'); // untagged
+    expect(journal.awaiting().map((a) => a.messageId)).toEqual(['a2', 'b1']);
+
+    await commit2(journal, 'ans2', 'codex', 'claude', 'answer'); // untagged again
+    expect(journal.awaiting().map((a) => a.messageId)).toEqual(['b1']); // b1 is claude's debt, untouched
+
+    await commit2(journal, 'noise', 'agy', 'claude', 'answer'); // wrong direction pair
+    expect(journal.awaiting().map((a) => a.messageId)).toEqual(['b1']);
+  });
+});

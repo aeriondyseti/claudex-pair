@@ -77,9 +77,9 @@ export async function runBrokerCli(
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') {
       const thread = str(flags, 'thread');
-      // Item 7 (`pair log -Thread <id>`): a chain is sparse in the archive,
-      // so -Thread widens the fetch before filtering to root + replies.
-      const messages = await gateway.log(num(flags, 'tail', thread ? 500 : 10));
+      // Item 7 round 2: -Thread fetches the FULL archive — any horizon can
+      // orphan a chain member and silently truncate the thread.
+      const messages = await gateway.log(thread ? Number.MAX_SAFE_INTEGER : num(flags, 'tail', 10));
       const selected = thread ? threadChain(messages, thread) : messages;
       if (!selected.length) out(thread ? `No archived messages in thread ${thread}.` : 'No archived messages yet.');
       for (const m of selected) out(`${'='.repeat(66)}\n${m.name}\n${'-'.repeat(66)}\n${m.raw}`);
@@ -163,9 +163,20 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
       if (s.session.agents.includes(as) && s.session.status !== 'completed') out(`Thread ${threadId} is NOT resolved by this — after handling the user input above, re-arm: pair wait -As ${as} -Thread ${threadId}`);
       return 0;
     }
-    if (threadId && header.replyTo !== threadId) {
-      out(`(waiting on thread ${threadId} — the above was a different delivery; still listening)`);
-      continue;
+    if (threadId) {
+      if (header.replyTo !== threadId) {
+        out(`(waiting on thread ${threadId} — the above was a different delivery; still listening)`);
+        continue;
+      }
+      // Round 2 (codex): a replyTo naming the thread is only a CANDIDATE —
+      // the journal's awaiting-set is the authority on resolution. A tagged
+      // wrong-type/wrong-endpoint message keeps this wait armed.
+      const s = await gateway.status();
+      if ((s.awaiting ?? []).some((a) => a.messageId === threadId)) {
+        out(`(a reply candidate named thread ${threadId} but did not resolve the ask — wrong type or endpoints; still listening)`);
+        continue;
+      }
+      renderTurn(s, as); return 0;
     }
     renderTurn((await gateway.status()), as); return 0;
   }
@@ -185,15 +196,19 @@ function renderTurn(s: StatusDto, as: AgentId) {
   else out(`FYI only — the turn stays with ${s.session.turn}. Note the content and continue; if you are idle, re-arm: pair wait -As ${as}`);
 }
 /** Item 7 (`pair log -Thread`): the root plus every message whose replyTo
- * chains back into the thread. Archive order is id-chronological, so a
- * reply's parent is always classified before the reply itself. */
+ * chains back into the thread. Computed to a fixpoint so the closure never
+ * depends on parent-before-child ordering (round 2: archives are id-sorted
+ * today, but correctness must not lean on that). */
 function threadChain<T extends { readonly header: { readonly id: string; readonly replyTo?: string } }>(messages: readonly T[], root: string): T[] {
   const inThread = new Set([root]);
-  const selected: T[] = [];
-  for (const m of messages) {
-    if (m.header.id === root || (m.header.replyTo !== undefined && inThread.has(m.header.replyTo))) { inThread.add(m.header.id); selected.push(m); }
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const m of messages) {
+      if (inThread.has(m.header.id)) continue;
+      if (m.header.replyTo !== undefined && inThread.has(m.header.replyTo)) { inThread.add(m.header.id); grew = true; }
+    }
   }
-  return selected;
+  return messages.filter((m) => inThread.has(m.header.id));
 }
 function required(flags: Flags, name: string, message: string): string { const value = str(flags, name); if (!value) throw new Error(message); return value; }
 async function bodyFrom(flags: Flags): Promise<string> { const file = str(flags, 'file'); if (file) return Bun.file(file).text(); const message = str(flags, 'message'); if (message) return message; throw new Error("Provide the message body via -Message '...' or -File <path>"); }

@@ -41,6 +41,8 @@ export type ProtocolErrorCode =
   | 'user-channel-already-registered'
   | 'user-auth-failed'
   | 'invalid-recipient'
+  | 'invalid-message-type'
+  | 'invalid-reply-to'
   | 'session-paused'
   | 'session-already-paused'
   | 'session-not-paused';

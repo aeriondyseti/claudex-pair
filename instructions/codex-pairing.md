@@ -51,6 +51,18 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File D:\Development\claudex\bin\pair.ps
    wait command again (keep re-running on exit 2; this is the designed idle
    loop, not an error).
 
+## Threading (reply_to)
+
+- Answering an `ask`? Use `-Type answer|review` with `-ReplyTo <ask id>` —
+  that clears the who-owes-whom entry (`pair status` shows `Awaiting:`
+  lines). With more than one ask in flight, tagging is mandatory (an
+  untagged answer settles your OLDEST debt to that agent).
+- A fused ask waits on ITS OWN reply: unrelated FYIs print and ack without
+  ending it. If it exits for a user message or ⚡ action, act on that
+  first, then re-arm with the printed hint — it preserves `-Thread <id>`,
+  as do timeout hints; use them verbatim.
+- `pair log -Thread <id>` prints an ask's whole reply chain.
+
 ## Etiquette (deltas from normal work)
 
 - Messages are pointers: send `path:line` references and summaries, never

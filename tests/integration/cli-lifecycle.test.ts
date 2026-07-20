@@ -24,6 +24,8 @@ async function until(cond: () => boolean, ms = 3_000): Promise<void> {
 function makeFakeGateway(log: Log) {
   let pushDelivery: ((d: Delivery) => void) | undefined;
   let closeCount = 0;
+  let awaiting: { messageId: string; from: string; to: string; sentAt: string }[] = [];
+  const logCalls: (number | undefined)[] = [];
 
   const session = {
     task: 't', status: 'active', started: 's',
@@ -46,8 +48,8 @@ function makeFakeGateway(log: Log) {
   const gateway: CliGateway = {
     clientId: 'fake-client',
     execute: async () => { log.push('execute'); return outcome; },
-    status: async () => { log.push('status'); return status; },
-    log: async () => [],
+    status: async () => { log.push('status'); return { ...status, awaiting: [...awaiting] } as StatusDto; },
+    log: async (tail?: number) => { logCalls.push(tail); return []; },
     grants: async () => [],
     brokerStatus: async () => ({ running: true }),
     stop: async () => {},
@@ -82,6 +84,8 @@ function makeFakeGateway(log: Log) {
       pushDelivery({ deliverySeq: 1, deliveryId: id, message: { name: `${id}.md`, header: { id, from: 'codex', to: 'claude', type: 'answer', turn: 'pass', sent: 's', ...(replyTo ? { replyTo } : {}), ...(headerExtra ?? {}) }, body: 'b', raw: 'raw-body' } as Delivery['message'] });
     },
     closes: () => closeCount,
+    setAwaiting: (entries: { messageId: string; from: string; to: string; sentAt: string }[]) => { awaiting = entries; },
+    logCalls,
   };
 }
 
@@ -243,5 +247,94 @@ describe('item 7: pair log -Thread (codex blocker 6)', () => {
       expect(await runBrokerCli('log', flags, [], 'unused-root', () => gateway)).toBe(0);
     } finally { capture.restore(); }
     expect(capture.text()).toContain('No archived messages in thread nope.');
+  });
+});
+
+
+describe('item 7 round 2: authoritative thread resolution + golden workflow', () => {
+  const debt = (messageId: string) => ({ messageId, from: 'claude', to: 'codex', sentAt: 's' });
+
+  test('a tagged reply that does not resolve the ask keeps the thread wait armed', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes, setAwaiting } = makeFakeGateway(log);
+    setAwaiting([debt('ask-7')]);
+    const flags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'ask-7']]);
+    const capture = captureOut();
+    try {
+      const result = runBrokerCli('wait', flags, [], 'unused-root', () => gateway);
+      await until(() => log.includes('subscribe (closeCount=0)'));
+
+      deliver('w1:claude', 'ask-7'); // names the thread, but the journal says the debt still stands
+      await until(() => log.includes('ack w1:claude (closeCount=0)'));
+      await until(() => capture.text().includes('did not resolve the ask'));
+      expect(closes()).toBe(0); // still armed
+
+      setAwaiting([]); // journal confirms resolution
+      deliver('ok:claude', 'ask-7');
+      expect(await result).toBe(0);
+    } finally { capture.restore(); }
+  }, 10_000);
+
+  test('golden workflow: ask -> unrelated -> control wake -> re-arm -> non-resolving candidate -> resolution', async () => {
+    const log: Log = [];
+    const { gateway, deliver, closes, setAwaiting } = makeFakeGateway(log);
+    setAwaiting([debt('m1')]); // the ask m1 is open
+    const capture = captureOut();
+    try {
+      // 1. Fused ask — thread-scoped to its own id.
+      const sendFlags = new Map<string, string | true>([['from', 'claude'], ['to', 'codex'], ['type', 'ask'], ['message', 'x']]);
+      const fused = runBrokerCli('send', sendFlags, [], 'unused-root', () => gateway);
+      await until(() => log.includes('subscribe (closeCount=0)'));
+
+      // 2. Unrelated FYI: printed + acked, fused ask keeps waiting.
+      deliver('n1:claude');
+      await until(() => log.includes('ack n1:claude (closeCount=0)'));
+      expect(closes()).toBe(0);
+
+      // 3. Control wake: user message exits distinctly, thread unresolved.
+      deliver('u1:claude', undefined, { from: 'user', type: 'info', provenance: 'trusted_user_client' });
+      expect(await fused).toBe(0);
+      expect(capture.text()).toContain('Thread m1 is NOT resolved');
+      expect(capture.text()).toContain('-Thread m1');
+
+      // 4. Re-arm on the same thread.
+      const waitFlags = new Map<string, string | true>([['as', 'claude'], ['timeoutsec', '30'], ['thread', 'm1']]);
+      const rearmed = runBrokerCli('wait', waitFlags, [], 'unused-root', () => gateway);
+      await until(() => log.includes('subscribe (closeCount=1)'));
+
+      // 5. Candidate that the journal rejects (wrong type/endpoints).
+      deliver('w1:claude', 'm1');
+      await until(() => log.includes('ack w1:claude (closeCount=1)'));
+      expect(closes()).toBe(1); // rearmed wait is still open
+
+      // 6. The valid reply lands; the awaiting-set clears; the wait exits.
+      setAwaiting([]);
+      deliver('ans:claude', 'm1');
+      expect(await rearmed).toBe(0);
+    } finally { capture.restore(); }
+  }, 15_000);
+});
+
+describe('item 7 round 2: log -Thread full-archive fixpoint closure', () => {
+  test('requests the full archive and closes the chain independent of message order', async () => {
+    const log: Log = [];
+    const { gateway, logCalls } = makeFakeGateway(log);
+    const stored = (id: string, replyTo?: string) => ({ name: `${id}.md`, header: { id, from: 'claude', to: 'codex', type: 'info', turn: 'keep', sent: 's', ...(replyTo ? { replyTo } : {}) }, body: 'b', raw: `raw-${id}` });
+    // Child chain members appear BEFORE their parents: a one-pass classifier
+    // would drop r2 and r1 (codex round 2 #4).
+    const fixture = [stored('r2', 'r1'), stored('u1'), stored('r1', 'ask-1'), stored('ask-1'), stored('u2', 'u1')];
+    const threaded = { ...gateway, log: async (tail?: number) => { logCalls.push(tail); return fixture as unknown as Awaited<ReturnType<CliGateway['log']>>; } };
+    const capture = captureOut();
+    try {
+      const flags = new Map<string, string | true>([['thread', 'ask-1']]);
+      expect(await runBrokerCli('log', flags, [], 'unused-root', () => threaded)).toBe(0);
+    } finally { capture.restore(); }
+    expect(logCalls).toEqual([Number.MAX_SAFE_INTEGER]); // no hidden horizon
+    const text = capture.text();
+    expect(text).toContain('raw-ask-1');
+    expect(text).toContain('raw-r1');
+    expect(text).toContain('raw-r2');
+    expect(text).not.toContain('raw-u1');
+    expect(text).not.toContain('raw-u2');
   });
 });

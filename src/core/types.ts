@@ -8,6 +8,11 @@ export type Timestamp = string;
 
 export const AGENT_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,15}$/;
 
+/** Item 7 round 2: safe id syntax for reply_to (and ids generally) — no
+ * whitespace/newlines/header delimiters, bounded length. Fail-closed at
+ * decide; the CLI casts untrusted strings into these fields. */
+export const MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
 export type MessageType =
   | 'ask'
   | 'answer'
@@ -23,6 +28,13 @@ export type MessageType =
   | 'leave'
   | 'join'
   | 'kick';
+
+/** Runtime mirror of MessageType (keep in sync) — decide validates against
+ * this fail-closed because transport casts arbitrary strings to the union. */
+export const MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'ask', 'answer', 'review', 'handoff', 'info', 'done', 'grant', 'grant-done',
+  'grant-cancel', 'propose-end', 'turn-revoked', 'leave', 'join', 'kick',
+] satisfies MessageType[]);
 
 export type TurnMode = 'pass' | 'keep';
 
