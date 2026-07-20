@@ -549,8 +549,12 @@ export class BrokerCore {
       } else if (verb === 'kick') {
         if (!str(fields.agent)) return err(reqId, 'bad-command', 'user action kick requires an agent.');
         command = { kind: 'user-kick-agent', agent: str(fields.agent), reason: str(fields.reason), ...shared };
+      } else if (verb === 'pause') {
+        command = { kind: 'user-pause-session', reason: str(fields.reason), ...shared };
+      } else if (verb === 'resume') {
+        command = { kind: 'user-resume-session', ...shared };
       } else {
-        return err(reqId, 'bad-command', `Unknown user action verb '${String(verb)}' (4a verbs: end, cancel-grant, kick).`);
+        return err(reqId, 'bad-command', `Unknown user action verb '${String(verb)}' (verbs: end, cancel-grant, kick, pause, resume).`);
       }
       const envelope: CommandEnvelope = { command, meta: { id: base, at: this.#clock.now(), principal: USER_IDENTITY } };
       return this.#commitUserEnvelope(reqId, clientId, envelope);

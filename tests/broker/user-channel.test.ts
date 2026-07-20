@@ -382,9 +382,9 @@ describe('slice-4a userAction (design REV 6)', () => {
     const cancel = await core.userAction('act-cg', 'user-client', 'cg-conn', { verb: 'cancel-grant', grantId: 'g9' });
     expect(cancel.ok).toBeTrue();
     expect(core.journal.sessionState?.grants['g9']?.state).toBe('cancelled');
-    const unknown = await core.userAction('act-x', 'user-client', 'cg-conn', { verb: 'pause' });
+    const unknown = await core.userAction('act-x', 'user-client', 'cg-conn', { verb: 'frobnicate' });
     expect(unknown.ok).toBeFalse();
-    if (!unknown.ok) expect(unknown.error.code).toBe('bad-command'); // 4b verb, not in 4a
+    if (!unknown.ok) expect(unknown.error.code).toBe('bad-command'); // unknown verbs stay fail-closed
   });
 });
 

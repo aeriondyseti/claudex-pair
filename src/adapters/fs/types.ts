@@ -6,7 +6,7 @@ export type DiskSession = {
   driver: AgentId;
   navigators: AgentId[];
   turn: AgentId;
-  status: 'active' | 'completed';
+  status: 'active' | 'paused' | 'completed';
   started: Timestamp;
 };
 

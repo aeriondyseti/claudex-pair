@@ -33,7 +33,9 @@ export function decide(
         );
       }, GRANT_INACTIVE);
     case 'complete-grant':
-      return withActive(state, (s) => {
+      // Allowed while PAUSED for an ACTIVE grant (committed edits land their
+      // record); the ['active'] grant-state check below enforces the rest.
+      return withLive(state, (s) => {
         const bad = assertParticipant(s, meta.principal, '-As');
         if (bad) return err(bad);
         return withGrant(s, command.grantId, ['active'], meta.principal, (g) =>
@@ -48,22 +50,62 @@ export function decide(
     case 'revoke-turn':
       return withActive(state, (s) => decideRevokeTurn(s, command, envelope));
     case 'leave-session':
-      return withActive(state, (s) => decideLeave(s, envelope));
+      return withLive(state, (s) => decideLeave(s, envelope)); // an agent may bail while paused
     case 'join-session':
       return withActive(state, (s) => decideJoin(s, command, envelope));
     case 'kick-agent':
       return withActive(state, (s) => decideKick(s, command, envelope));
     case 'user-message':
-      return withActive(state, (s) => decideUserMessage(s, command, envelope));
+      return withLive(state, (s) => decideUserMessage(s, command, envelope)); // pause never brakes the human
     case 'register-user-channel':
-      return withActive(state, (s) => decideRegisterUserChannel(s, command, envelope));
+      return withLive(state, (s) => decideRegisterUserChannel(s, command, envelope));
     case 'user-end-session':
-      return withActive(state, (s) => decideUserEnd(s, command, envelope));
+      return withLive(state, (s) => decideUserEnd(s, command, envelope)); // end-while-paused is valid (F-A6)
     case 'user-cancel-grant':
-      return withActive(state, (s) => decideUserCancelGrant(s, command, envelope), GRANT_INACTIVE);
+      return withLive(state, (s) => decideUserCancelGrant(s, command, envelope), GRANT_INACTIVE);
     case 'user-kick-agent':
-      return withActive(state, (s) => decideUserKick(s, command, envelope));
+      return withLive(state, (s) => decideUserKick(s, command, envelope));
+    case 'user-pause-session':
+      return withLive(state, (s) => decideUserPause(s, command, envelope));
+    case 'user-resume-session':
+      return withLive(state, (s) => decideUserResume(s, command, envelope));
   }
+}
+
+/** U1 slice 4b: the brake. Repeated transitions are STABLE errors (F-A9). */
+function decideUserPause(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-pause-session' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-pause-session');
+  if (bad) return err(bad);
+  if (s.status === 'paused') {
+    return err(new ProtocolError('session-already-paused', 'The session is already paused.'));
+  }
+  const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
+  const events: Event[] = [{ kind: 'session-paused', reason: command.reason, at: envelope.meta.at }];
+  s.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'pause', 'info', `SESSION PAUSED by the user.${reasonSuffix} Stand by — do not send, do not end; your commands will succeed after the user resumes.`, envelope.meta.at));
+  });
+  return ok(events);
+}
+
+function decideUserResume(
+  s: SessionState,
+  command: Extract<Command, { kind: 'user-resume-session' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const bad = requireUserPrincipal(envelope, 'user-resume-session');
+  if (bad) return err(bad);
+  if (s.status !== 'paused') {
+    return err(new ProtocolError('session-not-paused', 'The session is not paused; there is nothing to resume.'));
+  }
+  const events: Event[] = [{ kind: 'session-resumed', at: envelope.meta.at }];
+  s.agents.forEach((agent, i) => {
+    events.push(userActionNotice(command, agent, i, 'resume', 'info', 'SESSION RESUMED by the user — normal protocol applies again.', envelope.meta.at));
+  });
+  return ok(events);
 }
 
 /**
@@ -424,7 +466,26 @@ function withActive(
   fn: (s: SessionState) => Result<Event[], ProtocolError>,
   message: (status: string) => string = SEND_INACTIVE,
 ): Result<Event[], ProtocolError> {
+  // The brake (U1 slice 4b): paused is LIVE, not terminal — agent mutations
+  // get a stable, distinct code so CLIs can say "stand by", never "ended".
+  if (state?.status === 'paused') {
+    return err(new ProtocolError('session-paused', 'The user paused the session — stand by for resume. Do not re-send; your command will succeed after /resume.'));
+  }
   if (!state || state.status !== 'active') {
+    const status = state ? state.status : 'missing';
+    return err(new ProtocolError('session-not-active', message(status)));
+  }
+  return fn(state);
+}
+
+/** LIVE gate (active OR paused): the allowlisted agent verbs, all user
+ * verbs, and user messages — pause is a brake on agents, never the human. */
+function withLive(
+  state: SessionState | undefined,
+  fn: (s: SessionState) => Result<Event[], ProtocolError>,
+  message: (status: string) => string = SEND_INACTIVE,
+): Result<Event[], ProtocolError> {
+  if (!state || (state.status !== 'active' && state.status !== 'paused')) {
     const status = state ? state.status : 'missing';
     return err(new ProtocolError('session-not-active', message(status)));
   }
@@ -450,11 +511,12 @@ function decideInit(
   principal: string,
   at: string,
 ): Result<Event[], ProtocolError> {
-  if (state && state.status === 'active') {
+  if (state && state.status !== 'completed') {
+    // Paused is LIVE: re-init over it would destroy a braked session.
     return err(
       new ProtocolError(
         'session-exists',
-        `An active session already exists here (task: ${state.task}). Finish it with 'pair end' or delete .pair first.`,
+        `A ${state.status} session already exists here (task: ${state.task}). Finish it with 'pair end' (or /resume it) first.`,
       ),
     );
   }

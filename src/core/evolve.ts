@@ -24,6 +24,13 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
       return state && { ...state, driver: event.driver };
     case 'session-ended':
       return state && { ...state, status: 'completed' };
+    case 'session-paused':
+      return state && { ...state, status: 'paused' };
+    case 'session-resumed':
+      // Resume changes ONLY the status: mutations legitimately committed
+      // while paused (a turn-moving leave, a grant completion) are
+      // preserved, never rolled back (design REV 6, tail A).
+      return state && { ...state, status: 'active' };
     case 'grant-issued':
       return (
         state && {

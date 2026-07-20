@@ -40,7 +40,10 @@ export type ProtocolErrorCode =
   | 'user-channel-unregistered'
   | 'user-channel-already-registered'
   | 'user-auth-failed'
-  | 'invalid-recipient';
+  | 'invalid-recipient'
+  | 'session-paused'
+  | 'session-already-paused'
+  | 'session-not-paused';
 
 export class ProtocolError extends Error {
   constructor(

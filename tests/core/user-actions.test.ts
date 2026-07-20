@@ -140,3 +140,73 @@ describe('user-kick-agent', () => {
     if (!stranger.ok) expect(stranger.error.code).toBe('not-a-participant');
   });
 });
+
+describe('slice 4b: the paused-status matrix (F-A5/A6/A9)', () => {
+  const paused = (): SessionState => {
+    const s = withGrant(session(['claude', 'codex'], 'claude'));
+    const r = decide(s, env({ kind: 'user-pause-session', reason: 'lunch', ...base }, 'user', 'mp'));
+    if (!r.ok) throw r.error;
+    return r.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+  };
+
+  test('pause: status flips, actionKind pause notices to every agent; agent mutations reject stable session-paused', () => {
+    const s = paused();
+    expect(s.status).toBe('paused');
+    for (const command of [
+      { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' },
+      { kind: 'issue-grant', grantId: 'g2', to: 'codex', task: 'w', scope: { mode: 'worktree', worktree: 'wt' }, agreedIn: '' },
+      { kind: 'accept-grant', grantId: 'g1' },
+      { kind: 'end-session', summary: 'x' },
+      { kind: 'kick-agent', agent: 'codex', reason: '' },
+      { kind: 'revoke-turn', reason: '' },
+      { kind: 'join-session', agent: 'agy' },
+    ]) {
+      const r = decide(s, env(command, 'claude', `c-${command.kind}`));
+      expect(r.ok).toBeFalse();
+      if (!r.ok) expect(r.error.code).toBe('session-paused');
+    }
+  });
+
+  test('leave-with-grant rejects for the GRANT reason while paused (never session-paused); grant completion commits; then leave commits', () => {
+    let s = paused();
+    const blocked = decide(s, env({ kind: 'leave-session' }, 'codex', 'lv1'));
+    expect(blocked.ok).toBeFalse();
+    if (!blocked.ok) expect(blocked.error.code).toBe('leave-with-grant');
+    const done = decide(s, env({ kind: 'complete-grant', grantId: 'g1', result: 'landed' }, 'codex', 'gd'));
+    expect(done.ok).toBeTrue();
+    if (!done.ok) return;
+    s = done.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    expect(s.status).toBe('paused'); // completion never resumes
+    const leave = decide(s, env({ kind: 'leave-session' }, 'codex', 'lv2'));
+    expect(leave.ok).toBeTrue();
+  });
+
+  test('user verbs stay valid while paused: message, cancel-grant, kick, and END (F-A6)', () => {
+    const s = paused();
+    const msg = decide(s, env({ kind: 'user-message', groupId: 'g', recipients: [{ to: 'claude', messageId: 'um1' }], body: 'still here' }, 'user', 'um'));
+    expect(msg.ok).toBeTrue();
+    const end = decide(s, env({ kind: 'user-end-session', summary: '', ...base }, 'user', 'ue'));
+    expect(end.ok).toBeTrue(); // the user outranks the brake
+  });
+
+  test('F-A9: pause-while-paused and resume-while-active are STABLE distinct errors; resume restores active', () => {
+    const s = paused();
+    const again = decide(s, env({ kind: 'user-pause-session', reason: '', ...base }, 'user', 'p2'));
+    expect(again.ok).toBeFalse();
+    if (!again.ok) expect(again.error.code).toBe('session-already-paused');
+    const resume = decide(s, env({ kind: 'user-resume-session', ...base }, 'user', 'r1'));
+    expect(resume.ok).toBeTrue();
+    if (!resume.ok) return;
+    const active = resume.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    expect(active.status).toBe('active');
+    const notPaused = decide(active, env({ kind: 'user-resume-session', ...base }, 'user', 'r2'));
+    expect(notPaused.ok).toBeFalse();
+    if (!notPaused.ok) expect(notPaused.error.code).toBe('session-not-paused');
+  });
+
+  test('init rejects over a PAUSED session exactly as over active (paused is live)', () => {
+    const r = decide(paused(), env({ kind: 'init-session', task: 't2', agents: ['claude', 'codex'], driver: 'claude' }, 'claude', 'i2'));
+    expect(r.ok).toBeFalse();
+    if (!r.ok) expect(r.error.code).toBe('session-exists');
+  });
+});

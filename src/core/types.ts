@@ -46,7 +46,11 @@ export type Grant = {
   readonly updated: Timestamp;
 };
 
-export type SessionStatus = 'active' | 'completed';
+/** Statuses partition into LIVE (active, paused) and TERMINAL (completed).
+ * Surfaces must branch on the partition, never on !== 'active' (U1 slice 4b,
+ * design REV 6 R2). */
+export type SessionStatus = 'active' | 'paused' | 'completed';
+export const LIVE_STATUSES: readonly SessionStatus[] = ['active', 'paused'];
 
 export type SessionState = {
   readonly task: string;

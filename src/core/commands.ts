@@ -41,7 +41,11 @@ export type Command =
   // per-verb recipients itself and derives notice ids `${base}-r${i}`.
   | { kind: 'user-end-session'; summary: string; groupId: string; noticeIdBase: string }
   | { kind: 'user-cancel-grant'; grantId: GrantId; reason: string; groupId: string; noticeIdBase: string }
-  | { kind: 'user-kick-agent'; agent: AgentId; reason: string; groupId: string; noticeIdBase: string };
+  | { kind: 'user-kick-agent'; agent: AgentId; reason: string; groupId: string; noticeIdBase: string }
+  // U1 slice 4b: the brake. Pause freezes agent mutations (allowlist:
+  // leave, active-grant completion); resume restores ONLY the status.
+  | { kind: 'user-pause-session'; reason: string; groupId: string; noticeIdBase: string }
+  | { kind: 'user-resume-session'; groupId: string; noticeIdBase: string };
 
 export type GrantScopeInput =
   | { mode: 'worktree'; worktree: string }

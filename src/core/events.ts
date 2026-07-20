@@ -30,6 +30,8 @@ export type Event =
   | { kind: 'turn-passed'; to: AgentId }
   | { kind: 'driver-changed'; driver: AgentId }
   | { kind: 'session-ended'; by: AgentId; summary: string; at: Timestamp }
+  | { kind: 'session-paused'; reason: string; at: Timestamp }
+  | { kind: 'session-resumed'; at: Timestamp }
   | { kind: 'grant-issued'; grantId: GrantId; issuer: AgentId; assignee: AgentId; task: string; scope: GrantScope; agreedIn: MessageId | ''; at: Timestamp }
   | { kind: 'grant-accepted'; grantId: GrantId; at: Timestamp }
   | { kind: 'grant-completed'; grantId: GrantId; result: string; at: Timestamp }
