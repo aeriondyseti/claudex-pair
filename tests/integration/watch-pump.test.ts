@@ -64,3 +64,50 @@ describe('watch event queue', () => {
     expect((await closed).done).toBeTrue();
   });
 });
+
+describe('push → reducer pending reconciliation (close-out #1)', () => {
+  test('a committed user activity decoded from the wire clears the composer pending with the matching reqId', async () => {
+    const { reduceWatch } = await import('@adapters/tui/reducer.ts');
+    const { initialWatchState } = await import('@adapters/tui/events.ts');
+    const session = { task: 't', agents: ['claude', 'codex'], driver: 'claude', turn: 'claude', status: 'active', started: 's', grants: {} } as const;
+    const snapshot = {
+      seq: 4, session, transcript: [],
+      liveness: { broker: { pid: 1, epoch: 1, heartbeatAt: 'h' }, agents: {} },
+      broker: { pid: 1, epoch: 1, endpoint: 'e', heartbeatAt: 'h' },
+    };
+
+    // Attach, gain a registered composer, and put a submit in flight.
+    let state = initialWatchState({ width: 100, tail: 10, now: 'now' });
+    ({ state } = reduceWatch(state, { kind: 'attach', snapshot, endpoint: 'e', now: 'now' }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    ({ state } = reduceWatch(state, { kind: 'text', text: 'ship it' }));
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'req-9' }));
+    expect(state.composer?.pending).toMatchObject({ reqId: 'req-9', state: 'sending' });
+    // A successful wire result alone must NOT clear pending (commit is truth).
+    ({ state } = reduceWatch(state, { kind: 'submit-result', reqId: 'req-9', ok: true }));
+    expect(state.composer?.pending).toMatchObject({ reqId: 'req-9' });
+
+    // The committed activity arrives on the WIRE and flows through decodePush
+    // — the real pump path — carrying groupId === reqId.
+    const wirePush = {
+      kind: 'activity', seq: 5, at: 'later', principal: 'user-client',
+      session,
+      events: [{
+        kind: 'message-sent', id: 'u1', from: 'user', to: 'claude', type: 'info', turn: 'keep',
+        body: 'ship it', at: 'later', groupId: 'req-9', provenance: 'trusted_user_client',
+      }],
+      ackedDeliveryIds: [], voidedDeliveryIds: [],
+    } as unknown as ObserverPush;
+    const decoded = decodePush(wirePush);
+    expect(decoded.kind).toBe('activity');
+    const step = reduceWatch(state, decoded);
+    expect(step.state.composer?.pending).toBeUndefined(); // reconciled by commit, not by wire ack
+    expect(step.effects).toContain('render');
+
+    // Determinism guard: an activity with a DIFFERENT groupId must not clear.
+    let other = state;
+    const otherPush = { ...(wirePush as unknown as Record<string, unknown>), events: [{ kind: 'message-sent', id: 'u2', from: 'user', to: 'claude', type: 'info', turn: 'keep', body: 'x', at: 'later', groupId: 'req-OTHER', provenance: 'trusted_user_client' }] } as unknown as ObserverPush;
+    ({ state: other } = reduceWatch(other, decodePush(otherPush)));
+    expect(other.composer?.pending).toMatchObject({ reqId: 'req-9' }); // still awaiting its own commit
+  });
+});
