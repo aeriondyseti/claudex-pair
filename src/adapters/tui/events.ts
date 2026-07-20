@@ -67,7 +67,21 @@ export type WatchEffect =
   | 'render'
   | 'exit'
   | 'reattach'
-  | { readonly kind: 'submit'; readonly reqId: string; readonly target: AgentId | '*'; readonly body: string };
+  | { readonly kind: 'submit'; readonly reqId: string; readonly target: AgentId | '*'; readonly body: string }
+  /** U1 slice 4 (SEAM ADDITION, flagged for lane ratification): a CONFIRMED
+   * privileged action. Emitted only by the second Enter on a confirming
+   * draft; reqId minted then (freeze-then-mint), reused verbatim on retry. */
+  | { readonly kind: 'action'; readonly reqId: string; readonly action: UserActionDraft; readonly display: string };
+
+/** Frozen normalized action (first Enter pins it; buffer edits after the
+ * freeze cannot mutate what executes — design REV 6). 4b verbs parse but
+ * the broker rejects them bad-command until 4b lands. */
+export type UserActionDraft =
+  | { readonly verb: 'end'; readonly summary: string }
+  | { readonly verb: 'cancel-grant'; readonly grantId: string; readonly reason: string }
+  | { readonly verb: 'kick'; readonly agent: string; readonly reason: string }
+  | { readonly verb: 'pause'; readonly reason: string }
+  | { readonly verb: 'resume' };
 
 /**
  * Reducer-owned state (amendment 1). `model` is the renderable view;
@@ -108,8 +122,14 @@ export type ComposerState = {
   readonly scrollOffset: number;
   readonly filter: 'all' | 'dialogue' | 'user' | 'protocol';
   /** In-flight submit (no optimistic transcript insertion): cleared when
-   * the committed activity with groupId === reqId arrives. */
-  readonly pending?: { readonly reqId: string; readonly target: AgentId | '*'; readonly body: string; readonly state: 'sending' | 'error'; readonly error?: string };
+   * the committed activity with groupId === reqId arrives. `action: true`
+   * marks a privileged action pending (slice 4) — same clear machinery,
+   * distinct rendering. Actions and sends share this single slot. */
+  readonly pending?: { readonly reqId: string; readonly target: AgentId | '*'; readonly body: string; readonly state: 'sending' | 'error'; readonly error?: string; readonly action?: true };
+  /** Slice 4: the frozen action awaiting its second Enter (CONFIRM state). */
+  readonly confirming?: UserActionDraft & { readonly display: string };
+  /** Slice 4: transient unknown-/malformed-action hint (cleared on edit). */
+  readonly actionHint?: string;
 };
 
 export type WatchStep = { readonly state: WatchTuiState; readonly effects: readonly WatchEffect[] };

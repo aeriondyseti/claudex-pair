@@ -74,6 +74,8 @@ type EffectHost = {
   reattach?: () => Promise<void>;
   /** U1: perform the wire send for a submit effect (broker mode only). */
   submit?: (effect: Extract<WatchEffect, { kind: 'submit' }>) => void;
+  /** U1 slice 4: perform the wire call for a CONFIRMED privileged action. */
+  action?: (effect: Extract<WatchEffect, { kind: 'action' }>) => void;
 };
 
 async function consumeEvents(queue: WatchEventQueue, reduce: WatchReducer, initial: WatchTuiState, host: EffectHost): Promise<number> {
@@ -85,7 +87,8 @@ async function consumeEvents(queue: WatchEventQueue, reduce: WatchReducer, initi
       if (effect === 'render') host.render(state);
       else if (effect === 'exit') return 0;
       else if (effect === 'reattach') { if (host.reattach) await host.reattach(); }
-      else host.submit?.(effect);
+      else if (effect.kind === 'submit') host.submit?.(effect);
+      else host.action?.(effect);
     }
   }
   return 0;
@@ -223,33 +226,40 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
      * once — reqId reuse keeps it dedup-safe if the first attempt actually
      * committed (codex re-read blocker 20260720-105928-798).
      */
-    const submitViaSession = async (effect: Extract<WatchEffect, { kind: 'submit' }>): Promise<void> => {
+    const opViaSession = async (op: (s: UserObserverSession) => Promise<void>): Promise<void> => {
       const current = session;
       if (!current || !('send' in current)) throw new Error('user channel not attached');
-      await current.send(effect.reqId, effect.target, effect.body);
+      await op(current);
     };
-    const submitWithRecovery = async (effect: Extract<WatchEffect, { kind: 'submit' }>): Promise<void> => {
+    /**
+     * Shared recovery for sends AND privileged actions (both are active
+     * user work — the one spawn-allowed observer path, design §5): on a
+     * dead/unattached session, await any in-flight background attach, ride
+     * a FRESH session if one won, else authenticated reattach with spawn
+     * allowed, then retry the immutable op exactly once (reqId dedup-safe).
+     */
+    const withUserRecovery = async (reqId: string, op: (s: UserObserverSession) => Promise<void>): Promise<void> => {
       try {
-        await submitViaSession(effect);
-        queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+        await opViaSession(op);
+        queue.push({ kind: 'submit-result', reqId, ok: true });
         return;
       } catch (first) {
         if (!options.userToken || !gateway.userAttach || closed || recovering) {
-          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: message(first) });
+          queue.push({ kind: 'submit-result', reqId, ok: false, error: message(first) });
           return;
         }
-        const failedSession = session; // the session the submit just failed on
+        const failedSession = session; // the session the op just failed on
         recovering = true; // background loop yields; its catch won't close our client
         try {
           // Never race the in-flight background attach on the SHARED gateway
           // (`getClient` ??=-assigns one client): await its settlement — the
           // loop exits promptly once `recovering` is up (codex combined
           // audit). If it adopted a FRESH session meanwhile, ride it; the
-          // one the submit failed on is never retried in place.
+          // one the op failed on is never retried in place.
           await attachTask?.catch(() => undefined);
           if (session && session !== failedSession) {
-            await submitViaSession(effect);
-            queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+            await opViaSession(op);
+            queue.push({ kind: 'submit-result', reqId, ok: true });
             return;
           }
           pumpGeneration++; // silence the dying session's pump
@@ -259,10 +269,10 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
           const next = await gateway.userAttach(options.userToken, true); // spawn: active user work
           if (closed) { await next.close(); return; }
           adoptSession(next, false);
-          await submitViaSession(effect); // the single retry, payload immutable
-          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: true });
+          await opViaSession(op); // the single retry, payload immutable
+          queue.push({ kind: 'submit-result', reqId, ok: true });
         } catch (second) {
-          queue.push({ kind: 'submit-result', reqId: effect.reqId, ok: false, error: message(second) });
+          queue.push({ kind: 'submit-result', reqId, ok: false, error: message(second) });
         } finally {
           recovering = false;
           if (!session && !closed) startAttach(); // recovery failed — resume the background loop
@@ -271,7 +281,8 @@ export async function runBrokerEventLoop(root: string, options: WatchLoopOptions
     };
     return await consumeEvents(queue, reduce, state, {
       render: frameSink(write),
-      submit: (effect) => void submitWithRecovery(effect),
+      submit: (effect) => void withUserRecovery(effect.reqId, (s) => s.send(effect.reqId, effect.target, effect.body)),
+      action: (effect) => void withUserRecovery(effect.reqId, (s) => s.action(effect.reqId, effect.action)),
       reattach: async () => {
         if (recovering) return; // recovery owns attachment; it re-arms on failure
         // Invalidate BEFORE the intentional close: the dying pump's error

@@ -1,7 +1,7 @@
 import type { LivenessDto, ObserverSnapshotDto } from '@app/ports/gateway.ts';
 import { navigators, openGrants } from '@core/queries.ts';
 import type { SessionState } from '@core/types.ts';
-import type { ComposerState, WatchActivity, WatchEffect, WatchEvent, WatchStep, WatchTuiState } from './events.ts';
+import type { ComposerState, UserActionDraft, WatchActivity, WatchEffect, WatchEvent, WatchStep, WatchTuiState } from './events.ts';
 import { visibleTranscriptCount } from './watch.ts';
 import type { AgentPresence, TranscriptEntry, WatchViewModel } from './viewmodel.ts';
 
@@ -116,7 +116,35 @@ function activity(state: WatchTuiState, value: WatchActivity): WatchStep {
 function text(state: WatchTuiState, value: string): WatchStep {
   const composer = state.composer;
   if (composer?.channel !== 'registered' || value.length === 0) return step(state);
-  return rendered(state, { ...composer, buffer: composer.buffer + value });
+  // Editing clears the transient action hint; a frozen CONFIRM survives
+  // typing (the immutable draft executes regardless of buffer edits —
+  // freeze-then-mint, design REV 6) until Esc or the second Enter.
+  const { actionHint: _hint, ...rest } = composer;
+  return rendered(state, { ...rest, buffer: composer.buffer + value });
+}
+
+/** Slice 4: parse a leading-/ line into a frozen normalized action.
+ * Returns undefined for advisory text (including the //-escape). */
+function parseActionDraft(buffer: string): { draft?: UserActionDraft & { display: string }; hint?: string } {
+  const line = buffer.trim();
+  if (!line.startsWith('/') || line.startsWith('//')) return {};
+  const [head = '', ...restParts] = line.slice(1).split(/\s+/);
+  const rest = restParts.join(' ');
+  const verb = head.toLowerCase();
+  if (verb === 'end') return { draft: { verb: 'end', summary: rest, display: `/end ${rest || '(default summary)'}`.trim() } };
+  if (verb === 'resume') return { draft: { verb: 'resume', display: '/resume' } };
+  if (verb === 'pause') return { draft: { verb: 'pause', reason: rest, display: `/pause ${rest}`.trim() } };
+  if (verb === 'cancel-grant') {
+    const [grantId = '', ...reasonParts] = restParts;
+    if (!grantId) return { hint: 'usage: /cancel-grant <grantId> [reason]' };
+    return { draft: { verb: 'cancel-grant', grantId, reason: reasonParts.join(' '), display: `/cancel-grant ${grantId}` } };
+  }
+  if (verb === 'kick') {
+    const [agent = '', ...reasonParts] = restParts;
+    if (!agent) return { hint: 'usage: /kick <agent> [reason]' };
+    return { draft: { verb: 'kick', agent, reason: reasonParts.join(' '), display: `/kick ${agent}` } };
+  }
+  return { hint: `unknown action '/${verb}' — actions: /end /cancel-grant /kick /pause /resume; send a literal /${verb} with //${verb}` };
 }
 
 function key(state: WatchTuiState, event: Extract<WatchEvent, { kind: 'key' }>): WatchStep {
@@ -140,9 +168,16 @@ function key(state: WatchTuiState, event: Extract<WatchEvent, { kind: 'key' }>):
     return composer.scrollOffset === 0 ? step(state) : rendered(state, { ...composer, scrollOffset: 0 });
   }
   if (event.key === 'escape') {
-    if (!composer.buffer && composer.pending?.state !== 'error') return step(state);
+    // Slice 4: Esc on a frozen CONFIRM aborts back to the editable draft
+    // (buffer preserved); with a failed action it also discards the pending.
+    if (composer.confirming && composer.pending?.state !== 'sending') {
+      const { confirming: _c, ...rest } = composer.pending?.state === 'error' ? clearPending(composer) : composer;
+      return rendered(state, rest);
+    }
+    if (!composer.buffer && composer.pending?.state !== 'error' && !composer.actionHint) return step(state);
     const cleared = composer.pending?.state === 'error' ? clearPending(composer) : composer;
-    return rendered(state, { ...cleared, buffer: '' });
+    const { actionHint: _h, ...rest } = cleared;
+    return rendered(state, { ...rest, buffer: '' });
   }
   if (composer.channel !== 'registered') return step(state);
   if (event.key === 'backspace') {
@@ -163,13 +198,41 @@ function submit(state: WatchTuiState, composer: ComposerState, candidateReqId: s
     // The host allocates a candidate for every Enter, but a visible retry
     // MUST retain the immutable identity and payload of the failed attempt.
     const pending = sendingPending(composer.pending);
+    if (pending.action) {
+      // A failed ACTION retry re-emits the action effect with the SAME reqId.
+      const frozen = state.composer?.confirming;
+      if (!frozen) return step(state); // aborted meanwhile — nothing to retry
+      const { display: _d, ...draft } = frozen;
+      return step({ ...state, composer: { ...composer, pending } }, ['render', { kind: 'action', reqId: pending.reqId, action: draft as UserActionDraft, display: frozen.display }]);
+    }
     return withSubmitEffect(state, { ...composer, pending }, pending);
   }
+  // Slice 4 freeze-then-mint: SECOND Enter on a frozen CONFIRM executes —
+  // reqId minted NOW (this event's candidate), reused verbatim on retries.
+  if (composer.confirming) {
+    const frozen = composer.confirming;
+    const { display: _display, ...draft } = frozen;
+    const pending = { reqId: candidateReqId, target: '*' as const, body: frozen.display, state: 'sending' as const, action: true as const };
+    return step(
+      { ...state, composer: { ...composer, pending } },
+      ['render', { kind: 'action', reqId: candidateReqId, action: draft as UserActionDraft, display: frozen.display }],
+    );
+  }
   if (!composer.buffer.trim()) return step(state);
+  // Slice 4: FIRST Enter on a /-draft freezes the immutable normalized
+  // action and enters CONFIRM — no effect, no reqId (design REV 6).
+  const parsed = parseActionDraft(composer.buffer);
+  if (parsed.hint) return rendered(state, { ...composer, actionHint: parsed.hint });
+  if (parsed.draft) {
+    const { actionHint: _hint, ...rest } = composer;
+    return rendered(state, { ...rest, confirming: parsed.draft });
+  }
+  // The //-escape sends the literal /-prefixed advisory body (ruling Q3).
+  const body = composer.buffer.trim().startsWith('//') ? composer.buffer.replace('//', '/') : composer.buffer;
   const pending = {
     reqId: candidateReqId,
     target: composer.target,
-    body: composer.buffer,
+    body,
     state: 'sending' as const,
   };
   return withSubmitEffect(state, { ...composer, buffer: '', pending }, pending);
@@ -298,6 +361,8 @@ function messageGroupId(entry: TranscriptEntry): string | undefined {
 }
 
 function clearPending(composer: ComposerState): ComposerState {
+  // Also drops confirming/actionHint: a committed or discarded action's
+  // frozen draft must not linger into the next interaction (slice 4).
   const { channel, channelDetail, buffer, target, scrollOffset, filter } = composer;
   return {
     channel,

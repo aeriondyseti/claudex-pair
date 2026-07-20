@@ -347,3 +347,69 @@ describe('watch frame equality gate', () => {
     expect(diffWatchFrame(resized, first.current).frame).toBeDefined();
   });
 });
+
+describe('slice-4 action confirmation: freeze-then-mint (F-A7)', () => {
+  const registered = () => {
+    let state = attached(snapshot({ transcript: [] }));
+    ({ state } = reduceWatch(state, { kind: 'user-channel', state: 'registered' }));
+    return state;
+  };
+  const type = (s: ReturnType<typeof registered>, text: string) => reduceWatch(s, { kind: 'text', text }).state;
+
+  test('first Enter freezes the immutable action with NO effect and NO reqId; second Enter mints the reqId and emits the action effect', () => {
+    let state = type(registered(), '/kick codex wedged');
+    const first = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-first' });
+    expect(first.effects).toEqual(['render']); // no action effect yet
+    expect(first.state.composer?.confirming).toMatchObject({ verb: 'kick', agent: 'codex', reason: 'wedged' });
+    expect(first.state.composer?.pending).toBeUndefined();
+
+    // Buffer edits after the freeze cannot mutate what executes.
+    state = type(first.state, ' EDITED');
+    const second = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-second' });
+    const action = second.effects.find((e) => typeof e !== 'string' && e.kind === 'action');
+    expect(action).toMatchObject({ kind: 'action', reqId: 'r-second', action: { verb: 'kick', agent: 'codex', reason: 'wedged' } });
+    expect(second.state.composer?.pending).toMatchObject({ reqId: 'r-second', state: 'sending', action: true });
+  });
+
+  test('Esc on a frozen CONFIRM aborts back to the editable draft; the buffer survives', () => {
+    const state = type(registered(), '/end all done');
+    const frozen = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r1' }).state;
+    expect(frozen.composer?.confirming).toMatchObject({ verb: 'end', summary: 'all done' });
+    const aborted = reduceWatch(frozen, { kind: 'key', key: 'escape' });
+    expect(aborted.state.composer?.confirming).toBeUndefined();
+    expect(aborted.state.composer?.buffer).toBe('/end all done'); // still editable
+  });
+
+  test('// escapes to an exact literal-slash advisory send (ruling Q3); unknown verbs hint without freezing', () => {
+    const escaped = reduceWatch(type(registered(), '//end is a nice word'), { kind: 'key', key: 'submit', reqId: 'r2' });
+    const submit = escaped.effects.find((e) => typeof e !== 'string' && e.kind === 'submit');
+    expect(submit).toMatchObject({ kind: 'submit', body: '/end is a nice word' }); // exact, no leading space
+    expect(escaped.state.composer?.confirming).toBeUndefined();
+
+    const unknown = reduceWatch(type(registered(), '/frobnicate now'), { kind: 'key', key: 'submit', reqId: 'r3' });
+    expect(unknown.effects).toEqual(['render']);
+    expect(unknown.state.composer?.confirming).toBeUndefined();
+    expect(unknown.state.composer?.actionHint).toContain('//frobnicate');
+  });
+
+  test('the pending slot serializes actions against sends, and a committed action notice clears the action pending by groupId', () => {
+    let state = type(registered(), '/end ship it');
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'rf' }));
+    ({ state } = reduceWatch(state, { kind: 'key', key: 'submit', reqId: 'r-mint' }));
+    expect(state.composer?.pending).toMatchObject({ reqId: 'r-mint', action: true });
+    // While the action is in flight, a new submit is a no-op.
+    const blocked = reduceWatch(type(state, 'hello'), { kind: 'key', key: 'submit', reqId: 'r-other' });
+    expect(blocked.effects).toEqual([]);
+    // The committed ACTION NOTICE (groupId === reqId) clears the pending.
+    ({ state } = reduceWatch(state, {
+      kind: 'activity',
+      activity: {
+        seq: 5, session: active,
+        entries: [{ deliveryId: 'n1:claude', message: userStored('n1', 'claude', 'r-mint') }],
+        ackedDeliveryIds: [], voidedDeliveryIds: [],
+      },
+    }));
+    expect(state.composer?.pending).toBeUndefined();
+    expect(state.composer?.confirming).toBeUndefined(); // frozen draft dropped with the clear
+  });
+});

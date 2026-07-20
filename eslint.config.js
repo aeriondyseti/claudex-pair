@@ -3,6 +3,14 @@ import tseslint from 'typescript-eslint';
 export default tseslint.config(
   ...tseslint.configs.recommended,
   {
+    // Underscore-prefixed destructure bindings are the idiom for REMOVING an
+    // optional property under exactOptionalPropertyTypes (assigning
+    // `undefined` is a type error) — allow them everywhere.
+    rules: {
+      '@typescript-eslint/no-unused-vars': ['error', { varsIgnorePattern: '^_', argsIgnorePattern: '^_' }],
+    },
+  },
+  {
     files: ['src/core/**/*.ts'],
     rules: {
       'no-restricted-imports': ['error', { patterns: [{ group: ['node:*', '@app/*', '@adapters/*', 'bun', 'bun:*'], message: 'core is pure: it imports nothing but core (ARCHITECTURE.md)' }] }],
