@@ -189,6 +189,15 @@ export class BrokerCore {
     return next;
   }
 
+  /** Round 4 #3: lifecycle quiescence — resolves when every committed
+   * txn's fire-and-forget mirror application has settled. A same-root
+   * successor (restart, test reopen) must await this; without it the old
+   * core's rename chain races the successor's recovery reconcile. */
+  async quiesce(): Promise<void> {
+    await this.#chain(async () => undefined);
+    await this.#mirrorSerial;
+  }
+
   execute(reqId: string, clientId: string, as: string, payload: unknown, connectionId?: string): Promise<BrokerResponse> {
     this.#lastBusyAt = Date.now();
     return this.#chain(() => this.#execute(reqId, clientId, as, payload, connectionId));
@@ -341,10 +350,11 @@ export class BrokerCore {
         this.#agentConnections.set(connectionId, { agent, credentialVersion: existing.credentialVersion });
         return { reqId, ok: true, data: { agent, credentialVersion: existing.credentialVersion, admitted: true } };
       }
-      // Round 3 #1: a user revocation is FINAL for that secret — the old
-      // hash is a private denylist; presenting the revoked credential can
-      // never TOFU it back in at a new version.
-      if (existing?.revokedHash !== undefined && constantTimeEqualHex(sha256Hex(credential), existing.revokedHash)) {
+      // Round 3/4 #1: a user revocation is FINAL for that secret — the
+      // CUMULATIVE private denylist rejects every previously revoked
+      // credential forever, across any number of rotations.
+      const candidateHash = sha256Hex(credential);
+      if ((existing?.revokedHashes ?? []).some((h) => constantTimeEqualHex(candidateHash, h))) {
         return err(reqId, 'credential-revoked', 'This credential was revoked by the user — generate a NEW one (pair attach -Regenerate) and re-attach.');
       }
       // TOFU: no dedup shortcut (mirrors user-attach — an unrelated recorded
@@ -592,6 +602,7 @@ export class BrokerCore {
     if (what === 'broker-stop') {
       this.#stopping = true;
       await this.#serial; // finish in-flight txn (drain)
+      await this.#mirrorSerial; // round 4 #3: mirrors settle before teardown
       // The composition root schedules the actual teardown AFTER this
       // response has been written — respond-then-close is the drain order.
       return { reqId, ok: true, data: { stopping: true } };

@@ -71,7 +71,7 @@ export type Snapshot = {
    * WITHOUT a hash are pending-rebind (revoked): the version must survive
    * restart so the next TOFU binds at version+1, and the REVOKED hash is
    * kept as a denylist so the old secret can never re-bind (round 3 #1). */
-  bindings?: Record<string, { hash?: string; credentialVersion: number; revokedHash?: string }>;
+  bindings?: Record<string, { hash?: string; credentialVersion: number; revokedHashes?: string[] }>;
   /** Item 7: first-class awaiting-set (asks not yet validly answered).
    * Persisted so cap pressure on the transcript ring can never lose an
    * unresolved ask across restart. Optional: a legacy snapshot lacks it —
@@ -204,7 +204,7 @@ export class Journal {
    * A revoked binding keeps its version (hash cleared, moved to
    * revokedHash) so the next TOFU binds at version+1 AND the old secret
    * is rejected forever (round 3 #1). */
-  private bindings_ = new Map<string, { hash?: string; credentialVersion: number; revokedHash?: string }>();
+  private bindings_ = new Map<string, { hash?: string; credentialVersion: number; revokedHashes?: string[] }>();
   private segmentIndex = 1;
   private segmentBytes = 0;
   readonly dir: string;
@@ -237,7 +237,7 @@ export class Journal {
     return [...this.awaiting_.values()];
   }
   /** Peer 1A: the PRIVATE verifier for an agent (never projected). */
-  binding(agent: string): { hash?: string; credentialVersion: number; revokedHash?: string } | undefined {
+  binding(agent: string): { hash?: string; credentialVersion: number; revokedHashes?: string[] } | undefined {
     return this.bindings_.get(agent);
   }
 
@@ -344,16 +344,20 @@ export class Journal {
     for (const [agent, verifier] of Object.entries(record.privateBindings ?? {})) {
       if (verifier === null) {
         // Revocation DERIVES the denylist from the prior verifier — the
-        // record itself stores null (no re-written hash material), and
-        // both segment replay and snapshot restore reproduce it.
+        // record stores null (no re-written hash material); replay and
+        // snapshots reproduce it. Round 4 #1: the denylist ACCUMULATES
+        // across every rotation — an offline v1 secret stays rejected
+        // through v2, v3, ... forever.
         const prev = this.bindings_.get(agent);
         if (prev) {
-          this.bindings_.set(agent, {
-            credentialVersion: prev.credentialVersion,
-            ...(prev.hash !== undefined ? { revokedHash: prev.hash } : prev.revokedHash !== undefined ? { revokedHash: prev.revokedHash } : {}),
-          });
+          const revokedHashes = [...(prev.revokedHashes ?? []), ...(prev.hash !== undefined ? [prev.hash] : [])];
+          this.bindings_.set(agent, { credentialVersion: prev.credentialVersion, ...(revokedHashes.length ? { revokedHashes } : {}) });
         }
-      } else this.bindings_.set(agent, verifier);
+      } else {
+        // A fresh bind PRESERVES the accumulated denylist.
+        const prev = this.bindings_.get(agent);
+        this.bindings_.set(agent, { ...verifier, ...(prev?.revokedHashes?.length ? { revokedHashes: prev.revokedHashes } : {}) });
+      }
     }
     this.lastSeq = record.seq;
     for (const d of record.deliveries) {

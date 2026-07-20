@@ -136,6 +136,7 @@ describe('agent-attach: TOFU admission, reconnect proof, rejection matrix', () =
     core.onConnection('conn-codex', 'open');
     expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
 
+    await core.quiesce(); // round 4 #3: mirrors settle before the same-root successor
     const reopened = makeCore(root);
     expect(await reopened.recover()).not.toBe('conflict');
     reopened.onConnection('conn-codex-2', 'open');
@@ -240,28 +241,44 @@ describe('user-rebind-agent: pending-new-binding, revoked tags, TOFU at version+
 
   });
 
-  test('round 3 #1: revocation state survives RESTART — old secret rejected, rotated secret reconnects at v2', async () => {
+  test('round 4 #1: the denylist is CUMULATIVE across rotations and restarts — v1 and v2 stay rejected forever, v3 binds', async () => {
     const root = await tempRoot();
     const core = await peerCore(root);
-    core.onConnection('conn-codex', 'open');
-    expect((await core.agentAttach('at-1', 'conn-codex', 'client-codex', 'codex', CRED.codex)).ok).toBeTrue();
-    core.onConnection('conn-user', 'open');
-    expect((await core.userAttach('uat-1', { id: 'conn-user', sendObserver: async () => undefined }, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
-    expect((await core.userAction('ract-1', 'client-user', 'conn-user', { verb: 'rebind', agent: 'codex' })).ok).toBeTrue();
-    core.onConnection('conn-x', 'open');
-    expect((await core.agentAttach('at-2', 'conn-x', 'client-codex', 'codex', 'd'.repeat(64))).ok).toBeTrue(); // rotated v2
+    const user = async (c: BrokerCore, connId: string, reqId: string) => {
+      c.onConnection(connId, 'open');
+      expect((await c.userAttach(`uat-${reqId}`, { id: connId, sendObserver: async () => undefined }, 'client-user', 'f'.repeat(64))).ok).toBeTrue();
+      expect((await c.userAction(reqId, 'client-user', connId, { verb: 'rebind', agent: 'codex' })).ok).toBeTrue();
+    };
+    const attach = async (c: BrokerCore, connId: string, reqId: string, cred: string) => {
+      c.onConnection(connId, 'open');
+      return c.agentAttach(reqId, connId, 'client-codex', 'codex', cred);
+    };
+    const V2 = 'd'.repeat(64);
+    const V3 = 'e'.repeat(64);
 
+    expect((await attach(core, 'c1', 'at-1', CRED.codex)).ok).toBeTrue(); // v1
+    await user(core, 'u1', 'r-1'); // rebind #1
+    expect(((await attach(core, 'c2', 'at-2', CRED.codex)) as { error?: { code?: string } }).error?.code).toBe('credential-revoked');
+    expect((await attach(core, 'c3', 'at-3', V2)).ok).toBeTrue(); // v2 TOFU
+    await user(core, 'u2', 'r-2'); // rebind #2 — the SECOND pending window
+    // BOTH prior secrets stay denied (the round-4 hole was v1 re-binding here).
+    expect(((await attach(core, 'c4', 'at-4', CRED.codex)) as { error?: { code?: string } }).error?.code).toBe('credential-revoked');
+    expect(((await attach(core, 'c5', 'at-5', V2)) as { error?: { code?: string } }).error?.code).toBe('credential-revoked');
+    const v3 = await attach(core, 'c6', 'at-6', V3);
+    expect(v3.ok).toBeTrue();
+    expect((v3 as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(3);
+
+    await core.quiesce(); // round 4 #3 lifecycle seam
     const reopened = makeCore(root);
     expect(await reopened.recover()).not.toBe('conflict');
-    reopened.onConnection('conn-y', 'open');
-    const oldAfterRestart = await reopened.agentAttach('at-3', 'conn-y', 'client-codex', 'codex', CRED.codex);
-    // Once a ROTATED binding exists, the old secret is simply a wrong
-    // credential (auth-failed); during the pending window it is the typed
-    // credential-revoked (pinned in the rebind test above). Rejected either way.
-    expect((oldAfterRestart as { error?: { code?: string } }).error?.code).toBe('agent-auth-failed');
-    const rotated = await reopened.agentAttach('at-4', 'conn-y', 'client-codex', 'codex', 'd'.repeat(64));
-    expect(rotated.ok).toBeTrue();
-    expect((rotated as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(2);
+    reopened.onConnection('c7', 'open');
+    // v1/v2 remain rejected after restart (auth-failed once v3 is live —
+    // rejected either way); v3 still proves.
+    expect((await reopened.agentAttach('at-7', 'c7', 'client-codex', 'codex', CRED.codex)).ok).toBeFalse();
+    expect((await reopened.agentAttach('at-8', 'c7', 'client-codex', 'codex', V2)).ok).toBeFalse();
+    const again = await reopened.agentAttach('at-9', 'c7', 'client-codex', 'codex', V3);
+    expect(again.ok).toBeTrue();
+    expect((again as { data?: { credentialVersion?: number } }).data?.credentialVersion).toBe(3);
   });
 });
 
@@ -276,6 +293,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     expect(Object.keys(before.registry.agents)).toEqual(['claude']);
     const versionBefore = before.registry.version;
 
+    await core.quiesce(); // round 4 #3: mirrors settle before the same-root successor
     const reopened = makeCore(root);
     expect(await reopened.recover()).not.toBe('conflict');
     const after = await session(reopened);
@@ -383,6 +401,7 @@ describe('1A round 2: registry honesty, durable authorization, frozen electorate
     s = await session(core);
     expect(s.attention.some((a) => a.id === item.id)).toBeFalse();
 
+    await core.quiesce(); // round 4 #3: mirrors settle before the same-root successor
     const reopened = makeCore(root);
     expect(await reopened.recover()).not.toBe('conflict');
     expect((await session(reopened)).attention.some((a) => a.id === item.id)).toBeFalse();

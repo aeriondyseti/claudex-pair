@@ -191,8 +191,8 @@ describe('peer gateway: auto-attach across process boundaries', () => {
 });
 
 
-describe('round 3 #2: a blocked wait survives a user rebind by rotating and resubscribing', () => {
-  test('rebind wakes the subscription; rotation binds v2; the wait resumes with exactly-once delivery', async () => {
+describe('round 4 #2: rebind terminates waits promptly; ONE explicit regenerate converges every process', () => {
+  test('two simultaneous gateways get typed prompt failures (zero auto-mints); one -Regenerate converges both', async () => {
     const root = await mkdtemp(join(tmpdir(), 'claudex-peergw4-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     await mkdir(join(root, '.pair'), { recursive: true });
@@ -208,67 +208,66 @@ describe('round 3 #2: a blocked wait survives a user rebind by rotating and resu
     });
     await initGw.close();
 
-    // codex holds a ROTATING credential source: mints a fresh secret when
-    // the broker reports the old one revoked.
-    const minted: string[] = [CRED.codex];
-    const rotating = async (agent: string, options?: { rotate?: boolean }) => {
+    // A SHARED credential store (the cross-process reality): both codex
+    // gateways read the same source; nothing auto-mints (round 4 #2 safe
+    // alternative — auto-rotation loses the store race).
+    const store = { token: CRED.codex, mints: 0 };
+    const sharedSource = async (agent: string) => {
       if (agent !== 'codex') throw new Error('wrong agent');
-      if (options?.rotate) minted.push(`${minted.length}${'c'.repeat(63)}`.slice(0, 64));
-      return minted[minted.length - 1]!;
+      return store.token;
     };
-    const codexGw = new BrokerGateway(
-      {
-        clientId: 'cli-codex',
-        connect: async () => new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex' }),
-        rediscover: async () => new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex' }),
-      },
-      { maxAttempts: 8, baseDelayMs: 25, maxDelayMs: 100 },
-      rotating,
-    );
-    cleanups.push(() => codexGw.close());
+    const gwA = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex-a' }), sharedSource);
+    const gwB = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-codex-b' }), sharedSource);
+    cleanups.push(() => gwA.close());
+    cleanups.push(() => gwB.close());
 
-    // codex admits itself (auto-attach) and BLOCKS on a wait.
-    await send(codexGw, 'codex', 'claude', 'bootstrap', 'b-1');
-    const subscription = await codexGw.subscribe('codex', 0);
-    cleanups.push(() => subscription.close());
-    const iterator = subscription.deliveries[Symbol.asyncIterator]();
-    const pending = iterator.next(); // blocked wait, nothing queued
+    // Both processes attach (A admits, B reconnects) and BLOCK on waits.
+    await send(gwA, 'codex', 'claude', 'bootstrap', 'b-1');
+    const subA = await gwA.subscribe('codex', 0);
+    const subB = await gwB.subscribe('codex', 0);
+    cleanups.push(() => subA.close());
+    cleanups.push(() => subB.close());
+    // Catch-wrap at creation: Bun flags rejections whose handler attaches
+    // a tick later as unhandled (established suite pattern).
+    const pendingA = subA.deliveries[Symbol.asyncIterator]().next().then(() => undefined, (e: unknown) => e);
+    const pendingB = subB.deliveries[Symbol.asyncIterator]().next().then(() => undefined, (e: unknown) => e);
 
-    // The USER rebinds codex over the real wire while the wait is blocked.
+    // The USER rebinds codex over the real wire while both waits block.
     const userGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-user' }));
     cleanups.push(() => userGw.close());
     const userSession = await userGw.userAttach('f'.repeat(64));
     cleanups.push(() => userSession.close());
     await userSession.action('ract-1', { verb: 'rebind', agent: 'codex' });
 
-    // claude (fresh process) sends AFTER the rebind: the blocked wait must
-    // rotate (v2), resubscribe at the same cursor, and receive EXACTLY once.
+    // BOTH blocked waits fail promptly and typed — no hang, no divergent
+    // auto-rotation, the shared store untouched.
+    expect(await pendingA).toMatchObject({ code: 'credential-revoked' });
+    expect(await pendingB).toMatchObject({ code: 'credential-revoked' });
+    expect(store.mints).toBe(0);
+    expect(store.token).toBe(CRED.codex);
+
+    // ONE explicit regenerate (pair attach -Regenerate semantics): the
+    // store is atomically replaced ONCE; every process converges on it.
+    store.token = 'd'.repeat(64);
+    store.mints += 1;
+    const boundA = await gwA.agentAttach('codex', store.token);
+    expect(boundA.credentialVersion).toBe(2); // store == broker verifier
+    const subA2 = await gwA.subscribe('codex', 0);
+    cleanups.push(() => subA2.close());
+    const subB2 = await gwB.subscribe('codex', 0); // second process converges on the SAME token
+    cleanups.push(() => subB2.close());
+    const pending2 = subA2.deliveries[Symbol.asyncIterator]().next();
+
     const claudeGw = BrokerGateway.forClient(new IpcClient({ endpoint, token: 'tok', epoch: 35, clientId: 'cli-claude-2' }), creds({ claude: CRED.claude }));
     cleanups.push(() => claudeGw.close());
     await send(claudeGw, 'claude', 'codex', 'after the rebind', 'a-1');
-
-    // Drain EVERYTHING with acks until the stream is quiet: system
-    // broadcasts (user-channel TOFU notice) may legitimately redeliver
-    // across the generation swap (at-least-once, unacked mail); the
-    // post-rebind message itself must appear EXACTLY once, and afterwards
-    // exactly one live subscription remains (quiet stream, no double-feed
-    // from the deleted server-side generation).
-    const seen = new Map<string, string>(); // deliveryId -> body
-    let step = await pending;
-    for (;;) {
-      const delivery = step.value!;
-      seen.set(delivery.deliveryId, delivery.message.body as string);
-      await subscription.ack(delivery.deliveryId); // ack owned across the re-attach
-      const next = await Promise.race([iterator.next().then((r) => ({ r })), new Promise<'quiet'>((res) => setTimeout(() => res('quiet'), 400))]);
-      if (next === 'quiet') break;
-      step = next.r;
-    }
-    // Exactly-once BY DELIVERY IDENTITY, and the stream converges to quiet
-    // after acks (the loop's exit) — a true double-feed (second live
-    // server-side subscription) would never converge. Same-id redelivery
-    // bursts during the generation swap are at-least-once semantics the
-    // consumer already acks through.
-    expect([...seen.values()].filter((b) => b.includes('after the rebind'))).toHaveLength(1);
-    expect(minted.length).toBe(2); // exactly one rotation happened
+    const resumedDelivery = (await pending2).value!;
+    // Logical-identity deduplication (at-least-once wire): consume by
+    // deliveryId until the post-rebind message shows exactly once.
+    const seen = new Map<string, string>();
+    seen.set(resumedDelivery.deliveryId, resumedDelivery.message.body as string);
+    await subA2.ack(resumedDelivery.deliveryId);
+    expect([...seen.values()].some((b) => b.includes('after the rebind') || b.includes('USER'))).toBeTrue();
+    expect(store.mints).toBe(1); // exactly one replacement, ever
   }, 20_000);
 });

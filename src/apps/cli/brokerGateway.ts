@@ -53,18 +53,17 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
 
   /** Attach `agent` on this exact client (its OWN credential, transport
    * edge only). Throws typed errors; TOFU is idempotent by credential.
-   * Round 3 #1: a credential-revoked rejection ROTATES — the source mints
-   * an agent-generated replacement and re-attaches once (new TOFU at
-   * version+1); the revoked secret itself is denylisted broker-side. */
+   * Round 4 #2 (codex-approved safe alternative): NO automatic rotation —
+   * concurrent processes racing rm+create on the shared store could
+   * strand a divergent token forever. A credential-revoked rejection
+   * surfaces typed; the human (or the agent, deliberately) runs ONE
+   * explicit `pair attach -Regenerate`, and every process converges on
+   * the single stored replacement. */
   private async attachOn(client: IpcClient, agent: string): Promise<void> {
     if (!this.credentials) throw new BrokerWireError('agent-not-attached', 'This gateway has no agent-credential source for peer sessions.');
     const token = await this.credentials(agent);
     const res = await client.agentAttach(agent, token);
-    if (res.ok) return;
-    if (res.error.code !== 'credential-revoked') throw new BrokerWireError(res.error.code, res.error.message);
-    const fresh = await this.credentials(agent, { rotate: true });
-    const retry = await client.agentAttach(agent, fresh);
-    if (!retry.ok) throw new BrokerWireError(retry.error.code, retry.error.message);
+    if (!res.ok) throw new BrokerWireError(res.error.code, res.error.message);
   }
 
   async execute(request: ExecuteRequest): Promise<ExecuteOutcome> {
@@ -193,13 +192,12 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
       // any close callback can replace it, and reconnect is suppressed.
       const offErr = next.onServerError((e) => {
         if (e.code === 'credential-revoked') {
-          // Round 3 #2: a rebind deregisters this subscription server-side
-          // WITHOUT closing the socket — treat it as a reconnect trigger.
-          // The reconnect's attach path hits the denylist, ROTATES the
-          // credential, re-attaches, and resubscribes at the same acked
-          // cursor (no duplicate consumption: server state was dropped).
-          scheduleReconnect();
-          next.close(); // listeners already unhooked by scheduleReconnect
+          // Round 4 #2: terminate the wait PROMPTLY and typed — the store
+          // race makes auto-rotation unsafe; recovery is one explicit
+          // `pair attach -Regenerate` (then re-arm), after which every
+          // process converges on the single stored replacement.
+          removed = new BrokerWireError(e.code, e.message);
+          queue.preempt(removed);
           return;
         }
         if (e.code !== 'removed-from-session') return;

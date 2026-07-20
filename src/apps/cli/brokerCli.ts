@@ -176,6 +176,11 @@ async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, 
   } catch (error) {
     // Slice 4 (design REV 6): a user kick terminates this wait — terminal
     // wording, exit 0, NO re-arm hint, never reconnect churn.
+    if (error instanceof BrokerWireError && error.code === 'credential-revoked') {
+      out('='.repeat(66));
+      out(`YOUR CREDENTIAL WAS REBOUND by the user. Recover with: pair attach -As ${as} -Regenerate  — then re-arm this wait.`);
+      return 2;
+    }
     if (error instanceof BrokerWireError && error.code === 'removed-from-session') {
       out('='.repeat(66));
       out(`YOU WERE REMOVED FROM THE SESSION by the user. Stop all work immediately; do not re-arm this wait and do not send. Report to your human.`);
