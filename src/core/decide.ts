@@ -86,7 +86,7 @@ function decideUserPause(
   const reasonSuffix = command.reason ? ` Reason: ${command.reason}` : '';
   const events: Event[] = [{ kind: 'session-paused', reason: command.reason, at: envelope.meta.at }];
   s.agents.forEach((agent, i) => {
-    events.push(userActionNotice(command, agent, i, 'pause', 'info', `SESSION PAUSED by the user.${reasonSuffix} Stand by — do not send, do not end; your commands will succeed after the user resumes.`, envelope.meta.at));
+    events.push(userActionNotice(command, agent, i, 'pause', 'info', `SESSION PAUSED by the user.${reasonSuffix} Stand by — do not send, do not end. Mutations are accepted again after the user resumes; retry only if still appropriate.`, envelope.meta.at));
   });
   return ok(events);
 }
@@ -469,7 +469,7 @@ function withActive(
   // The brake (U1 slice 4b): paused is LIVE, not terminal — agent mutations
   // get a stable, distinct code so CLIs can say "stand by", never "ended".
   if (state?.status === 'paused') {
-    return err(new ProtocolError('session-paused', 'The user paused the session — stand by for resume. Do not re-send; your command will succeed after /resume.'));
+    return err(new ProtocolError('session-paused', 'The user paused the session — stand by for resume. Mutations are accepted again after resume; retry only if still appropriate.'));
   }
   if (!state || state.status !== 'active') {
     const status = state ? state.status : 'missing';
@@ -512,12 +512,13 @@ function decideInit(
   at: string,
 ): Result<Event[], ProtocolError> {
   if (state && state.status !== 'completed') {
-    // Paused is LIVE: re-init over it would destroy a braked session.
+    // Paused is LIVE: re-init over it would destroy a braked session. The
+    // guidance branches — agent end is itself braked while paused.
+    const guidance = state.status === 'paused'
+      ? 'The user must /resume it (after which an agent may end it) or /end it immediately.'
+      : "Finish it with 'pair end' or delete .pair first.";
     return err(
-      new ProtocolError(
-        'session-exists',
-        `A ${state.status} session already exists here (task: ${state.task}). Finish it with 'pair end' (or /resume it) first.`,
-      ),
+      new ProtocolError('session-exists', `A ${state.status} session already exists here (task: ${state.task}). ${guidance}`),
     );
   }
   const agents = command.agents;

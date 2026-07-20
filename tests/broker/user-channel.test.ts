@@ -415,6 +415,14 @@ describe('slice 4b: pause/resume through the broker (F-A10)', () => {
     expect((await core.userAttach('att-pz', sink('pz-conn'), 'user-client', 'a'.repeat(64))).ok).toBeTrue();
     expect((await core.userAction('act-pause', 'user-client', 'pz-conn', { verb: 'pause', reason: 'lunch' })).ok).toBeTrue();
     expect(core.journal.sessionState?.status).toBe('paused');
+    // The acceptance matrix names the session.json ROUND-TRIP explicitly:
+    // observe the mirror on disk, not just journal state (codex 4b review).
+    const sessionJson = join(root, '.pair', 'session.json');
+    {
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline && JSON.parse(await Bun.file(sessionJson).text()).status !== 'paused') await Bun.sleep(20);
+      expect(JSON.parse(await Bun.file(sessionJson).text()).status).toBe('paused');
+    }
 
     // Restart: journal replay restores paused (F-A10).
     const reopened = makeCore(root);
@@ -431,6 +439,11 @@ describe('slice 4b: pause/resume through the broker (F-A10)', () => {
     expect((await reopened.userAttach('att-pz2', sink('pz-conn-2'), 'user-client-2', 'a'.repeat(64))).ok).toBeTrue();
     expect((await reopened.userAction('act-resume', 'user-client-2', 'pz-conn-2', { verb: 'resume' })).ok).toBeTrue();
     expect(reopened.journal.sessionState?.status).toBe('active');
+    {
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline && JSON.parse(await Bun.file(sessionJson).text()).status !== 'active') await Bun.sleep(20);
+      expect(JSON.parse(await Bun.file(sessionJson).text()).status).toBe('active');
+    }
     const unbraked = await reopened.execute('try-send-2', 'client-a', 'claude', { command: { kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' } });
     expect(unbraked.ok).toBeTrue();
   });

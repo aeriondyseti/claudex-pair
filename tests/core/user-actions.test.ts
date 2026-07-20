@@ -158,6 +158,7 @@ describe('slice 4b: the paused-status matrix (F-A5/A6/A9)', () => {
       { kind: 'accept-grant', grantId: 'g1' },
       { kind: 'end-session', summary: 'x' },
       { kind: 'kick-agent', agent: 'codex', reason: '' },
+      { kind: 'cancel-grant', grantId: 'g1', reason: '' },
       { kind: 'revoke-turn', reason: '' },
       { kind: 'join-session', agent: 'agy' },
     ]) {
@@ -181,12 +182,42 @@ describe('slice 4b: the paused-status matrix (F-A5/A6/A9)', () => {
     expect(leave.ok).toBeTrue();
   });
 
-  test('user verbs stay valid while paused: message, cancel-grant, kick, and END (F-A6)', () => {
+  test('EVERY user verb stays valid while paused: message, cancel-grant, kick, and END (F-A6)', () => {
     const s = paused();
     const msg = decide(s, env({ kind: 'user-message', groupId: 'g', recipients: [{ to: 'claude', messageId: 'um1' }], body: 'still here' }, 'user', 'um'));
     expect(msg.ok).toBeTrue();
+    const cancel = decide(s, env({ kind: 'user-cancel-grant', grantId: 'g1', reason: 'braked', ...base }, 'user', 'uc'));
+    expect(cancel.ok).toBeTrue(); // user cancel unaffected by the brake
+    const kick = decide(s, env({ kind: 'user-kick-agent', agent: 'codex', reason: 'stuck', ...base }, 'user', 'uk'));
+    expect(kick.ok).toBeTrue(); // user kick unaffected by the brake
     const end = decide(s, env({ kind: 'user-end-session', summary: '', ...base }, 'user', 'ue'));
     expect(end.ok).toBeTrue(); // the user outranks the brake
+  });
+
+  test('turn-holding leave WHILE PAUSED returns the turn to the driver; resume preserves that turn change (resume-only-status proper)', () => {
+    // No grant: leave must be free to commit. Pass the turn to codex first.
+    let s = session(['claude', 'codex'], 'claude');
+    const pass = decide(s, env({ kind: 'send-message', to: 'codex', type: 'ask', turn: 'pass', body: 'q' }, 'claude', 'tp'));
+    if (!pass.ok) throw pass.error;
+    s = pass.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    const pausedR = decide(s, env({ kind: 'user-pause-session', reason: '', ...base }, 'user', 'up'));
+    if (!pausedR.ok) throw pausedR.error;
+    s = pausedR.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    expect([s.status, s.turn]).toEqual(['paused', 'codex']);
+
+    const leave = decide(s, env({ kind: 'leave-session' }, 'codex', 'lv'));
+    expect(leave.ok).toBeTrue();
+    if (!leave.ok) return;
+    expect(leave.value.find((e) => e.kind === 'turn-passed')).toMatchObject({ to: 'claude' }); // same txn
+    s = leave.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    expect([s.status, s.turn, [...s.agents]]).toEqual(['paused', 'claude', ['claude']]);
+
+    const resume = decide(s, env({ kind: 'user-resume-session', ...base }, 'user', 'ur'));
+    expect(resume.ok).toBeTrue();
+    if (!resume.ok) return;
+    s = resume.value.reduce<SessionState | undefined>((acc, e) => replayOne(acc, e), s)!;
+    // Resume changed ONLY the status: the paused-time turn return SURVIVES.
+    expect([s.status, s.turn, [...s.agents]]).toEqual(['active', 'claude', ['claude']]);
   });
 
   test('F-A9: pause-while-paused and resume-while-active are STABLE distinct errors; resume restores active', () => {
