@@ -43,7 +43,7 @@ const COMMAND_KINDS = new Set([
   'propose', 'draft-amend',
   'critique', 'respond-critique', 'confirm-critique', 'amend-critique', 'yield-turn',
   'call-question', 'vote', 'address-agenda',
-  'init-session', 'send-message', 'end-session',
+  'init-session', 'send-message', 'send-batch', 'end-session',
   'issue-grant', 'accept-grant', 'complete-grant', 'cancel-grant',
   'revoke-turn', 'leave-session', 'join-session', 'kick-agent',
 ]);

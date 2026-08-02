@@ -138,6 +138,9 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case 'send': {
+      if (has(flags, 'batch') || str(flags, 'batch')) {
+        throw new ProtocolError('session-not-active', '-Batch requires broker mode (the default); this legacy fs-mode session cannot batch.');
+      }
       const deps = bindFsDeps(findRoot(rootFlag));
       const from = requireStr(flags, 'from', 'send requires -From <you> — never impersonate a partner').toLowerCase();
       const to = str(flags, 'to')?.toLowerCase();
@@ -397,7 +400,11 @@ Usage:
               # Timeout exit 2 means the send COMMITTED — re-arm with 'pair
               # wait', never re-send. -Turn keep returns immediately.
   pair wait   -As <me> [-TimeoutSec 300] [-PollSec 2]      # 0 = check once
+              [-Thread <id[,id,...]>]  # exit only when ALL these asks resolve
   pair ask    -From <me> (-Message '<text>' | -File <path>) # = send -Type ask
+              [-Batch <file>]  # n asks from '## ' sections, ONE txn, one wake;
+                               # answer them all with: send -Type answer -Batch <file>
+                               # (items map to your open asks oldest-first)
   pair propose-end -From <me> (-Message '<why>' | -File <path>) # FYI to driver
   pair revoke-turn -From <driver> -ConfirmUnresponsive [-Reason '<why>']
               # Broker rejects while a live delivery lease exists. FS mode has

@@ -158,6 +158,11 @@ export function findControlCharacter(text: string): number {
  * free (INCLUDING tab/newline: it serializes as one `review_scope:` line). */
 export const REVIEW_SCOPE_MAX = 256;
 
+/** T3: batch send bounds — a batch is 2..16 items (one item is a plain
+ * send; more than 16 decisions in one turn is a design smell, not a wire
+ * problem). */
+export const BATCH_ITEMS_MAX = 16;
+
 /** M1: bounded practical roster limit — registry-defined, fail-closed at
  * init AND join. Raising it is a deliberate registry change, not implied
  * unbounded scaling (ENHANCEMENTS M1). */

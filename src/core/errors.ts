@@ -91,6 +91,7 @@ export type ProtocolErrorCode =
   | 'invalid-message-type'
   | 'invalid-reply-to'
   | 'invalid-review-scope'
+  | 'invalid-batch'
   | 'session-paused'
   | 'session-already-paused'
   | 'session-not-paused';

@@ -8,6 +8,7 @@ import { systemClock, systemIds } from '@adapters/clock/index.ts';
 import { BrokerGateway, BrokerWireError } from './brokerGateway.ts';
 import { nextDelivery, printDeliveryThenAck, renderWakeDigest } from './brokerWait.ts';
 import { has, num, str } from './args.ts';
+import { splitBatchItems } from './batch.ts';
 import { loadOrCreateAgentCredential } from './credentialStore.ts';
 
 type Flags = Map<string, string | true>;
@@ -85,6 +86,33 @@ export async function runBrokerCli(
       const turn = (str(flags, 'turn') ?? 'pass').toLowerCase() as TurnMode;
       let to = str(flags, 'to')?.toLowerCase();
       if (!to) { const status = await gateway.status(); to = resolveRecipient(status.session, from); if (!to) throw new Error(`Ambiguous recipient: specify -To explicitly`); }
+      // T3: -Batch <file> — n items, ONE txn, one wake per side.
+      const batchFile = str(flags, 'batch');
+      if (batchFile !== undefined) {
+        if (type !== 'ask' && type !== 'answer') throw new Error("-Batch supports -Type ask or answer only.");
+        const rawItems = splitBatchItems(await Bun.file(batchFile).text());
+        let items: { body: string; replyTo?: string }[] = rawItems.map((body) => ({ body }));
+        if (type === 'answer') {
+          // Positional mapping, oldest-first, against the asks YOU owe THIS
+          // partner — a count mismatch is a hard error, never a guess.
+          const status = await gateway.status();
+          const owed = (status.awaiting ?? []).filter((a) => a.to === from && a.from === to).sort((a, b) => a.messageId.localeCompare(b.messageId));
+          if (owed.length !== items.length) {
+            throw new Error(`Batch answer has ${items.length} items but you owe ${to} ${owed.length} repl${owed.length === 1 ? 'y' : 'ies'} (${owed.map((a) => a.messageId).join(', ') || 'none'}) — one item per open ask, oldest first.`);
+          }
+          items = items.map((item, i) => ({ ...item, replyTo: owed[i]!.messageId }));
+        }
+        const r = await execute(gateway, from, { kind: 'send-batch', to, type, turn, items });
+        const sentIds = r.events.filter((e) => e.kind === 'message-sent').map((e) => (e as { id: string }).id);
+        out(`Sent batch of ${items.length} ${type} -> ${to} (${sentIds.join(', ')}). Turn: ${r.session.turn}. Status: ${r.session.status}.`);
+        if (type === 'answer') for (const [i, item] of items.entries()) out(`  item ${i + 1} answers ${item.replyTo}`);
+        const fuseBatch = turn === 'pass' && !has(flags, 'nowait') && r.session.status === 'active';
+        if (!fuseBatch) { if (turn === 'pass' && r.session.status === 'active') out(`You handed over the turn. Now block on: pair wait -As ${from}`); return 0; }
+        out('You handed over the turn. Waiting for the replies (-NoWait skips the fused wait).');
+        // A fused batch ASK waits on ALL its threads; answers wait untargeted.
+        const threads = type === 'ask' ? sentIds : [];
+        return await waitBroker(gateway, root, from, num(flags, 'timeoutsec', Infinity), true, threads);
+      }
       const replyTo = str(flags, 'replyto');
       // T2 (item 16): sender-declared review scope — base/head refs plus an
       // optional path list, carried as one review_scope header line.
@@ -104,7 +132,7 @@ export async function runBrokerCli(
       // Without this the first unrelated delivery ended the fused ask, and a
       // timeout re-arm lost the thread entirely (codex blocker 1).
       const fusedThread = type === 'ask' && sent?.kind === 'message-sent' ? sent.id : undefined;
-      return await waitBroker(gateway, root, from, num(flags, 'timeoutsec', Infinity), true, fusedThread);
+      return await waitBroker(gateway, root, from, num(flags, 'timeoutsec', Infinity), true, fusedThread ? [fusedThread] : []);
     }
     if (command === 'attach') {
       // Peer 1A: bind THIS connection as the agent using its own stored
@@ -262,7 +290,7 @@ export async function runBrokerCli(
       renderArtifacts(await gateway.planningArtifacts());
       return 0;
     }
-    if (command === 'wait') return await waitBroker(gateway, root, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
+    if (command === 'wait') return await waitBroker(gateway, root, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, (str(flags, 'thread') ?? '').split(',').map((t) => t.trim()).filter(Boolean));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') {
       const thread = str(flags, 'thread');
@@ -322,12 +350,12 @@ export async function runBrokerCli(
 
 async function execute(gateway: CliGateway, as: AgentId, command: Command, credential?: string): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() }, ...(credential === undefined ? {} : { credential }) }); }
 
-async function waitBroker(gateway: CliGateway, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
+async function waitBroker(gateway: CliGateway, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadIds: string[] = []): Promise<number> {
   const status = await gateway.status();
   if (!status.session.agents.includes(as)) throw new Error(`'${as}' is not a participant in this session`);
   const subscription = await gateway.subscribe(as, 0);
   try {
-    return await waitOnSubscription(gateway, subscription, root, as, timeoutSec, fused, threadId);
+    return await waitOnSubscription(gateway, subscription, root, as, timeoutSec, fused, threadIds);
   } catch (error) {
     // Slice 4 (design REV 6): a user kick terminates this wait — terminal
     // wording, exit 0, NO re-arm hint, never reconnect churn.
@@ -345,12 +373,14 @@ async function waitBroker(gateway: CliGateway, root: string, as: AgentId, timeou
   } finally { await subscription.close(); }
 }
 
-async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
-  // Item 7: -Thread <messageId> — every delivery still prints and acks
-  // normally (at-least-once consumption is unchanged); the wait simply
-  // EXITS only when the reply to that specific message arrives.
-  // A timeout re-arm must preserve the thread scope (codex blocker 1).
-  const rearm = `pair wait -As ${as} -TimeoutSec ${timeoutSec}${threadId ? ` -Thread ${threadId}` : ''}`;
+async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadIds: string[] = []): Promise<number> {
+  // Item 7 / T3: -Thread <id[,id,...]> — every delivery still prints and
+  // acks normally (at-least-once consumption is unchanged); the wait simply
+  // EXITS only when EVERY watched ask has resolved (a fused batch ask arms
+  // all its item threads). A timeout re-arm must preserve the thread scope
+  // (codex blocker 1).
+  const threadScope = threadIds.length ? ` -Thread ${threadIds.join(',')}` : '';
+  const rearm = `pair wait -As ${as} -TimeoutSec ${timeoutSec}${threadScope}`;
   for (;;) {
     const delivery = await nextDelivery(subscription, timeoutSec);
     if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: ${rearm}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: ${rearm}`); return 2; }
@@ -361,27 +391,39 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
     // thread-scoped wait — the harness has to act on the user's input NOW.
     // It never resolves the thread. Seam: future control notices
     // (phase/lease) belong on this exit too.
-    if (threadId && (header.provenance === 'trusted_user_client' || header.actionKind !== undefined)) {
+    if (threadIds.length && (header.provenance === 'trusted_user_client' || header.actionKind !== undefined)) {
       const s = await gateway.status();
       renderTurn(s, as);
-      if (s.session.agents.includes(as) && s.session.status !== 'completed') out(`Thread ${threadId} is NOT resolved by this — after handling the user input above, re-arm: pair wait -As ${as} -Thread ${threadId}`);
+      if (s.session.agents.includes(as) && s.session.status !== 'completed') out(`Thread${threadIds.length > 1 ? 's' : ''} ${threadIds.join(',')} ${threadIds.length > 1 ? 'are' : 'is'} NOT resolved by this — after handling the user input above, re-arm: pair wait -As ${as}${threadScope}`);
       return 0;
     }
-    if (threadId) {
+    if (threadIds.length) {
       // Round 3 (codex): resolution may arrive UNTAGGED (compat rule), so
       // consult the authoritative awaiting-set on EVERY non-control
-      // delivery — exit iff the watched ask disappeared from a PRESENT
+      // delivery — exit iff every watched ask disappeared from a PRESENT
       // set. An absent set is NOT confirmation: fail closed, keep armed.
       const s = await gateway.status();
       if (s.awaiting === undefined) {
-        out(`(cannot confirm thread ${threadId}: this broker reports no awaiting-set; still listening — check pair status manually)`);
+        out(`(cannot confirm thread${threadIds.length > 1 ? 's' : ''} ${threadIds.join(',')}: this broker reports no awaiting-set; still listening — check pair status manually)`);
         continue;
       }
-      if (!s.awaiting.some((a) => a.messageId === threadId)) { renderTurn(s, as); return 0; }
-      out(header.replyTo === threadId
-        ? `(a reply candidate named thread ${threadId} but did not resolve the ask — wrong type or endpoints; still listening)`
-        : `(waiting on thread ${threadId} — the above did not resolve it; still listening)`);
+      const remaining = threadIds.filter((id) => s.awaiting!.some((a) => a.messageId === id));
+      if (remaining.length === 0) { renderTurn(s, as); return 0; }
+      out(remaining.length < threadIds.length
+        ? `(${threadIds.length - remaining.length}/${threadIds.length} threads resolved — still waiting on ${remaining.join(',')})`
+        : header.replyTo !== undefined && threadIds.includes(header.replyTo)
+          ? `(a reply candidate named thread ${header.replyTo} but did not resolve the ask — wrong type or endpoints; still listening)`
+          : `(waiting on thread${threadIds.length > 1 ? 's' : ''} ${remaining.join(',')} — the above did not resolve ${threadIds.length > 1 ? 'them' : 'it'}; still listening)`);
       continue;
+    }
+    // T3: drain everything already enqueued (the rest of a batch, queued
+    // FYIs) before exiting — one wake consumes the whole backlog instead of
+    // costing a re-arm cycle per message.
+    for (;;) {
+      const more = await nextDelivery(subscription, 0.25);
+      if (!more) break;
+      await printDeliveryThenAck(more, subscription);
+      renderWakeDigest(more, as, root);
     }
     renderTurn((await gateway.status()), as); return 0;
   }

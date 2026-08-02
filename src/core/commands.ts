@@ -33,6 +33,14 @@ export type Command =
   // review asks ('base..head [-- paths]'). Advisory metadata — messages stay
   // pointers; the broker never runs git.
   | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId; reviewScope?: string }
+  // T3 (THROUGHPUT-SPRINT): n questions (or answers), one wake — the batch
+  // commits atomically in ONE txn. Per-item message ids are derived
+  // `${meta.id}-b<i>` (broker reveal-manifest idiom), groupId = meta.id.
+  // Only the LAST item carries the turn when turn=pass. Answer items carry
+  // replyTo (the CLI resolves positional mapping against the awaiting-set
+  // BEFORE decide — decide validates syntax, the shared awaiting rule does
+  // the rest at fold time).
+  | { kind: 'send-batch'; to: AgentId; type: 'ask' | 'answer'; turn: TurnMode; items: readonly { body: string; replyTo?: MessageId }[] }
   | { kind: 'end-session'; summary: string }
   | { kind: 'issue-grant'; grantId: GrantId; to: AgentId; task: string; scope: GrantScopeInput; agreedIn: MessageId | '' }
   | { kind: 'accept-grant'; grantId: GrantId }

@@ -2,7 +2,7 @@ import type { CommandEnvelope, Command, CommandMeta, GrantScopeInput } from './c
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
 import { advanceRotation } from './rotation.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, REVIEW_SCOPE_MAX, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, REVIEW_SCOPE_MAX, BATCH_ITEMS_MAX, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
 import { validatePlanTaskBlock } from './plan.ts';
 
 /**
@@ -49,6 +49,8 @@ function decideInner(
       return decideInit(state, command, meta.principal, meta.at);
     case 'send-message':
       return withActive(state, (s) => decideSend(s, command, envelope));
+    case 'send-batch':
+      return withActive(state, (s) => decideSendBatch(s, command, envelope));
     case 'end-session':
       return withActive(state, (s) => decideEnd(s, command, envelope));
     case 'issue-grant':
@@ -1551,6 +1553,58 @@ function decideSend(
   // pair.ps1 parity: a raw `send -Type done` completes the session (pair end
   // is the richer verb — memory summary + fan-out — but done-send is legal).
   if (command.type === 'done') events.push({ kind: 'session-ended', by: from, summary: command.body, at: envelope.meta.at });
+  return ok(events);
+}
+
+/** T3 (THROUGHPUT-SPRINT): atomic multi-item send. Shares decideSend's
+ * authority rules (participants, self-address, peer turn ban, turn
+ * ownership) but only for the conversational types a batch supports —
+ * every special-cased type (handoff/done/proposal/propose-end) is out. */
+function decideSendBatch(
+  s: SessionState,
+  command: Extract<Command, { kind: 'send-batch' }>,
+  envelope: CommandEnvelope,
+): Result<Event[], ProtocolError> {
+  const from = envelope.meta.principal;
+  if (command.type !== 'ask' && command.type !== 'answer') {
+    return err(new ProtocolError('invalid-batch', `A batch sends 'ask' or 'answer' items only (got '${String(command.type)}').`));
+  }
+  if (!Array.isArray(command.items) || command.items.length < 2 || command.items.length > BATCH_ITEMS_MAX) {
+    return err(new ProtocolError('invalid-batch', `A batch is 2..${BATCH_ITEMS_MAX} items (got ${Array.isArray(command.items) ? command.items.length : 'none'}); send a single item with pair send/ask.`));
+  }
+  if (s.topology === 'peer' && command.turn === 'pass') {
+    return err(new ProtocolError('no-turn-in-phase', 'This peer phase has no turn token; send with -Turn keep.'));
+  }
+  const bad = assertParticipant(s, from, '-From') ?? assertParticipant(s, command.to, '-To');
+  if (bad) return err(bad);
+  if (from === command.to) {
+    return err(new ProtocolError('self-addressed', `-From and -To must differ (both were '${from}')`));
+  }
+  if (command.turn === 'pass' && s.turn !== from) {
+    return err(new ProtocolError('not-your-turn', `It is ${s.turn}'s turn; '${from}' cannot send a turn-passing batch. Use -Turn keep, or wait for the turn.`));
+  }
+  for (const [i, item] of command.items.entries()) {
+    if (typeof item.body !== 'string' || item.body.trim() === '') {
+      return err(new ProtocolError('invalid-batch', `Batch item ${i + 1} has an empty body.`));
+    }
+    if (command.type === 'answer' && item.replyTo === undefined) {
+      return err(new ProtocolError('invalid-batch', `Batch answer item ${i + 1} carries no reply target — the CLI maps items to open asks before sending.`));
+    }
+    if (item.replyTo !== undefined && !MESSAGE_ID_PATTERN.test(item.replyTo)) {
+      return err(new ProtocolError('invalid-reply-to', `Batch item ${i + 1}: reply target must be a plain message id.`));
+    }
+  }
+  const last = command.items.length - 1;
+  const events: Event[] = command.items.map((item, i) => ({
+    kind: 'message-sent' as const,
+    id: `${envelope.meta.id}-b${i + 1}`,
+    from, to: command.to, type: command.type,
+    turn: (i === last && command.turn === 'pass' ? 'pass' : 'keep') as 'pass' | 'keep',
+    body: item.body, at: envelope.meta.at,
+    groupId: envelope.meta.id,
+    ...(item.replyTo === undefined ? {} : { replyTo: item.replyTo }),
+  }));
+  if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   return ok(events);
 }
 
