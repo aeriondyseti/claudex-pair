@@ -7,7 +7,7 @@ export function messageFilename(message: PairMessage): string {
 }
 
 export function serializeMessage(m: PairMessage): string {
-  return ['---', `id: ${m.id}`, `from: ${m.from}`, `to: ${m.to}`, `type: ${m.type}`, `turn: ${m.turn}`, `sent: ${m.sent}`, ...(m.replyTo === undefined ? [] : [`reply_to: ${m.replyTo}`]), ...(m.sessionId === undefined ? [] : [`session_id: ${m.sessionId}`]), ...(m.reviewScope === undefined ? [] : [`review_scope: ${m.reviewScope}`]), '---', '', m.body, ''].join('\n');
+  return ['---', `id: ${m.id}`, `from: ${m.from}`, `to: ${m.to}`, `type: ${m.type}`, `turn: ${m.turn}`, `sent: ${m.sent}`, ...(m.replyTo === undefined ? [] : [`reply_to: ${m.replyTo}`]), ...(m.sessionId === undefined ? [] : [`session_id: ${m.sessionId}`]), ...(m.reviewScope === undefined ? [] : [`review_scope: ${m.reviewScope}`]), ...(m.reviewAsync === undefined ? [] : ['review: async']), ...(m.lapseAt === undefined ? [] : [`lapse_at: ${m.lapseAt}`]), ...(m.severity === undefined ? [] : [`severity: ${m.severity}`]), '---', '', m.body, ''].join('\n');
 }
 
 export function parseMessage(raw: string): PairMessage {
@@ -20,7 +20,7 @@ export function parseMessage(raw: string): PairMessage {
   }
   for (const key of ['id', 'from', 'to', 'type', 'turn', 'sent']) if (!meta[key]) throw new Error(`Malformed pair message: missing ${key}`);
   const body = match[2]!.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-  return { id: meta.id!, from: meta.from!, to: meta.to!, type: meta.type! as PairMessage['type'], turn: meta.turn! as PairMessage['turn'], sent: meta.sent!, ...(meta.reply_to === undefined ? {} : { replyTo: meta.reply_to }), ...(meta.session_id === undefined ? {} : { sessionId: meta.session_id }), ...(meta.review_scope === undefined ? {} : { reviewScope: meta.review_scope }), body };
+  return { id: meta.id!, from: meta.from!, to: meta.to!, type: meta.type! as PairMessage['type'], turn: meta.turn! as PairMessage['turn'], sent: meta.sent!, ...(meta.reply_to === undefined ? {} : { replyTo: meta.reply_to }), ...(meta.session_id === undefined ? {} : { sessionId: meta.session_id }), ...(meta.review_scope === undefined ? {} : { reviewScope: meta.review_scope }), ...(meta.review === 'async' ? { reviewAsync: true as const } : {}), ...(meta.lapse_at === undefined ? {} : { lapseAt: meta.lapse_at }), ...(meta.severity === undefined ? {} : { severity: meta.severity as NonNullable<PairMessage['severity']> }), body };
 }
 
 export class FsMailbox {

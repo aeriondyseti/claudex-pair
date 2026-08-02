@@ -402,6 +402,14 @@ Usage:
   pair wait   -As <me> [-TimeoutSec 300] [-PollSec 2]      # 0 = check once
               [-Thread <id[,id,...]>]  # exit only when ALL these asks resolve
   pair ask    -From <me> (-Message '<text>' | -File <path>) # = send -Type ask
+              [-Async [-LapseSec 900]]  # async review request: turn stays with
+                               # you — KEEP WORKING. Verdict arrives as a review
+                               # message; unanswered past the window = recorded
+                               # lapsed-consent. HIGH/MED verdicts open gates
+                               # that block handoff/end until answered.
+              # Reviews: pair send -Type review -Severity HIGH|MED|LOW
+              #          -ReplyTo <ask id> — HIGH/MED open a gate; the driver
+              #          clears it with an answer tagged -ReplyTo <review id>.
               [-Batch <file>]  # n asks from '## ' sections, ONE txn, one wake;
                                # answer them all with: send -Type answer -Batch <file>
                                # (items map to your open asks oldest-first)

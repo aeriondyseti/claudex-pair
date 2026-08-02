@@ -420,6 +420,8 @@ export class Journal {
       // clean up entries a removed agent can no longer answer.
       if (event.kind === 'message-sent') applyMessageToAwaiting(this.awaiting_, { id: event.id, from: event.from, to: event.to, type: event.type, sent: event.at, ...(event.replyTo === undefined ? {} : { replyTo: event.replyTo }) });
       else if (event.kind === 'agent-left' || event.kind === 'agent-kicked') removeAgentFromAwaiting(this.awaiting_, event.agent);
+      // T4: lapsed-consent closes the ask debt — recorded, never silent.
+      else if (event.kind === 'review-lapsed') this.awaiting_.delete(event.id);
       // (peer bindings replay from record.privateBindings below, not events)
       else if (event.kind === 'session-ended') this.awaiting_.clear();
       if (event.kind === 'message-sent') {

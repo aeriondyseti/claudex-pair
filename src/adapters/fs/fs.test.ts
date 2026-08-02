@@ -72,6 +72,18 @@ describe('item 7: reply_to codec round-trip (codex blocker 2)', () => {
     expect('replyTo' in parsed).toBeFalse();
   });
 
+  test('T4: review/lapse_at/severity headers round-trip and stay absent on legacy raw', () => {
+    const request: PairMessage = { ...base, type: 'ask', reviewAsync: true, lapseAt: '2026-08-02 12:15:00' };
+    const rawReq = serializeMessage(request);
+    expect(rawReq).toContain('review: async');
+    expect(rawReq).toContain('lapse_at: 2026-08-02 12:15:00');
+    expect(parseMessage(rawReq)).toEqual(request);
+    const verdict: PairMessage = { ...base, type: 'review', severity: 'HIGH' };
+    expect(parseMessage(serializeMessage(verdict))).toEqual(verdict);
+    const legacy = parseMessage(serializeMessage(base));
+    expect('reviewAsync' in legacy || 'lapseAt' in legacy || 'severity' in legacy).toBeFalse();
+  });
+
   test('T2: reviewScope serializes as review_scope and round-trips; legacy raw parses with it absent', () => {
     const scoped: PairMessage = { ...base, reviewScope: 'main..HEAD -- src/a.ts,src/b.ts' };
     const raw = serializeMessage(scoped);

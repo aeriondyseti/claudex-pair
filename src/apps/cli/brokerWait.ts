@@ -63,6 +63,8 @@ export function renderWakeDigest(
     }
     const f = digest.findingsOpen;
     if (f && (f.high || f.med || f.low)) lines.push(`  unsettled findings: ${f.high} HIGH, ${f.med} MED, ${f.low} LOW`);
+    const g = digest.reviewGates;
+    if (g && (g.high || g.med)) lines.push(`  REVIEW GATES open: ${g.high} HIGH, ${g.med} MED — handoff/end are blocked until each is answered (-ReplyTo the review id)`);
   }
   try {
     const memory = statSync(join(root, '.pair', 'memory.md'));

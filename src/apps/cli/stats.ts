@@ -64,7 +64,7 @@ function render(s: SessionStats): void {
 
   const lat = latencySummary(s.asks.resolved);
   const latText = lat ? ` — latency avg ${dur(lat.meanSec)}, p50 ${dur(lat.p50Sec)}, p90 ${dur(lat.p90Sec)}` : '';
-  out(`Asks:      ${s.asks.asked} asked, ${s.asks.resolved.length} resolved${latText}`);
+  out(`Asks:      ${s.asks.asked} asked, ${s.asks.resolved.length} resolved${latText}${s.asks.lapsed ? `; ${s.asks.lapsed} lapsed to recorded consent (watch this rate)` : ''}`);
   for (const open of s.asks.open) out(`           OPEN: ${open.to} owes ${open.from} a reply to ${open.messageId}${open.ageSec !== null ? ` (${dur(open.ageSec)} old at journal head)` : ''}`);
 
   if (s.attention.raised) out(`Attention: ${s.attention.raised} raised, ${s.attention.cleared} cleared — ${dur(s.attention.blockedSec)} human-blocked${s.attention.openIds.length ? `; still open: ${s.attention.openIds.join(', ')}` : ''}`);

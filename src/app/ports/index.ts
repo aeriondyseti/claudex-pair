@@ -32,6 +32,10 @@ export type StoredMessage = {
     readonly sessionId?: string;
     /** T2: sender-declared review scope (`review_scope:` header line). */
     readonly reviewScope?: string;
+    /** T4: async review request marker + consent window + verdict severity. */
+    readonly reviewAsync?: true;
+    readonly lapseAt?: Timestamp;
+    readonly severity?: 'HIGH' | 'MED' | 'LOW';
   };
   readonly body: string;
   readonly raw: string;

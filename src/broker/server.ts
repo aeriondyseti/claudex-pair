@@ -601,7 +601,10 @@ export class BrokerCore {
 
   #deadlinePending(): boolean {
     const state = this.#journal.sessionState;
-    if (state?.topology !== 'peer' || !state.planning) return false;
+    if (!state) return false;
+    // T4: open async review requests carry lapse deadlines (any topology).
+    if (state.status === 'active' && Object.keys(state.reviewRequests ?? {}).length > 0) return true;
+    if (state.topology !== 'peer' || !state.planning) return false;
     return (state.planning.substate === 'admitting' || state.planning.substate === 'collecting') && state.planning.deadlineAt !== undefined;
   }
 
@@ -625,7 +628,44 @@ export class BrokerCore {
         await this.#raiseDeadlineExpired(state, state.planning, deadlineAt, now);
       }
     }
+    // T4: lapse expired async review requests — RECORDED consent, one txn
+    // per request. Re-read state after each commit (the previous lapse
+    // already mutated it).
+    for (;;) {
+      const current = this.#journal.sessionState;
+      if (!current || current.status !== 'active') break;
+      const now = this.#clock.now();
+      const expired = Object.entries(current.reviewRequests ?? {}).find(([, r]) => isDeadlinePast(now, r.lapseAt));
+      if (!expired) break;
+      await this.#lapseReviewRequest(current, expired[0], expired[1], now);
+    }
     this.#scheduleDeadlineWatch(); // keep polling every 1s while a deadline remains pending
+  }
+
+  /** T4: broker-authored lapsed-consent txn (pseudo-command like the
+   * deadline sweep — unforgeable from the wire). The review-lapsed event
+   * closes the request in state and the ask debt in the journal; both
+   * parties get a turn-keep notice with broker provenance. */
+  async #lapseReviewRequest(state: SessionState, id: string, request: { from: string; to: string; lapseAt: string }, at: string): Promise<void> {
+    const envelope: CommandEnvelope = {
+      command: { kind: 'review-lapse-sweep' } as unknown as CommandEnvelope['command'],
+      meta: { id: this.#ids.messageId(), at, principal: BROKER_SENDER },
+    };
+    const sessionId = state.sessionId === undefined ? {} : { sessionId: state.sessionId };
+    const events: Event[] = [
+      { kind: 'review-lapsed', id, at },
+      {
+        kind: 'message-sent', id: `${envelope.meta.id}-d0`, from: BROKER_SENDER, to: request.to,
+        type: 'info', turn: 'keep', at, provenance: 'broker', replyTo: id, ...sessionId,
+        body: `Review request ${id} lapsed unanswered at ${request.lapseAt} — LAPSED-CONSENT is recorded and the requester is unblocked. If you still have findings, send them as an ordinary review; nothing stops a late verdict.`,
+      },
+      {
+        kind: 'message-sent', id: `${envelope.meta.id}-d1`, from: BROKER_SENDER, to: request.from,
+        type: 'info', turn: 'keep', at, provenance: 'broker', replyTo: id, ...sessionId,
+        body: `Your async review request ${id} lapsed at ${request.lapseAt} with no verdict from ${request.to} — consent recorded. Watch the lapse rate in pair stats: a high rate means the window is too short or your partner is overloaded.`,
+      },
+    ];
+    await this.#commitDecided(`review-lapse-${id}`, 'broker-deadline-watch', envelope, state, events);
   }
 
   /** Broker-authored deadline-expired txn (pattern: agentAttach's bind-agent
@@ -1187,19 +1227,24 @@ export class BrokerCore {
         low: unsettled.filter((f) => f.severity === 'LOW').length,
       };
     }
+    const gates = Object.values(state.reviewGates ?? {});
+    const reviewGates = gates.length
+      ? { high: gates.filter((g) => g.severity === 'HIGH').length, med: gates.filter((g) => g.severity === 'MED').length }
+      : undefined;
     return {
       digest: {
         status: state.status,
         ...(state.topology === 'pair' ? { turn: state.turn, driver: state.driver } : { phase: state.phase, ...(state.planning ? { substate: state.planning.substate } : {}) }),
         awaiting,
         ...(findingsOpen === undefined ? {} : { findingsOpen }),
+        ...(reviewGates === undefined ? {} : { reviewGates }),
       },
     };
   }
 
   #toStored(delivery: OpenDelivery): StoredMessage {
     const m = delivery.message;
-    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }), ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }), ...(m.reviewScope === undefined ? {} : { reviewScope: m.reviewScope }) };
+    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }), ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }), ...(m.reviewScope === undefined ? {} : { reviewScope: m.reviewScope }), ...(m.reviewAsync === undefined ? {} : { reviewAsync: m.reviewAsync }), ...(m.lapseAt === undefined ? {} : { lapseAt: m.lapseAt }), ...(m.severity === undefined ? {} : { severity: m.severity }) };
     return {
       name: this.#codec.filename(pair),
       header: {
@@ -1211,6 +1256,9 @@ export class BrokerCore {
         ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
         ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }),
         ...(m.reviewScope === undefined ? {} : { reviewScope: m.reviewScope }),
+        ...(m.reviewAsync === undefined ? {} : { reviewAsync: m.reviewAsync }),
+        ...(m.lapseAt === undefined ? {} : { lapseAt: m.lapseAt }),
+        ...(m.severity === undefined ? {} : { severity: m.severity }),
       },
       body: m.body,
       raw: this.#codec.raw(pair),

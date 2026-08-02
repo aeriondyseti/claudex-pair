@@ -99,6 +99,8 @@ export type WakeDigest = {
   readonly awaiting: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
   /** Unsettled findings by severity (converging/blocked peer sessions). */
   readonly findingsOpen?: { readonly high: number; readonly med: number; readonly low: number };
+  /** T4: unresolved HIGH/MED review gates (block handoff/end). */
+  readonly reviewGates?: { readonly high: number; readonly med: number };
 };
 
 export type Delivery = {

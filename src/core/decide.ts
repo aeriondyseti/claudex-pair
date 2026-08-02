@@ -2,7 +2,7 @@ import type { CommandEnvelope, Command, CommandMeta, GrantScopeInput } from './c
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
 import { advanceRotation } from './rotation.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, REVIEW_SCOPE_MAX, BATCH_ITEMS_MAX, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, REVIEW_SCOPE_MAX, BATCH_ITEMS_MAX, REVIEW_LAPSE_DEFAULT_SEC, REVIEW_LAPSE_MIN_SEC, REVIEW_LAPSE_MAX_SEC, type Timestamp, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
 import { validatePlanTaskBlock } from './plan.ts';
 
 /**
@@ -1455,6 +1455,25 @@ function validateAgentMeta(meta: import('./types.ts').AgentMeta | undefined, age
 
 const PEER_GRANTS = 'Grants are pair-topology machinery; peer work authorization is claims (slice 3).';
 
+/** T4: one-line summary of open review gates, or undefined when clear. */
+function reviewGateSummary(s: SessionState): string | undefined {
+  const gates = Object.entries(s.reviewGates ?? {});
+  if (!gates.length) return undefined;
+  return gates.map(([id, g]) => `${id} (${g.severity} from ${g.from})`).join(', ');
+}
+
+/** T4: wall-clock timestamp arithmetic for the consent window. The frame is
+ * the session's local wall clock (same as every journal timestamp); UTC
+ * round-trip keeps the addition itself DST-proof. Malformed input returns
+ * itself — the broker stamps meta.at, so this is a belt-and-braces guard. */
+function addSeconds(at: Timestamp, sec: number): Timestamp {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(at);
+  if (!m) return at;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])) + sec * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
 /** The union-safe notice anchor: pair notices route to the driver, peer
  * notices to the initiator (the only standing identity a peer session has). */
 function sessionAnchor(s: SessionState): AgentId {
@@ -1521,6 +1540,25 @@ function decideSend(
       return err(new ProtocolError('invalid-review-scope', `Review scope must be a single printable line of at most ${REVIEW_SCOPE_MAX} characters (e.g. 'main..HEAD -- src/a.ts,src/b.ts').`));
     }
   }
+  // T4: async review requests ride asks and NEVER move the turn — the whole
+  // point is that the sender keeps working. The consent window is bounded.
+  if (command.reviewAsync) {
+    if (command.type !== 'ask') return err(new ProtocolError('invalid-review-request', 'An async review request is an ask (-Type ask / pair ask -Async).'));
+    if (command.turn === 'pass') return err(new ProtocolError('invalid-review-request', 'An async review request keeps the turn (you keep working) — drop -Async for a blocking review, or send with -Turn keep.'));
+  }
+  if (command.lapseSec !== undefined) {
+    if (!command.reviewAsync) return err(new ProtocolError('invalid-review-request', '-LapseSec applies only to an async review request (-Async).'));
+    if (!Number.isInteger(command.lapseSec) || command.lapseSec < REVIEW_LAPSE_MIN_SEC || command.lapseSec > REVIEW_LAPSE_MAX_SEC) {
+      return err(new ProtocolError('invalid-review-request', `-LapseSec must be an integer between ${REVIEW_LAPSE_MIN_SEC} and ${REVIEW_LAPSE_MAX_SEC} seconds.`));
+    }
+  }
+  // T4: severity is a review verdict's field; HIGH/MED open a gate.
+  if (command.severity !== undefined) {
+    if (command.type !== 'review') return err(new ProtocolError('invalid-review-request', '-Severity belongs on a review verdict (-Type review).'));
+    if (command.severity !== 'HIGH' && command.severity !== 'MED' && command.severity !== 'LOW') {
+      return err(new ProtocolError('invalid-review-request', '-Severity must be HIGH, MED, or LOW.'));
+    }
+  }
   if (command.turn === 'pass' && s.turn !== from) {
     return err(
       new ProtocolError(
@@ -1531,6 +1569,12 @@ function decideSend(
   }
   if (command.type === 'handoff' && s.driver !== from) {
     return err(new ProtocolError('handoff-not-driver', `Only the driver (${s.driver}) may send handoff (you are '${from}').`));
+  }
+  // T4 gate: role transitions and session end are the review gate points —
+  // unresolved HIGH/MED review verdicts must be answered (tagged) first.
+  if (command.type === 'handoff' || command.type === 'done') {
+    const gated = reviewGateSummary(s);
+    if (gated) return err(new ProtocolError('unresolved-review-findings', `Cannot ${command.type === 'handoff' ? 'hand off' : 'end'} with unresolved review findings: ${gated}. Answer each with: pair send -Type answer -ReplyTo <review id> -Message '<how it was addressed>'.`));
   }
   // ENHANCEMENTS 11 (F19): ending is driver authority — the raw done-send
   // completion path is not a loophole. Navigators propose via
@@ -1546,7 +1590,9 @@ function decideSend(
   const events: Event[] = [
     { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at,
       ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
-      ...(command.reviewScope === undefined ? {} : { reviewScope: command.reviewScope }) },
+      ...(command.reviewScope === undefined ? {} : { reviewScope: command.reviewScope }),
+      ...(command.reviewAsync ? { reviewAsync: true as const, lapseAt: addSeconds(envelope.meta.at, command.lapseSec ?? REVIEW_LAPSE_DEFAULT_SEC) } : {}),
+      ...(command.severity === undefined ? {} : { severity: command.severity }) },
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });
@@ -1625,6 +1671,9 @@ function decideEnd(
       ),
     );
   }
+  // T4 gate: same rule as done-send — no ending over unresolved findings.
+  const gated = reviewGateSummary(s);
+  if (gated) return err(new ProtocolError('unresolved-review-findings', `Cannot end with unresolved review findings: ${gated}. Answer each with: pair send -Type answer -ReplyTo <review id> -Message '<how it was addressed>'.`));
   const events: Event[] = [{ kind: 'session-ended', by, summary: command.summary, at: envelope.meta.at }];
   // Fan-out messages need DISTINCT ids: the mailbox file name is derived from
   // the id, and same-named files for different recipients later collide in

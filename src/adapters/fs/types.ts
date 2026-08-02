@@ -47,6 +47,12 @@ export type PairMessage = {
   sessionId?: string;
   /** T2: serialized as `review_scope:` (optional, backward compatible). */
   reviewScope?: string;
+  /** T4: serialized as `review: async` (optional, backward compatible). */
+  reviewAsync?: true;
+  /** T4: serialized as `lapse_at:` (optional, backward compatible). */
+  lapseAt?: Timestamp;
+  /** T4: serialized as `severity:` (optional, backward compatible). */
+  severity?: 'HIGH' | 'MED' | 'LOW';
   body: string;
 };
 

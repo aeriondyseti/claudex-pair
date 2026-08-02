@@ -92,6 +92,8 @@ export type ProtocolErrorCode =
   | 'invalid-reply-to'
   | 'invalid-review-scope'
   | 'invalid-batch'
+  | 'invalid-review-request'
+  | 'unresolved-review-findings'
   | 'session-paused'
   | 'session-already-paused'
   | 'session-not-paused';

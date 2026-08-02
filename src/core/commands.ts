@@ -32,7 +32,10 @@ export type Command =
   // reviewScope (T2, ENHANCEMENTS item 16): sender-declared git context for
   // review asks ('base..head [-- paths]'). Advisory metadata — messages stay
   // pointers; the broker never runs git.
-  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId; reviewScope?: string }
+  // T4: reviewAsync (ask only, turn keep) marks an async review request with
+  // a consent window (lapseSec, default 900); severity (review only) opens a
+  // review gate on HIGH/MED that blocks handoff/end until answered.
+  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId; reviewScope?: string; reviewAsync?: boolean; lapseSec?: number; severity?: 'HIGH' | 'MED' | 'LOW' }
   // T3 (THROUGHPUT-SPRINT): n questions (or answers), one wake — the batch
   // commits atomically in ONE txn. Per-item message ids are derived
   // `${meta.id}-b<i>` (broker reveal-manifest idiom), groupId = meta.id.

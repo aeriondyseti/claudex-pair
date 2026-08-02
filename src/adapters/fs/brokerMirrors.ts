@@ -430,8 +430,8 @@ export class FsMirrors implements MirrorStore {
 
 /** The fs adapter's message codec, injected into the broker core. */
 export const fsMessageCodec = {
-  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; reviewScope?: string; body: string }) => messageFilename(m as PairMessage),
-  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; reviewScope?: string; body: string }) => serializeMessage(m as PairMessage),
+  filename: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; reviewScope?: string; reviewAsync?: true; lapseAt?: string; severity?: string; body: string }) => messageFilename(m as PairMessage),
+  raw: (m: { id: string; from: string; to: string; type: string; turn: string; sent: string; replyTo?: string; sessionId?: string; reviewScope?: string; reviewAsync?: true; lapseAt?: string; severity?: string; body: string }) => serializeMessage(m as PairMessage),
 };
 
 function toDiskSession(state: SessionState): DiskSession {

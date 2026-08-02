@@ -103,9 +103,20 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
     case 'agent-kicked': {
       if (!state) return state;
       const agents = state.agents.filter((a) => a !== event.agent);
+      // T4 membership cleanup (mirror of the awaiting rule): a departed
+      // agent's review requests (either side) and its authored gates can no
+      // longer progress — drop them rather than deadlock handoff/end.
+      const reviewRequests = state.reviewRequests === undefined ? undefined
+        : Object.fromEntries(Object.entries(state.reviewRequests).filter(([, r]) => r.from !== event.agent && r.to !== event.agent));
+      const reviewGates = state.reviewGates === undefined ? undefined
+        : Object.fromEntries(Object.entries(state.reviewGates).filter(([, g]) => g.from !== event.agent));
+      const cleaned = {
+        ...(reviewRequests === undefined ? {} : { reviewRequests }),
+        ...(reviewGates === undefined ? {} : { reviewGates }),
+      };
       // Membership events mutate the LIVE projection only; the paired
       // registry-updated event carries the canonical registry transition.
-      if (state.topology !== 'peer') return { ...state, agents };
+      if (state.topology !== 'peer') return { ...state, agents, ...cleaned };
       // Round 2 #6 churn rule: a departure during ADMITTING leaves both
       // the admitted set and the current completion set; a KICK also
       // revokes durable authorization (re-entry needs a fresh user admit),
@@ -119,14 +130,58 @@ export function evolve(state: SessionState | undefined, event: Event): SessionSt
             authorizedExpected: state.planning.authorizedExpected.filter((a) => a !== event.agent),
           }
         : state.planning;
-      return { ...state, agents, authorized, ...(planning === undefined ? {} : { planning }) };
+      return { ...state, agents, authorized, ...cleaned, ...(planning === undefined ? {} : { planning }) };
     }
     case 'agent-joined':
       return state && { ...state, agents: [...state.agents, event.agent] };
     case 'registry-updated':
       return state && { ...state, registry: applyRegistryUpdate(state.registry, event) };
-    case 'message-sent':
-      return state; // delivery is the Mailbox port's concern, not session state
+    case 'message-sent': {
+      // Delivery is the Mailbox port's concern; T4 review lifecycle is the
+      // ONE session-state fact a message carries.
+      if (!state) return state;
+      let next: typeof state = state;
+      // An async review request opens a state-resident request (the broker's
+      // lapse watcher reads these — deadlines derive from state, never from
+      // an in-memory schedule).
+      if (event.reviewAsync && event.lapseAt !== undefined) {
+        next = { ...next, reviewRequests: { ...(next.reviewRequests ?? {}), [event.id]: { from: event.from, to: event.to, at: event.at, lapseAt: event.lapseAt } } };
+      }
+      // A review/answer closes the request it targets; an UNTAGGED review
+      // from the debtor settles the OLDEST open request on the reverse
+      // endpoints (mirror of the awaiting compat rule — one convention).
+      if (event.type === 'review' || event.type === 'answer') {
+        const requests = next.reviewRequests ?? {};
+        let closed: string | undefined;
+        if (event.replyTo !== undefined && requests[event.replyTo] && requests[event.replyTo]!.to === event.from && requests[event.replyTo]!.from === event.to) {
+          closed = event.replyTo;
+        } else if (event.replyTo === undefined && event.type === 'review') {
+          closed = Object.entries(requests)
+            .filter(([, r]) => r.to === event.from && r.from === event.to)
+            .sort(([a], [b]) => a.localeCompare(b))[0]?.[0];
+        }
+        if (closed !== undefined) {
+          const { [closed]: _dropped, ...rest } = next.reviewRequests!;
+          next = { ...next, reviewRequests: rest };
+        }
+      }
+      // A HIGH/MED review verdict opens a gate; the driver's TAGGED answer
+      // resolves it (trust-based, like the rest of the protocol conduct).
+      if (event.type === 'review' && (event.severity === 'HIGH' || event.severity === 'MED')) {
+        next = { ...next, reviewGates: { ...(next.reviewGates ?? {}), [event.id]: { severity: event.severity, from: event.from, at: event.at } } };
+      }
+      if (event.type === 'answer' && event.replyTo !== undefined && next.reviewGates?.[event.replyTo]) {
+        const { [event.replyTo]: _resolved, ...rest } = next.reviewGates;
+        next = { ...next, reviewGates: rest };
+      }
+      return next;
+    }
+    case 'review-lapsed': {
+      // T4: recorded lapsed-consent — the request closes; nothing else moves.
+      if (!state?.reviewRequests?.[event.id]) return state;
+      const { [event.id]: _lapsed, ...rest } = state.reviewRequests;
+      return { ...state, reviewRequests: rest };
+    }
     case 'agent-admitted':
       // Peer 1A: admission makes the authorized identity a MEMBER.
       return state && state.topology === 'peer'

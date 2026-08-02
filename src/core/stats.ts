@@ -45,6 +45,10 @@ export type SessionStats = {
   turns: { passes: number; byAgent: Record<AgentId, HoldStats> };
   asks: {
     asked: number;
+    /** T4: async review requests that resolved as recorded lapsed-consent.
+     * A high rate means the consent window is too short or the reviewer is
+     * overloaded — the safety signal for the async-review default. */
+    lapsed: number;
     resolved: ResolvedAsk[];
     /** Asks still unresolved at the journal head, with age relative to the
      * last record (not wall-clock now — the fold is pure). */
@@ -89,7 +93,7 @@ export function foldStats(records: readonly StatsRecord[]): SessionStats {
     ended: false,
     messages: { total: 0, byType: {}, byFrom: {} },
     turns: { passes: 0, byAgent: {} },
-    asks: { asked: 0, resolved: [], open: [] },
+    asks: { asked: 0, lapsed: 0, resolved: [], open: [] },
     attention: { raised: 0, cleared: 0, blockedSec: 0, openIds: [] },
     planning: { barrierOpenSec: null, rounds: 0, findingsFiled: 0, findingsSettled: 0, ballots: { called: 0, passed: 0, rejected: 0, voided: 0 } },
   };
@@ -167,6 +171,7 @@ export function foldStats(records: readonly StatsRecord[]): SessionStats {
           holderSince = holder === null ? null : event.at;
           break;
         }
+        case 'review-lapsed': { awaiting.delete(event.id); stats.asks.lapsed += 1; break; }
         case 'attention-raised': { stats.attention.raised += 1; attentionOpen.set(event.id, event.at); break; }
         case 'attention-cleared': {
           stats.attention.cleared += 1;

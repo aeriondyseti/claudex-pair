@@ -25,6 +25,10 @@ export type MirrorMessage = {
   sessionId?: string;
   /** T2: serialized as `review_scope:` (optional, backward compatible). */
   reviewScope?: string;
+  /** T4: serialized as `review: async` / `lapse_at:` / `severity:`. */
+  reviewAsync?: true;
+  lapseAt?: string;
+  severity?: 'HIGH' | 'MED' | 'LOW';
   body: string;
 };
 

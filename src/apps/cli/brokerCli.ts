@@ -83,7 +83,10 @@ export async function runBrokerCli(
     if (command === 'send') {
       const from = required(flags, 'from', 'send requires -From <you> — never impersonate a partner').toLowerCase();
       const type = (str(flags, 'type') ?? 'info').toLowerCase() as MessageType;
-      const turn = (str(flags, 'turn') ?? 'pass').toLowerCase() as TurnMode;
+      // T4: an async review request defaults to keeping the turn — that is
+      // its entire point (an explicit -Turn pass is rejected by decide).
+      const reviewAsync = has(flags, 'async');
+      const turn = (str(flags, 'turn') ?? (reviewAsync ? 'keep' : 'pass')).toLowerCase() as TurnMode;
       let to = str(flags, 'to')?.toLowerCase();
       if (!to) { const status = await gateway.status(); to = resolveRecipient(status.session, from); if (!to) throw new Error(`Ambiguous recipient: specify -To explicitly`); }
       // T3: -Batch <file> — n items, ONE txn, one wake per side.
@@ -121,10 +124,22 @@ export async function runBrokerCli(
         throw new Error('Declare review scope with BOTH -Base <ref> and -Head <ref> (optionally -Paths a,b,c).');
       }
       const reviewScope = base !== undefined ? `${base}..${head}${paths !== undefined ? ` -- ${paths}` : ''}` : undefined;
-      const r = await execute(gateway, from, { kind: 'send-message', to, type, turn, body: await bodyFrom(flags), ...(replyTo ? { replyTo } : {}), ...(reviewScope === undefined ? {} : { reviewScope }) });
+      const lapseSecRaw = str(flags, 'lapsesec');
+      const severityRaw = str(flags, 'severity');
+      const r = await execute(gateway, from, {
+        kind: 'send-message', to, type, turn, body: await bodyFrom(flags),
+        ...(replyTo ? { replyTo } : {}),
+        ...(reviewScope === undefined ? {} : { reviewScope }),
+        ...(reviewAsync ? { reviewAsync: true } : {}),
+        ...(lapseSecRaw === undefined ? {} : { lapseSec: Number(lapseSecRaw) }),
+        ...(severityRaw === undefined ? {} : { severity: severityRaw.toUpperCase() as 'HIGH' | 'MED' | 'LOW' }),
+      });
       const sent = r.events.find((e) => e.kind === 'message-sent' && e.from === from);
       const sentTo = sent?.kind === 'message-sent' ? sent.to : to;
       out(`Sent ${type} -> ${sentTo} (${r.receipt.messageFiles[0] ?? ''}). Turn: ${r.session.turn}. Driver: ${r.session.driver}. Status: ${r.session.status}.`);
+      if (reviewAsync && sent?.kind === 'message-sent') {
+        out(`ASYNC REVIEW requested (lapses ${sent.lapseAt ?? '?'}). KEEP WORKING — the verdict arrives as a review message; HIGH/MED findings gate your next handoff/end. No verdict by the lapse = recorded consent.`);
+      }
       const fuse = turn === 'pass' && type !== 'done' && !has(flags, 'nowait') && r.session.status === 'active';
       if (!fuse) { if (turn === 'pass' && r.session.status === 'active') out(`You handed over the turn. Now block on: pair wait -As ${from}`); return 0; }
       out('You handed over the turn. Waiting for the reply (-NoWait skips the fused wait).');
@@ -453,7 +468,11 @@ function renderStatus(s: StatusDto) { out(`Task:      ${s.session.task}`);
     else out(`Phase:     ${s.session.phase}${planning ? ` (${planning.substate})` : ''}`);
     if (s.session.plan) out(`Plan:      FROZEN at revision ${s.session.plan.revision} (hash ${s.session.plan.hash}) — ${s.session.plan.taskBlock.tasks.length} tasks`);
     for (const item of s.session.attention) out(`ATTENTION [${item.id}] (${item.category}) ${item.detail} — clear with /clear-attention ${item.id} (${item.at})`);
-  } out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); if (s.session.topology !== 'peer') out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
+  }
+  // T4: open review pipeline facts — requests in flight, gates blocking.
+  for (const [id, r] of Object.entries(s.session.reviewRequests ?? {})) out(`Review:    ${r.to} owes ${r.from} a verdict on ${id} (lapses ${r.lapseAt} -> recorded consent)`);
+  for (const [id, g] of Object.entries(s.session.reviewGates ?? {})) out(`GATE:      ${g.severity} finding ${id} from ${g.from} is unresolved — handoff/end blocked until answered (-ReplyTo ${id})`);
+  out(`Status:    ${s.session.status}   (started ${s.session.started})`); out(`Agents:    ${s.session.agents.join(', ')}`); if (s.session.topology !== 'peer') out(`Driver:    ${s.session.driver}   Navigators: ${s.navigators.join(', ')}   Turn: ${s.session.turn}`); for (const agent of s.session.agents) { const pending = s.pending[agent] ?? []; out(`Inbox ${agent}: ${pending.length} pending${pending.length ? ` — ${pending.map((p) => p.name).join(', ')}` : ''}`); }
   for (const a of s.awaiting ?? []) out(`Awaiting: ${a.to} owes ${a.from} a reply to ${a.messageId} (asked ${a.sentAt})`); }
 /** 1B-c: one-line finding tally for the converging/blocked status panes. */
 function renderFindingsSummary(findings: Readonly<Record<string, import('@core/types.ts').Finding>>): string {

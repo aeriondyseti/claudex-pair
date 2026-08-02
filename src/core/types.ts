@@ -163,6 +163,17 @@ export const REVIEW_SCOPE_MAX = 256;
  * problem). */
 export const BATCH_ITEMS_MAX = 16;
 
+/** T4 (THROUGHPUT-SPRINT): pipelined async review. An async review request
+ * (`ask` + reviewAsync) keeps the driver working; unanswered past lapseAt it
+ * resolves as RECORDED lapsed-consent (broker deadline watcher — never a
+ * silent drop). A HIGH/MED review verdict opens a REVIEW GATE the driver
+ * must answer (tagged answer) before handoff/end. */
+export type ReviewRequest = { readonly from: AgentId; readonly to: AgentId; readonly at: Timestamp; readonly lapseAt: Timestamp };
+export type ReviewGate = { readonly severity: 'HIGH' | 'MED'; readonly from: AgentId; readonly at: Timestamp };
+export const REVIEW_LAPSE_DEFAULT_SEC = 900;
+export const REVIEW_LAPSE_MIN_SEC = 1;
+export const REVIEW_LAPSE_MAX_SEC = 86_400;
+
 /** M1: bounded practical roster limit — registry-defined, fail-closed at
  * init AND join. Raising it is a deliberate registry change, not implied
  * unbounded scaling (ENHANCEMENTS M1). */
@@ -345,6 +356,12 @@ type SessionBase = {
    * the user-channel-registered event — a hash is safe in agent-readable
    * mirrors (auth needs the preimage); slice 3 has no reset path. */
   readonly userChannelTokenHash?: string;
+  /** T4: open async review requests (keyed by the ask's message id).
+   * Absent on pre-T4 state. */
+  readonly reviewRequests?: Readonly<Record<MessageId, ReviewRequest>>;
+  /** T4: unresolved HIGH/MED review verdicts (keyed by the review's message
+   * id) — decide refuses handoff/end while any exist. */
+  readonly reviewGates?: Readonly<Record<MessageId, ReviewGate>>;
 };
 
 /** The classic driver/navigator session — byte-identical to pre-peer. */
