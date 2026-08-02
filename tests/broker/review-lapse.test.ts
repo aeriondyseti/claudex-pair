@@ -45,7 +45,7 @@ describe('T4 review lapse sweep', () => {
     expect(core.journal.awaiting().map((a) => a.messageId)).toEqual([askId]);
     expect(Object.keys(core.journal.sessionState?.reviewRequests ?? {})).toEqual([askId]);
 
-    await sleep(1_600); // let the 1s window expire (second-granularity clock)
+    await sleep(2_500); // let the 1s window expire (second-granularity clock)
     await core.runDeadlineSweepOnceForTest();
 
     expect(core.journal.awaiting()).toEqual([]); // debt cleared, RECORDED
@@ -76,7 +76,7 @@ describe('T4 review lapse sweep', () => {
     expect(Object.keys(core.journal.sessionState?.reviewRequests ?? {})).toEqual([]);
     expect(Object.keys(core.journal.sessionState?.reviewGates ?? {})).toHaveLength(1);
 
-    await sleep(1_600);
+    await sleep(2_500);
     const head = core.journal.headSeq;
     await core.runDeadlineSweepOnceForTest();
     expect(core.journal.headSeq).toBe(head); // nothing lapsed

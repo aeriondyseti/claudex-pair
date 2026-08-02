@@ -1,5 +1,13 @@
 # Throughput sprint — measure, cut wake latency, break the review serialization
 
+> **Status: SHIPPED 2026-08-02** (T1–T5, five commits). Deviations from this
+> design: none material — the wait drain (T3) was added beyond spec so a
+> batch costs the recipient one wake; T4 review findings use a lightweight
+> state-resident request/gate pair (`reviewRequests`/`reviewGates` on
+> SessionBase) instead of extending the planning finding machine — one
+> lifecycle rule, no cross-phase coupling; the planning-finding reuse
+> remains open for the peer implementation phase (slice 4+).
+
 Sprint goal: increase the speed of cooperative development by (A) making the
 protocol's time costs measurable, (B) cutting per-exchange latency and
 re-orientation cost, and (C) letting the driver keep working while reviews are

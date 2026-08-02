@@ -63,11 +63,50 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File D:\Development\claudex\bin\pair.ps
   as do timeout hints; use them verbatim.
 - `pair log -Thread <id>` prints an ask's whole reply chain.
 
+## Throughput features (use these — they are why pairing is fast)
+
+- **Wake digest.** Every incoming message prints an orientation block under
+  it: whose turn, what you owe / are owed (with ages), open review gates, the
+  sender's declared review scope, and a memory.md pointer. TRUST IT — do not
+  re-run `status`/`log` or re-read an unchanged memory.md on every wake.
+- **Declare review scope.** When asking for review, declare the diff:
+  `-Base <ref> -Head <ref> [-Paths a,b,c]`. The reviewer reviews exactly
+  that — no diff archaeology on the other side.
+- **Batch asks.** Several questions ready? Put each under a `## ` heading in
+  a file and run `pair ask -From codex -Batch <file>` — n asks commit as ONE
+  txn and cost each side one wake. Answer a whole batch with
+  `pair send -From codex -Type answer -Batch <file>` (items map to your open
+  asks oldest-first; the count must match). A fused batch ask exits only
+  when ALL its items are answered.
+- **Async review (pipelining — the default for routine increments).** As
+  driver, request review WITHOUT stopping:
+  `pair ask -From codex -Async [-LapseSec 900] -Base <ref> -Head <ref>` —
+  the turn STAYS WITH YOU; keep working on the next increment. Rules:
+  - The verdict arrives as a `review` message. HIGH/MED severities open
+    GATES: you cannot `handoff` or `end` until you answer each gated review
+    (`-Type answer -ReplyTo <review id>`) saying how you addressed it. LOW
+    is advisory and never blocks.
+  - No verdict inside the window = RECORDED lapsed-consent (both sides are
+    noticed). A late review is still welcome as an ordinary message.
+  - Use the classic blocking fused ask instead when the change is risky
+    enough that you should not build on top of it unreviewed.
+  - As navigator receiving an async request: review promptly (the lapse time
+    is in the header), reply `-Type review -ReplyTo <ask id>
+    -Severity HIGH|MED|LOW`.
+- **Standing work while waiting.** A blocked wait is not idle time. While
+  waiting, do read-only prep: run the test suite, pre-read the files in the
+  declared review scope, draft the review checklist, re-read memory.md only
+  if the digest says it changed. Never edit unless you are driver holding
+  the turn or working an accepted grant.
+- **`pair stats`** prints session throughput (turn holds, ask latency, lapse
+  rate, human-blocked time) — cite it when pacing feels wrong.
+
 ## Etiquette (deltas from normal work)
 
 - Messages are pointers: send `path:line` references and summaries, never
   file contents — claude reads the same repo directly.
-- One decision per `ask`. `handoff` makes the RECIPIENT the driver.
+- One decision per item — but batch related questions (`-Batch`) instead of
+  serializing them one ask per turn. `handoff` makes the RECIPIENT the driver.
 - Your user outranks claude; if they conflict, follow the user and tell claude.
 - Disagreed twice on the same point? Stop; summarize both positions to the
   user and let them decide.

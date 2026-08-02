@@ -101,6 +101,43 @@ turn.
 - **Thread log.** `pair log -Thread <id>` prints the root and its
   transitive reply chain, computed over the full archive.
 
+## Throughput features (T1–T4, docs/THROUGHPUT-SPRINT.md; broker mode only)
+
+- **`pair stats [-Json]`** — WAL-derived session metrics: per-agent turn-hold
+  durations, ask→resolution latency, review-lapse rate, human-blocked time,
+  planning costs, journal coverage. Read-only; needs no running broker.
+- **Wake digest.** Every delivery renders an orientation block beneath the
+  message: session status, turn/driver (or phase/substate), the recipient's
+  open asks with ages, unsettled finding counts, open review gates, the
+  sender's declared review scope, and a local memory.md pointer. Advisory by
+  contract — correctness never depends on it; a pre-T2 broker simply omits it.
+- **Review scope** (item 16): `send`/`ask` accept `-Base <ref> -Head <ref>
+  [-Paths a,b,c]`, carried as one validated `review_scope:` header line.
+  Sender-declared, never broker-computed — the broker does not run git.
+- **Batch asks** (T3): `pair ask -Batch <file>` splits the file on `## `
+  headings into 2..16 asks committed atomically in ONE txn (derived ids
+  `<envelope>-b<i>`, shared `groupId`; only the last item moves the turn).
+  The fused batch ask arms ALL item threads and exits when the awaiting-set
+  clears every one; `-Thread` on a standalone wait accepts a comma list.
+  Batch answers (`send -Type answer -Batch <file>`) map items to the
+  sender's open debts oldest-first — a count mismatch is a hard error. An
+  untargeted wait DRAINS all already-enqueued deliveries before exiting, so
+  a batch costs each side one wake.
+- **Async review with a consent window** (T4): `pair ask -Async
+  [-LapseSec 900]` marks a review request that KEEPS the turn — the
+  requester works on while the verdict is pending (review pipelining).
+  A verdict is `send -Type review -ReplyTo <ask id> -Severity HIGH|MED|LOW`.
+  HIGH/MED verdicts open **review gates**: `handoff` and `end` (verb and
+  done-send) are refused (`unresolved-review-findings`) until the driver
+  answers each gated review with a tagged `answer`. LOW never blocks. A
+  request unanswered past its window resolves as a broker-authored
+  `review-lapsed` txn — **recorded lapsed-consent** with notices to both
+  parties, never a silent drop; `pair stats` reports the lapse rate (a high
+  rate means the window is too short or the reviewer is overloaded). A
+  departed agent's requests and gates drop with it (mirror of the awaiting
+  membership rule). Blocking review remains available (the classic fused
+  ask) and stays the right call for risky changes.
+
 ## Work grants (grants-lite)
 
 When the agents **agree in conversation** that a set of tasks is parallelizable
@@ -240,7 +277,16 @@ prerequisite 3 only PARTIALLY until it lands.
 - **Messages are pointers, not payloads.** Both agents have the same repo on
   disk. Send file paths, `path:line` references, and short summaries — never
   paste whole files. The receiver reads the code directly.
-- **One decision per `ask`.** Compound questions get half-answered.
+- **One decision per item.** Compound questions get half-answered — but do
+  not serialize related questions one ask per turn either: batch them
+  (`-Batch`, one item per decision) so they cost one wake.
+- **Waiting is prep time.** A blocked wait does read-only standing work: run
+  the test suite, pre-read the declared review scope, draft the review
+  checklist. Editing still requires driver+turn or an accepted grant.
+- **Pipeline routine reviews.** Default to `-Async` review requests and keep
+  working; reserve blocking fused asks for changes too risky to build on
+  unreviewed. Answer every HIGH/MED verdict before handing off or ending —
+  the broker enforces it.
 - **Navigator never edits.** Not code, not tests, not docs. Change requests
   travel as messages. (Exception: after a `handoff`, roles have swapped.)
 - **Memory discipline.** Before passing the turn, record durable decisions in
