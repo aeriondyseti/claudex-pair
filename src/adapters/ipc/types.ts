@@ -30,7 +30,7 @@ export type ClientFrame = ExecuteFrame | QueryFrame | SubscribeFrame | AckFrame 
 
 export type ErrorFrame = { reqId?: string; ok: false; error: { code: string; message: string } };
 export type ResponseFrame = { reqId: string; ok: true; seq?: number; events?: unknown[]; data?: unknown } | ErrorFrame;
-export type DeliveryFrame = { kind: 'delivery'; deliverySeq: number; deliveryId: string; message: unknown };
+export type DeliveryFrame = { kind: 'delivery'; deliverySeq: number; deliveryId: string; message: unknown; digest?: unknown };
 /**
  * Observer pushes. `activity` mirrors one committed journal txn (seq is the
  * commit seq — a DIFFERENT sequence space from deliverySeq); `presence` is

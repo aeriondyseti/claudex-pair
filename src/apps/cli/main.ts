@@ -389,6 +389,7 @@ Usage:
   pair init   -Task '<goal>' [-Agents 'claude,codex[,agy,...]'] [-Driver <agent>] [-Root <repo>]
   pair send   -From <me> [-To <agent>] [-Type ask|answer|handoff|review|info|propose-end]
               (-Message '<text>' | -File <path>) [-Turn pass|keep]
+              [-Base <ref> -Head <ref> [-Paths a,b,c]]  # declare review scope
               [-NoWait] [-TimeoutSec N] [-PollSec 2]
               # -To required when more than one possible recipient
               # A send that passes the turn WAITS for the reply in the same

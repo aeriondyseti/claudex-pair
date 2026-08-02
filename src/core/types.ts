@@ -153,6 +153,11 @@ export function findControlCharacter(text: string): number {
   return -1;
 }
 
+/** T2 (THROUGHPUT-SPRINT): sender-declared review scope — a single header
+ * line ('base..head [-- paths]') carried on send. Bounded and control-char
+ * free (INCLUDING tab/newline: it serializes as one `review_scope:` line). */
+export const REVIEW_SCOPE_MAX = 256;
+
 /** M1: bounded practical roster limit — registry-defined, fail-closed at
  * init AND join. Raising it is a deliberate registry change, not implied
  * unbounded scaling (ENHANCEMENTS M1). */

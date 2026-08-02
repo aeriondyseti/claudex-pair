@@ -30,6 +30,8 @@ export type StoredMessage = {
     readonly replyTo?: MessageId;
     /** M1: the session this message belongs to (`session:` header line). */
     readonly sessionId?: string;
+    /** T2: sender-declared review scope (`review_scope:` header line). */
+    readonly reviewScope?: string;
   };
   readonly body: string;
   readonly raw: string;

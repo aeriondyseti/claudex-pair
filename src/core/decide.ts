@@ -2,7 +2,7 @@ import type { CommandEnvelope, Command, CommandMeta, GrantScopeInput } from './c
 import type { Event, UserActionKind } from './events.ts';
 import { ProtocolError } from './errors.ts';
 import { advanceRotation } from './rotation.ts';
-import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
+import { DISPLAY_PATTERN, PROPOSAL_MAX_BYTES, PROPOSALS_TOTAL_MAX_BYTES, DRAFT_MAX_BYTES, DRAFT_REVISIONS_MAX, FINDING_TEXT_MAX, FINDINGS_MAX, FINDINGS_TEXT_TOTAL_MAX, REASONS_MAX, ROUND_CAP, BROKER_SENDER, findControlCharacter, MAX_AGENTS, REVIEW_SCOPE_MAX, SESSION_ID_PATTERN, type AgentId, MESSAGE_ID_PATTERN, MESSAGE_TYPES, AGENT_NAME_PATTERN, USER_IDENTITY, err, ok, type Finding, type Grant, type GrantScope, type Registry, type Result, type SessionState } from './types.ts';
 import { validatePlanTaskBlock } from './plan.ts';
 
 /**
@@ -1510,6 +1510,15 @@ function decideSend(
   if (command.replyTo !== undefined && !MESSAGE_ID_PATTERN.test(command.replyTo)) {
     return err(new ProtocolError('invalid-reply-to', `-ReplyTo must be a plain message id (letters, digits, . _ : -; max 64 chars).`));
   }
+  // T2: reviewScope serializes as ONE `review_scope:` header line — reject
+  // anything that could break the line discipline (any control char, incl.
+  // tab/CR/LF), plus empty/oversized values. Fail-closed like replyTo.
+  if (command.reviewScope !== undefined) {
+    const scope = command.reviewScope;
+    if (scope.length === 0 || scope.length > REVIEW_SCOPE_MAX || [...scope].some((c) => { const n = c.charCodeAt(0); return n < 0x20 || (n >= 0x7f && n <= 0x9f); })) {
+      return err(new ProtocolError('invalid-review-scope', `Review scope must be a single printable line of at most ${REVIEW_SCOPE_MAX} characters (e.g. 'main..HEAD -- src/a.ts,src/b.ts').`));
+    }
+  }
   if (command.turn === 'pass' && s.turn !== from) {
     return err(
       new ProtocolError(
@@ -1534,7 +1543,8 @@ function decideSend(
   }
   const events: Event[] = [
     { kind: 'message-sent', id: envelope.meta.id, from, to: command.to, type: command.type, turn: command.turn, body: command.body, at: envelope.meta.at,
-      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }) },
+      ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
+      ...(command.reviewScope === undefined ? {} : { reviewScope: command.reviewScope }) },
   ];
   if (command.turn === 'pass') events.push({ kind: 'turn-passed', to: command.to });
   if (command.type === 'handoff') events.push({ kind: 'driver-changed', driver: command.to });

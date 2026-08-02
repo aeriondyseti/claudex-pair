@@ -344,7 +344,7 @@ export class BrokerGateway implements ProtocolGateway, BrokerControl {
   }
 }
 
-function toDelivery(frame: DeliveryFrame): Delivery { return { deliverySeq: frame.deliverySeq, deliveryId: frame.deliveryId, message: frame.message as StoredMessage }; }
+function toDelivery(frame: DeliveryFrame): Delivery { return { deliverySeq: frame.deliverySeq, deliveryId: frame.deliveryId, message: frame.message as StoredMessage, ...(frame.digest === undefined ? {} : { digest: frame.digest as NonNullable<Delivery['digest']> }) }; }
 function expectOk(response: ResponseFrame): void { if (!response.ok) throw new BrokerWireError(response.error.code, response.error.message); }
 
 class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {

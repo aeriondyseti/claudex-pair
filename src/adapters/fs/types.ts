@@ -45,6 +45,8 @@ export type PairMessage = {
   replyTo?: MessageId;
   /** M1: serialized as `session_id:` (optional, backward compatible). */
   sessionId?: string;
+  /** T2: serialized as `review_scope:` (optional, backward compatible). */
+  reviewScope?: string;
   body: string;
 };
 

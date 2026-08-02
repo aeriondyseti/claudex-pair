@@ -6,7 +6,7 @@ import { MAX_AGENTS, type AgentId, type MessageType, type TurnMode } from '@core
 import type { ExecuteOutcome, StatusDto } from '@app/ports/gateway.ts';
 import { systemClock, systemIds } from '@adapters/clock/index.ts';
 import { BrokerGateway, BrokerWireError } from './brokerGateway.ts';
-import { nextDelivery, printDeliveryThenAck } from './brokerWait.ts';
+import { nextDelivery, printDeliveryThenAck, renderWakeDigest } from './brokerWait.ts';
 import { has, num, str } from './args.ts';
 import { loadOrCreateAgentCredential } from './credentialStore.ts';
 
@@ -86,7 +86,14 @@ export async function runBrokerCli(
       let to = str(flags, 'to')?.toLowerCase();
       if (!to) { const status = await gateway.status(); to = resolveRecipient(status.session, from); if (!to) throw new Error(`Ambiguous recipient: specify -To explicitly`); }
       const replyTo = str(flags, 'replyto');
-      const r = await execute(gateway, from, { kind: 'send-message', to, type, turn, body: await bodyFrom(flags), ...(replyTo ? { replyTo } : {}) });
+      // T2 (item 16): sender-declared review scope — base/head refs plus an
+      // optional path list, carried as one review_scope header line.
+      const base = str(flags, 'base'); const head = str(flags, 'head'); const paths = str(flags, 'paths');
+      if ((base === undefined) !== (head === undefined) || (paths !== undefined && base === undefined)) {
+        throw new Error('Declare review scope with BOTH -Base <ref> and -Head <ref> (optionally -Paths a,b,c).');
+      }
+      const reviewScope = base !== undefined ? `${base}..${head}${paths !== undefined ? ` -- ${paths}` : ''}` : undefined;
+      const r = await execute(gateway, from, { kind: 'send-message', to, type, turn, body: await bodyFrom(flags), ...(replyTo ? { replyTo } : {}), ...(reviewScope === undefined ? {} : { reviewScope }) });
       const sent = r.events.find((e) => e.kind === 'message-sent' && e.from === from);
       const sentTo = sent?.kind === 'message-sent' ? sent.to : to;
       out(`Sent ${type} -> ${sentTo} (${r.receipt.messageFiles[0] ?? ''}). Turn: ${r.session.turn}. Driver: ${r.session.driver}. Status: ${r.session.status}.`);
@@ -97,7 +104,7 @@ export async function runBrokerCli(
       // Without this the first unrelated delivery ended the fused ask, and a
       // timeout re-arm lost the thread entirely (codex blocker 1).
       const fusedThread = type === 'ask' && sent?.kind === 'message-sent' ? sent.id : undefined;
-      return await waitBroker(gateway, from, num(flags, 'timeoutsec', Infinity), true, fusedThread);
+      return await waitBroker(gateway, root, from, num(flags, 'timeoutsec', Infinity), true, fusedThread);
     }
     if (command === 'attach') {
       // Peer 1A: bind THIS connection as the agent using its own stored
@@ -255,7 +262,7 @@ export async function runBrokerCli(
       renderArtifacts(await gateway.planningArtifacts());
       return 0;
     }
-    if (command === 'wait') return await waitBroker(gateway, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
+    if (command === 'wait') return await waitBroker(gateway, root, required(flags, 'as', 'wait requires -As <your own agent name>').toLowerCase(), num(flags, 'timeoutsec', 300), false, str(flags, 'thread'));
     if (command === 'status') { renderStatus(await gateway.status()); return 0; }
     if (command === 'log') {
       const thread = str(flags, 'thread');
@@ -315,12 +322,12 @@ export async function runBrokerCli(
 
 async function execute(gateway: CliGateway, as: AgentId, command: Command, credential?: string): Promise<ExecuteOutcome> { return gateway.execute({ as, command, identity: { clientId: gateway.clientId, reqId: randomUUID() }, ...(credential === undefined ? {} : { credential }) }); }
 
-async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
+async function waitBroker(gateway: CliGateway, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
   const status = await gateway.status();
   if (!status.session.agents.includes(as)) throw new Error(`'${as}' is not a participant in this session`);
   const subscription = await gateway.subscribe(as, 0);
   try {
-    return await waitOnSubscription(gateway, subscription, as, timeoutSec, fused, threadId);
+    return await waitOnSubscription(gateway, subscription, root, as, timeoutSec, fused, threadId);
   } catch (error) {
     // Slice 4 (design REV 6): a user kick terminates this wait — terminal
     // wording, exit 0, NO re-arm hint, never reconnect churn.
@@ -338,7 +345,7 @@ async function waitBroker(gateway: CliGateway, as: AgentId, timeoutSec: number, 
   } finally { await subscription.close(); }
 }
 
-async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
+async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<ReturnType<CliGateway['subscribe']>>, root: string, as: AgentId, timeoutSec: number, fused: boolean, threadId?: string): Promise<number> {
   // Item 7: -Thread <messageId> — every delivery still prints and acks
   // normally (at-least-once consumption is unchanged); the wait simply
   // EXITS only when the reply to that specific message arrives.
@@ -348,6 +355,7 @@ async function waitOnSubscription(gateway: CliGateway, subscription: Awaited<Ret
     const delivery = await nextDelivery(subscription, timeoutSec);
     if (!delivery) { if (fused) { out('SEND ALREADY COMMITTED — do NOT re-send.'); out(`No reply after ${timeoutSec}s; your partner is likely still working.`); out(`NEXT: ${rearm}`); } else out(`No message after ${timeoutSec}s; your partner is likely still working. Re-run: ${rearm}`); return 2; }
     await printDeliveryThenAck(delivery, subscription);
+    renderWakeDigest(delivery, as, root); // T2: orientation under the message
     const header = delivery.message.header;
     // Item 7 (codex blocker 5): user-channel traffic must WAKE a
     // thread-scoped wait — the harness has to act on the user's input NOW.

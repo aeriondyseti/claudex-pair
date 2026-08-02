@@ -23,6 +23,8 @@ export type MirrorMessage = {
   replyTo?: string;
   /** M1: serialized as `session_id:` (optional, backward compatible). */
   sessionId?: string;
+  /** T2: serialized as `review_scope:` (optional, backward compatible). */
+  reviewScope?: string;
   body: string;
 };
 
@@ -59,6 +61,8 @@ export type DeliveryPush = {
   deliverySeq: number;
   deliveryId: string;
   message: StoredMessage;
+  /** T2 wake packet — per-recipient orientation computed at push time. */
+  digest?: import('@app/ports/gateway.ts').WakeDigest;
 };
 
 /** A live subscriber connection, as the broker core sees it. */

@@ -90,6 +90,7 @@ export type ProtocolErrorCode =
   | 'invalid-session-id'
   | 'invalid-message-type'
   | 'invalid-reply-to'
+  | 'invalid-review-scope'
   | 'session-paused'
   | 'session-already-paused'
   | 'session-not-paused';

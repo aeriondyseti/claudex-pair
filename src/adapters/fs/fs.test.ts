@@ -71,6 +71,14 @@ describe('item 7: reply_to codec round-trip (codex blocker 2)', () => {
     expect(parsed).toEqual(base);
     expect('replyTo' in parsed).toBeFalse();
   });
+
+  test('T2: reviewScope serializes as review_scope and round-trips; legacy raw parses with it absent', () => {
+    const scoped: PairMessage = { ...base, reviewScope: 'main..HEAD -- src/a.ts,src/b.ts' };
+    const raw = serializeMessage(scoped);
+    expect(raw).toContain('review_scope: main..HEAD -- src/a.ts,src/b.ts');
+    expect(parseMessage(raw)).toEqual(scoped);
+    expect('reviewScope' in parseMessage(serializeMessage(base))).toBeFalse();
+  });
 });
 
 

@@ -29,7 +29,10 @@ export type Command =
   // replyTo (ENHANCEMENTS item 7): optional causality — the MessageId this
   // message answers. Advisory metadata in the core; the broker derives the
   // awaiting-set from it. Never affects turn semantics.
-  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId }
+  // reviewScope (T2, ENHANCEMENTS item 16): sender-declared git context for
+  // review asks ('base..head [-- paths]'). Advisory metadata — messages stay
+  // pointers; the broker never runs git.
+  | { kind: 'send-message'; to: AgentId; type: MessageType; turn: TurnMode; body: string; replyTo?: MessageId; reviewScope?: string }
   | { kind: 'end-session'; summary: string }
   | { kind: 'issue-grant'; grantId: GrantId; to: AgentId; task: string; scope: GrantScopeInput; agreedIn: MessageId | '' }
   | { kind: 'accept-grant'; grantId: GrantId }

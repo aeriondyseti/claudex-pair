@@ -80,12 +80,35 @@ export type StatusDto = {
   readonly awaiting?: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
 };
 
+/**
+ * T2 (THROUGHPUT-SPRINT): the wake packet — per-recipient orientation the
+ * broker computes at push time so a waking agent acts without re-running
+ * status/log. Protocol facts only (journal-derived); workspace facts
+ * (memory.md, git) are rendered client-side. Advisory: correctness never
+ * depends on it, and an old broker simply omits it.
+ */
+export type WakeDigest = {
+  readonly status: string;
+  /** pair topology only. */
+  readonly turn?: AgentId;
+  readonly driver?: AgentId;
+  /** peer topology only. */
+  readonly phase?: string;
+  readonly substate?: string;
+  /** Open asks involving THIS recipient (either side). */
+  readonly awaiting: readonly { readonly messageId: string; readonly from: AgentId; readonly to: AgentId; readonly sentAt: string }[];
+  /** Unsettled findings by severity (converging/blocked peer sessions). */
+  readonly findingsOpen?: { readonly high: number; readonly med: number; readonly low: number };
+};
+
 export type Delivery = {
   /** Monotonic ledger cursor assigned at enqueue — ordering + resume. */
   readonly deliverySeq: number;
   /** `<messageId>:<recipient>` — identity for ack/dedup, not ordering. */
   readonly deliveryId: string;
   readonly message: StoredMessage;
+  /** T2 wake packet; absent from pre-T2 brokers. */
+  readonly digest?: WakeDigest;
 };
 
 /**

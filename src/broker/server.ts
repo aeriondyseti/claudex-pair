@@ -557,7 +557,7 @@ export class BrokerCore {
     });
     sub.lastActivity = this.#clock.now();
     void sub.sink
-      .sendDelivery({ kind: 'delivery', deliverySeq: delivery.deliverySeq, deliveryId: delivery.deliveryId, message: this.#toStored(delivery) })
+      .sendDelivery({ kind: 'delivery', deliverySeq: delivery.deliverySeq, deliveryId: delivery.deliveryId, message: this.#toStored(delivery), ...(this.#digestFor(delivery.message.to) ?? {}) })
       .catch(() => this.#leases.delete(delivery.deliveryId));
     this.#notifyPresence(); // lastActivity moved (item 8 progress signal)
     this.#scheduleLeaseSweep();
@@ -1169,9 +1169,37 @@ export class BrokerCore {
     };
   }
 
+  /** T2: the wake packet — protocol orientation for one recipient, computed
+   * from journal-authoritative state at push time. Advisory by contract
+   * (events accelerate, files decide): a failed or absent digest never
+   * affects delivery. Wrapped as {digest} for object-spread at the call
+   * site; undefined pre-session. */
+  #digestFor(recipient: string): { digest: import('@app/ports/gateway.ts').WakeDigest } | undefined {
+    const state = this.#journal.sessionState;
+    if (!state) return undefined;
+    const awaiting = this.#journal.awaiting().filter((a) => a.from === recipient || a.to === recipient);
+    let findingsOpen: { high: number; med: number; low: number } | undefined;
+    if (state.topology === 'peer' && (state.planning?.substate === 'converging' || state.planning?.substate === 'convergence-blocked')) {
+      const unsettled = Object.values(state.planning.findings).filter((f) => f.lifecycle === 'open' || f.lifecycle === 'answered');
+      findingsOpen = {
+        high: unsettled.filter((f) => f.severity === 'HIGH').length,
+        med: unsettled.filter((f) => f.severity === 'MED').length,
+        low: unsettled.filter((f) => f.severity === 'LOW').length,
+      };
+    }
+    return {
+      digest: {
+        status: state.status,
+        ...(state.topology === 'pair' ? { turn: state.turn, driver: state.driver } : { phase: state.phase, ...(state.planning ? { substate: state.planning.substate } : {}) }),
+        awaiting,
+        ...(findingsOpen === undefined ? {} : { findingsOpen }),
+      },
+    };
+  }
+
   #toStored(delivery: OpenDelivery): StoredMessage {
     const m = delivery.message;
-    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }), ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }) };
+    const pair = { id: m.id, from: m.from, to: m.to, type: m.type, turn: m.turn, sent: m.at, body: m.body, ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }), ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }), ...(m.reviewScope === undefined ? {} : { reviewScope: m.reviewScope }) };
     return {
       name: this.#codec.filename(pair),
       header: {
@@ -1182,6 +1210,7 @@ export class BrokerCore {
         ...(m.actionKind === undefined ? {} : { actionKind: m.actionKind }),
         ...(m.replyTo === undefined ? {} : { replyTo: m.replyTo }),
         ...(m.sessionId === undefined ? {} : { sessionId: m.sessionId }),
+        ...(m.reviewScope === undefined ? {} : { reviewScope: m.reviewScope }),
       },
       body: m.body,
       raw: this.#codec.raw(pair),
