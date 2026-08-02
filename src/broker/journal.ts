@@ -149,7 +149,10 @@ function encodeRecord(record: Omit<TxnRecord, 'crc32'>): string {
   return JSON.stringify({ ...record, crc32: crc32(body) });
 }
 
-function decodeRecord(line: string): TxnRecord | undefined {
+/** Exported for read-only diagnostic consumers (`pair stats` reads segments
+ * directly per the architecture's diagnostics rule) — decode + CRC-verify
+ * one NDJSON line, undefined on any mismatch. */
+export function decodeRecord(line: string): TxnRecord | undefined {
   let parsed: TxnRecord;
   try {
     parsed = JSON.parse(line) as TxnRecord;

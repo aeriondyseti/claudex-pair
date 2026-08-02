@@ -105,7 +105,9 @@ async function main(argv: string[]): Promise<number> {
 
   // Broker is the authoritative default. The explicit fs mode is retained
   // for read-only diagnostics and the legacy compatibility test suite.
-  if (process.env.CLAUDEX_PROTOCOL_MODE !== 'fs' && command !== 'watch' && command !== 'help') {
+  // `stats` (T1) is a read-only journal diagnostic like `watch` — it never
+  // needs a broker connection and must not spawn one.
+  if (process.env.CLAUDEX_PROTOCOL_MODE !== 'fs' && command !== 'watch' && command !== 'help' && command !== 'stats') {
     const root = command === 'init' || command === 'broker' ? resolve(rootFlag ?? process.cwd()) : findRoot(rootFlag);
     // Legacy-session guard: an ACTIVE session with no journal predates the
     // broker — it must complete in fs mode (an empty journal would report it
@@ -350,6 +352,12 @@ async function main(argv: string[]): Promise<number> {
       out(`Grant ${id} cancelled; ${g?.assignee} notified.`);
       return 0;
     }
+    case 'stats': {
+      // T1: WAL-derived throughput metrics (turn holds, ask latency,
+      // human-blocked time). Direct segment read; works with no broker up.
+      const { runStats } = await import('./stats.ts');
+      return runStats(findRoot(rootFlag), has(flags, 'json'));
+    }
     case 'watch': {
       // Broker-native by default (non-consuming observer, authoritative);
       // legacy/no-journal sessions fall back to the fs-diagnostic poller.
@@ -397,6 +405,8 @@ Usage:
   pair join   -From <driver> -Agent <name>
   pair kick   -From <driver> -Agent <name> [-Reason '<why>']
   pair status
+  pair stats  [-Json]   # WAL-derived throughput: turn holds, ask latency,
+                        # human-blocked time (broker-journal sessions only)
   pair log    [-Tail 10]
   pair watch  [-Tail 10] [-RefreshSec 2]   # live dashboard (for the human's pane)
   pair broker status|stop [-Root <repo>]
