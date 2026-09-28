@@ -46,20 +46,26 @@ Neither topology matches "two equals working together without delegation".
    asks, async review (`review-request` → `verdict` → `review-resolve`),
    `pair stats`, `watch`, and memory.
 
+**Decided (user, 2026-09-27).**
+
+- **Collision avoidance uses lightweight file claims.** An agent declares the
+  files or areas it is about to edit, and the broker rejects overlapping claims.
+  There is no heavier enforcement.
+- **N-agent support stays.** Any number of equal partners can join, agy
+  included. Two agents is still the common case.
+- **A clean break is acceptable.** Existing `.pair/` sessions and WAL journals
+  from the removed modes do not need to load or replay. This simplifies the
+  code.
+
 **Open questions (decide at the start of R1).**
 
-- Is the target a simplified `peer` topology (keep claims and per-agent
-  workspaces, drop the planning and vote barriers), or `pair` with the
-  driver/navigator split removed (shared worktree, both edit, coordination by
-  message)? The answer determines how much of `docs/PEER-MODEL.md` survives.
-- If both agents can edit, what prevents them from editing the same file at
-  once? Options are file/area claims, separate worktrees with merges, or
-  convention only.
+- **Shape (first design question):** is the target a simplified `peer`
+  topology (keep claims and per-agent workspaces, drop the planning and vote
+  barriers), or `pair` with the driver/navigator split removed (shared worktree,
+  everyone edits, file claims plus messages coordinate)? The answer determines
+  how much of `docs/PEER-MODEL.md` survives.
 - Does the turn token survive at all (for example, only for blocking decisions),
   or does the model become fully asynchronous?
-- Are 3+ agents (agy) still in scope, or does "only mode" also mean two agents?
-- Is compatibility with existing `.pair/` sessions and WAL journals needed, or
-  is a clean break acceptable?
 
 **Done when:** one mode exists end to end (core → broker → CLI → skills →
 instructions → docs), it is the default, and the full test suite passes with the
