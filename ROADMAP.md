@@ -15,6 +15,9 @@ tracks what is next and why.
 
 ## R1 — Equal-partner mode as the default and only mode
 
+**Implementation proposal:** [R1-EQUAL-PARTNER-SPEC.md](docs/R1-EQUAL-PARTNER-SPEC.md)
+(revision 2 cross-agent review approved; proposed design decisions await user acceptance).
+
 **Goal.** Agents collaborate as equal partners. Neither agent directs or
 delegates to the other, and the partnership is the only mode the project supports
 for now.
